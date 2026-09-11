@@ -1,0 +1,18 @@
+[package]
+name = "tarvos-tests"
+version = "1.2.0"
+edition = "2021"
+
+[dev-dependencies]
+tarvos-ast = { path = "../tarvos-ast" }
+tarvos-parser = { path = "../tarvos-parser" }
+tarvos-analysis = { path = "../tarvos-analysis" }
+tarvos-optimizer = { path = "../tarvos-optimizer" }
+tarvos-codegen-rust = { path = "../tarvos-codegen-rust" }
+tarvos-ir = { path = "../tarvos-ir" }
+tarvos-types = { path = "../tarvos-types" }
+
+# Required so cargo doesn't complain about a lib-less package
+[lib]
+name = "tarvos_tests"
+path = "src/lib.rs"

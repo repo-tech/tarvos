@@ -1,0 +1,10 @@
+[package]
+name = "tarvos-parser"
+version = "1.2.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+
+tarvos-ast = { path = "../tarvos-ast" }

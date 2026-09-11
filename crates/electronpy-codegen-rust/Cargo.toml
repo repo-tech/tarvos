@@ -1,9 +1,0 @@
-[package]
-name = "electronpy-codegen-rust"
-version = "0.0.1"
-edition = "2021"
-
-[dependencies]
-anyhow = "1"
-electronpy-ir = { path = "../electronpy-ir" }
-electronpy-types = { path = "../electronpy-types" }

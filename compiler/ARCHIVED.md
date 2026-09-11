@@ -1,6 +1,6 @@
 # compiler/ — Archived Prototype
 
-This directory contains an **early standalone prototype** of the ElectronPy compiler
+This directory contains an **early standalone prototype** of the Tarvos compiler
 written before the multi-crate workspace (`crates/`) was established.
 
 It is **not part of the Cargo workspace** and is not compiled or tested by `cargo build`.
@@ -16,10 +16,10 @@ Use the workspace crates under `crates/`:
 
 ```
 crates/
-├── electronpy-ast/         ← replaces compiler/src/ast/
-├── electronpy-ir/          ← replaces compiler/src/ir/
-├── electronpy-codegen-rust/ ← replaces compiler/src/codegen/
-└── electronpy-analysis/    ← replaces compiler/src/ir/lower.rs
+├── tarvos-ast/         ← replaces compiler/src/ast/
+├── tarvos-ir/          ← replaces compiler/src/ir/
+├── tarvos-codegen-rust/ ← replaces compiler/src/codegen/
+└── tarvos-analysis/    ← replaces compiler/src/ir/lower.rs
 ```
 
 Do not add new code here. If this directory becomes confusing, delete it.

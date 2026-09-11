@@ -1,0 +1,11 @@
+[package]
+name = "tarvos-core"
+version = "1.2.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+tarvos-analysis = { path = "../tarvos-analysis" }
+tarvos-codegen-rust = { path = "../tarvos-codegen-rust" }
+tarvos-optimizer = { path = "../tarvos-optimizer" }
+tarvos-parser = { path = "../tarvos-parser" }

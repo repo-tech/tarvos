@@ -17,7 +17,7 @@ use ir::lower::lower_module;
 fn main() -> Result<()> {
     let input = env::args()
         .nth(1)
-        .context("usage: electronpy <file.py>")?;
+        .context("usage: tarvos <file.py>")?;
 
     let source = fs::read_to_string(&input)
         .with_context(|| format!("failed to read {input}"))?;

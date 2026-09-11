@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/electronpy-cli",
-    "crates/electronpy-core",
-    "crates/electronpy-ast",
-    "crates/electronpy-parser",
-    "crates/electronpy-types",
-    "crates/electronpy-ir",
-    "crates/electronpy-analysis",
-    "crates/electronpy-optimizer",
-    "crates/electronpy-codegen-rust",
-    "crates/electronpy-tests",
+    "crates/tarvos-cli",
+    "crates/tarvos-core",
+    "crates/tarvos-ast",
+    "crates/tarvos-parser",
+    "crates/tarvos-types",
+    "crates/tarvos-ir",
+    "crates/tarvos-analysis",
+    "crates/tarvos-optimizer",
+    "crates/tarvos-codegen-rust",
+    "crates/tarvos-tests",
 ]
 
 [profile.dev]
@@ -20,7 +20,7 @@ debug = 0
 opt-level = 0
 
 [profile.release]
-opt-level = 2
+opt-level = 3
 codegen-units = 8
 incremental = true
 lto = "thin"

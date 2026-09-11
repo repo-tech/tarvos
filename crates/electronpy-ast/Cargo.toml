@@ -1,8 +1,0 @@
-[package]
-name = "electronpy-ast"
-version = "0.0.1"
-edition = "2021"
-
-[dependencies]
-serde = { version = "1", features = ["derive"] }
-electronpy-types = { path = "../electronpy-types" }

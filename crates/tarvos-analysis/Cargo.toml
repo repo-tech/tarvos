@@ -1,0 +1,11 @@
+[package]
+name = "tarvos-analysis"
+version = "1.2.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+tarvos-types = { path = "../tarvos-types" }
+tarvos-ast = { path = "../tarvos-ast" }
+tarvos-ir = { path = "../tarvos-ir" }
