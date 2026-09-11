@@ -28,7 +28,7 @@ use tarvos_parser::parse_python_ast;
 #[derive(Parser, Debug)]
 #[command(name = "tarvos")]
 #[command(author = "Himanshu & Repo-Tech Team")]
-#[command(version = "1.2.0")]
+#[command(version = "1.5.0")]
 #[command(about = "Transpiles and compiles Python code to native high-performance Rust executables", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -154,6 +154,20 @@ enum Commands {
         output_dir: PathBuf,
     },
 
+    /// Convert a Python file or project folder into a Cargo release project and binary
+    Package {
+        /// Python file or project directory
+        input: PathBuf,
+
+        /// Entry Python file when input is a directory (defaults to main.py)
+        #[arg(long, value_name = "FILE.py")]
+        entry: Option<PathBuf>,
+
+        /// Destination Cargo project directory
+        #[arg(short, long, value_name = "DIR")]
+        output_dir: Option<PathBuf>,
+    },
+
     /// Clean build artifacts, temporary cache files, and intermediate outputs
     Clean,
 
@@ -249,6 +263,11 @@ fn main() -> Result<()> {
             ];
             export_command(&args)
         }
+        Some(Commands::Package {
+            input,
+            entry,
+            output_dir,
+        }) => package_project_mode(&input, entry.as_deref(), output_dir.as_deref()),
         Some(Commands::Clean) => clean_command(&[]),
         Some(Commands::Install) => install_command(&[]),
         Some(Commands::Validate) => validate_command(&[]),
@@ -376,6 +395,173 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
             Err(err)
         }
     }
+}
+
+fn package_project_mode(
+    input: &Path,
+    requested_entry: Option<&Path>,
+    requested_output: Option<&Path>,
+) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let input = canonicalize_existing_path(input, "package input")?;
+    let (project_root, entry) = if input.is_dir() {
+        let entry = requested_entry
+            .map(PathBuf::from)
+            .unwrap_or_else(|| input.join("main.py"));
+        let entry = if entry.is_absolute() {
+            entry
+        } else {
+            input.join(entry)
+        };
+        (
+            input.clone(),
+            canonicalize_existing_path(&entry, "package entrypoint")?,
+        )
+    } else {
+        let entry = input.clone();
+        (
+            input.parent().map(Path::to_path_buf).unwrap_or(cwd.clone()),
+            entry,
+        )
+    };
+    if !entry.is_file() {
+        return Err(anyhow::anyhow!(
+            "package entrypoint is not a file: {}",
+            entry.display()
+        ));
+    }
+    let output = requested_output.map(PathBuf::from).unwrap_or_else(|| {
+        cwd.join(format!(
+            "{}-tarvos-dist",
+            project_root
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        ))
+    });
+    let output = if output.is_absolute() {
+        output
+    } else {
+        cwd.join(output)
+    };
+    if output.starts_with(&project_root) {
+        return Err(anyhow::anyhow!(
+            "package output must not be inside the input project: {}",
+            output.display()
+        ));
+    }
+    if output.exists() {
+        return Err(anyhow::anyhow!(
+            "package output already exists; choose an empty destination: {}",
+            output.display()
+        ));
+    }
+
+    let src_dir = output.join("src");
+    let dist_dir = output.join("dist");
+    fs::create_dir_all(&src_dir)?;
+    fs::create_dir_all(&dist_dir)?;
+    let project_name = sanitize_package_name(
+        output
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .as_ref(),
+    );
+    let rust_source = transpile_python_to_rust(&entry)?;
+    fs::write(src_dir.join("main.rs"), rust_source)?;
+    fs::write(
+        output.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"1.5.0\"\nedition = \"2021\"\n\n[profile.release]\nopt-level = 3\nlto = \"thin\"\ncodegen-units = 1\nstrip = \"symbols\"\npanic = \"abort\"\n",
+            project_name
+        ),
+    )?;
+    fs::write(
+        output.join("README.md"),
+        "# Tarvos packaged project\n\nBuild output is available in `dist/`.\n",
+    )?;
+    copy_project_assets(&project_root, &output.join("python"), &entry)?;
+
+    let cargo = which_simple("cargo")?
+        .ok_or_else(|| anyhow::anyhow!("Cargo is required for `tarvos package`"))?;
+    let status = Command::new(cargo)
+        .args(["build", "--release"])
+        .current_dir(&output)
+        .status()
+        .with_context(|| format!("failed to build packaged project {}", output.display()))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "packaged Rust project failed to build; inspect {}",
+            output.join("src\\main.rs").display()
+        ));
+    }
+    let built = output
+        .join("target")
+        .join("release")
+        .join(if cfg!(windows) {
+            format!("{}.exe", project_name)
+        } else {
+            project_name.clone()
+        });
+    let dist_binary = dist_dir.join(
+        built
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("packaged binary has no file name"))?,
+    );
+    fs::copy(&built, &dist_binary).with_context(|| {
+        format!(
+            "failed to copy packaged binary to {}",
+            dist_binary.display()
+        )
+    })?;
+    println!("Packaged Rust project: {}", output.display());
+    println!("Release executable: {}", dist_binary.display());
+    Ok(())
+}
+
+fn copy_project_assets(root: &Path, destination: &Path, entry: &Path) -> Result<()> {
+    fn visit(source: &Path, root: &Path, destination: &Path, entry: &Path) -> Result<()> {
+        for item in fs::read_dir(source)? {
+            let item = item?;
+            let path = item.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if name == "__pycache__"
+                || name == ".venv"
+                || name == ".git"
+                || name == "target"
+                || name == ".build-tmp"
+                || name == ".tarvos_cache"
+            {
+                continue;
+            }
+            if path.is_file()
+                && matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("exe" | "dll" | "pdb" | "o" | "rlib" | "rmeta")
+                )
+            {
+                continue;
+            }
+            let relative = path.strip_prefix(root).unwrap_or(&path);
+            let target = destination.join(relative);
+            if path == entry {
+                continue;
+            }
+            if path.is_dir() {
+                fs::create_dir_all(&target)?;
+                visit(&path, root, destination, entry)?;
+            } else {
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::copy(&path, target)?;
+            }
+        }
+        Ok(())
+    }
+    fs::create_dir_all(destination)?;
+    visit(root, root, destination, entry)
 }
 
 pub(crate) fn run_mode(args: &[String]) -> Result<()> {
