@@ -356,9 +356,8 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
     let rust_source = transpile_python_to_rust(&input_path)?;
     let rust_output = output_path.with_extension("rs");
 
-    write_rust_output(&rust_output, &rust_source)?;
-
     if source_only {
+        write_rust_output(&rust_output, &rust_source)?;
         println!("Source-only build complete: {}", rust_output.display());
         println!("Rust is not required for source generation. Use `tarvos build ... --source-only` to emit Rust without native EXE compilation.");
         return Ok(());
@@ -371,8 +370,7 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
         }
         Err(err) => {
             eprintln!(
-                "Rust native build unavailable; source generation succeeded at {}",
-                rust_output.display()
+                "Rust native build unavailable; generated Rust remains in the user cache for this invocation."
             );
             eprintln!("Install Rust or use `tarvos compile <file.py> --source-only` to keep source mode working without a Rust toolchain.");
             Err(err)
@@ -392,14 +390,18 @@ fn prepare_native_run(args: &[String]) -> Result<(PathBuf, Vec<String>)> {
     let working_dir = env::current_dir()?;
     let input_path = secure_input_path(input_file, &working_dir)?;
     let rust_source = transpile_python_to_rust(&input_path)?;
-    let temp_dir = working_dir.join(".build-tmp");
-    fs::create_dir_all(&temp_dir).ok();
+    let temp_dir = tarvos_cache_dir()?.join("runs");
+    fs::create_dir_all(&temp_dir).with_context(|| {
+        format!(
+            "failed to create user cache directory {}",
+            temp_dir.display()
+        )
+    })?;
     let exe_path = temp_dir.join(format!(
         "{}{}",
         input_path.file_stem().unwrap_or_default().to_string_lossy(),
         if cfg!(windows) { ".exe" } else { "" }
     ));
-    fs::write(temp_dir.join("runtime_run.rs"), &rust_source)?;
     compile_rust_binary(&exe_path, &rust_source)?;
     Ok((exe_path, args[1..].to_vec()))
 }
@@ -420,15 +422,8 @@ fn execute_native_run(exe_path: &Path, args: &[String]) -> Result<()> {
 
 fn scan_project_mode(input: &Path) -> Result<()> {
     let root = env::current_dir()?;
-    let requested = if input.is_absolute() {
-        input.to_path_buf()
-    } else {
-        root.join(input)
-    };
-    let input = requested
-        .canonicalize()
-        .with_context(|| format!("scan path does not exist: {}", requested.display()))?;
-    let canonical_root = root.canonicalize()?;
+    let canonical_root = canonicalize_existing_path(&root, "project root")?;
+    let input = canonicalize_existing_path(input, "scan path")?;
     if !input.starts_with(&canonical_root) {
         return Err(anyhow::anyhow!(
             "scan path must remain inside the current project root: {}",
@@ -546,10 +541,12 @@ fn collect_python_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
-        for entry in fs::read_dir(&path)
-            .with_context(|| format!("failed to read directory {}", path.display()))?
-        {
-            let child = entry?.path();
+        let entries =
+            fs::read_dir(&path).map_err(|error| path_io_error("read directory", &path, error))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| path_io_error("inspect directory entry", &path, error))?;
+            let child = entry.path();
             if child.is_dir() {
                 if child.file_name().and_then(|n| n.to_str()) != Some("__pycache__") {
                     pending.push(child);
@@ -561,6 +558,30 @@ fn collect_python_files(root: &Path) -> Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+fn canonicalize_existing_path(input: &Path, label: &str) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(input).map_err(|error| path_io_error(label, input, error))?;
+    Ok(normalize_windows_path(canonical))
+}
+
+fn path_io_error(operation: &str, path: &Path, error: std::io::Error) -> anyhow::Error {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => anyhow::anyhow!(
+            "[Tarvos Doctor] Access Denied. Please ensure your terminal environment is running with administrative elevation (Run as Administrator)."
+        ),
+        std::io::ErrorKind::NotFound => anyhow::anyhow!(
+            "[Tarvos Doctor] Path Not Found while attempting to {}: {}. Verify the exact absolute path and directory structure.",
+            operation,
+            path.display()
+        ),
+        _ => anyhow::anyhow!(
+            "failed to {} '{}': {}",
+            operation,
+            path.display(),
+            error
+        ),
+    }
 }
 
 fn print_scan_report(file: &Path, report: &ModuleReport) {
@@ -726,8 +747,7 @@ pub(crate) fn doctor_mode(_args: &[String]) -> Result<()> {
 fn transpile_python_to_rust(input_path: &Path) -> Result<String> {
     let source = fs::read_to_string(input_path)
         .with_context(|| format!("failed to read {}", input_path.display()))?;
-    let root = env::current_dir()?;
-    let cache_dir = root.join(".tarvos_cache");
+    let cache_dir = tarvos_cache_dir()?;
     fs::create_dir_all(&cache_dir)
         .with_context(|| format!("failed to create cache directory {}", cache_dir.display()))?;
 
@@ -761,6 +781,17 @@ fn transpile_python_to_rust(input_path: &Path) -> Result<String> {
     Ok(rust_source)
 }
 
+fn tarvos_cache_dir() -> Result<PathBuf> {
+    let home = if cfg!(windows) {
+        env::var_os("USERPROFILE")
+    } else {
+        env::var_os("HOME")
+    }
+    .map(PathBuf::from)
+    .ok_or_else(|| anyhow::anyhow!("could not determine the current user's home directory"))?;
+    Ok(home.join(".tarvos").join("cache").join("tarvos-cache-v1.2"))
+}
+
 fn write_rust_output(output_path: &Path, rust_source: &str) -> Result<()> {
     CompilePipeline::write_rust_output(output_path, rust_source)
 }
@@ -775,7 +806,17 @@ fn find_python_command() -> Result<String> {
 
 fn compile_rust_binary(output_path: &Path, rust_source: &str) -> Result<()> {
     let rustc = ensure_rust_toolchain()?;
-    let rust_file = output_path.with_extension("rs");
+    let cache_dir = tarvos_cache_dir()?.join("rustc");
+    fs::create_dir_all(&cache_dir).with_context(|| {
+        format!(
+            "failed to create user cache directory {}",
+            cache_dir.display()
+        )
+    })?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rust_source.hash(&mut hasher);
+    output_path.to_string_lossy().hash(&mut hasher);
+    let rust_file = cache_dir.join(format!("{:016x}.rs", hasher.finish()));
     fs::write(&rust_file, rust_source)
         .with_context(|| format!("failed to write {}", rust_file.display()))?;
     let status = Command::new(&rustc)
@@ -922,6 +963,12 @@ pub(crate) fn clean_mode(_args: &[String]) -> Result<()> {
             println!("Removed {}", target.display());
         }
     }
+    let cache_dir = tarvos_cache_dir()?;
+    if cache_dir.exists() {
+        fs::remove_dir_all(&cache_dir)
+            .with_context(|| format!("failed to remove user cache {}", cache_dir.display()))?;
+        println!("Removed {}", cache_dir.display());
+    }
     println!("Workspace cleaned.");
     Ok(())
 }
@@ -1016,8 +1063,8 @@ pub(crate) fn benchmark_mode(args: &[String]) -> Result<()> {
         secure_input_path(&reference_file, &repo_root)?
     };
 
-    // Keep the benchmark runner inside the repository's controlled workspace.
-    let stage_dir = repo_root.join(".build-tmp").join(format!(
+    // Keep benchmark staging in the user's writable Tarvos cache, not the repository.
+    let stage_dir = tarvos_cache_dir()?.join("benchmarks").join(format!(
         "cli-benchmark-{}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1203,8 +1250,8 @@ fn secure_input_path(input: &str, root: &Path) -> Result<PathBuf> {
     } else {
         root.join(candidate)
     };
-    let canonical = normalize_windows_path(absolute.canonicalize().unwrap_or(absolute.clone()));
-    let root_norm = normalize_windows_path(root.canonicalize().unwrap_or(root.to_path_buf()));
+    let canonical = canonicalize_existing_path(&absolute, "resolve input path")?;
+    let root_norm = canonicalize_existing_path(root, "resolve project root")?;
     if !canonical.starts_with(&root_norm) {
         return Err(anyhow::anyhow!(
             "input path is outside the safe project root: {}",
