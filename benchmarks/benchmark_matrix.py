@@ -123,7 +123,7 @@ def benchmark_tarvos(script: Path, repeats: int):
     tmpdir.mkdir(parents=True, exist_ok=True)
     out_rs = tmpdir / "matrix_bench.rs"
     out_bin = tmpdir / ("matrix_bench.exe" if os.name == "nt" else "matrix_bench")
-    run_checked([str(root_bin), "compile", str(script), str(out_rs)], cwd=str(ROOT), env={**os.environ, "BENCH_LIMIT": "10000000", "BENCH_BIAS": "0"})
+    run_checked([str(root_bin), "compile", str(script), "--output", str(out_rs)], cwd=str(ROOT), env={**os.environ, "BENCH_LIMIT": "10000000", "BENCH_BIAS": "0"})
     rustc = subprocess.run(["rustc", "-O", "-C", "target-cpu=native", "-o", str(out_bin), str(out_rs)], capture_output=True, text=True, env={**os.environ, "BENCH_LIMIT": "10000000", "BENCH_BIAS": "0"})
     if rustc.returncode != 0:
         return {"runtime": "tarvos", "status": "failed", "reason": rustc.stderr.strip() or rustc.stdout.strip()}
@@ -167,17 +167,17 @@ def main():
     rows = []
     for name in runtimes:
         if name == "cpython":
-            rows.append({"workload": SUPPORTED_PY.name, **benchmark_python(SUPPORTED_PY, args.repeats)})
+            rows.append({"workload": FAIR_PY.name, **benchmark_python(FAIR_PY, args.repeats)})
         elif name == "pypy":
             rows.append({"workload": SUPPORTED_PY.name, **benchmark_pypy(SUPPORTED_PY, args.repeats)})
         elif name == "numba":
             rows.append({"workload": NUMBA_WRAPPER.name, **benchmark_numba(NUMBA_WRAPPER, args.repeats)})
         elif name == "nuitka":
-            rows.append({"workload": SUPPORTED_PY.name, **benchmark_nuitka(SUPPORTED_PY, args.repeats)})
+            rows.append({"workload": FAIR_PY.name, **benchmark_nuitka(FAIR_PY, args.repeats)})
         elif name == "codon":
             rows.append({"workload": SUPPORTED_PY.name, **benchmark_codon(SUPPORTED_PY, args.repeats)})
         elif name == "tarvos":
-            rows.append({"workload": SUPPORTED_PY.name, **benchmark_tarvos(SUPPORTED_PY, args.repeats)})
+            rows.append({"workload": FAIR_PY.name, **benchmark_tarvos(FAIR_PY, args.repeats)})
         elif name == "rust":
             rows.append({"workload": FAIR_RS.name, **benchmark_rust(FAIR_RS, args.repeats)})
 
