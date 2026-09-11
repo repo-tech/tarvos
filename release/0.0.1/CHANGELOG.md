@@ -1,4 +1,4 @@
-# ElectronPy 0.0.1 Changelog
+# Tarvos 0.0.1 Changelog
 
 ## Highlights
 
@@ -17,7 +17,7 @@
 
 ## Known scope
 
-ElectronPy 0.0.1 is a compiler for a statically analyzable subset of Python, not a full Python interpreter replacement. It is optimized for numeric, loop-heavy, deterministic workloads with clear static semantics.
+Tarvos 0.0.1 is a compiler for a statically analyzable subset of Python, not a full Python interpreter replacement. It is optimized for numeric, loop-heavy, deterministic workloads with clear static semantics.
 
 ## Validation gates
 

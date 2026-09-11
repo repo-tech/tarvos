@@ -1,4 +1,4 @@
-name: ElectronPy 0.0.1 release validation
+name: Tarvos 0.0.1 release validation
 
 on:
   push:
@@ -21,8 +21,8 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build ElectronPy
-        run: cargo build --release --bin electronpy
+      - name: Build Tarvos
+        run: cargo build --release --bin tarvos
 
       - name: Validate same-output fairness case
         run: bash scripts/verify_same_output.sh

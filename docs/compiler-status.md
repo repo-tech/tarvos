@@ -1,4 +1,4 @@
-# ElectronPy compiler status
+# Tarvos compiler status
 
 ## Scope and audit basis
 
@@ -45,7 +45,7 @@ The current workspace compiles under the GNU Rust toolchain and passes the exist
 
 The project now includes a reproducible differential harness for the audited workload set:
 
-- `scripts/diff_test.py` compares CPython stdout to ElectronPy-generated Rust stdout for each workload in `benchmarks/workloads/`.
+- `scripts/diff_test.py` compares CPython stdout to Tarvos-generated Rust stdout for each workload in `benchmarks/workloads/`.
 - `benchmarks/workloads/expected_outputs.json` records the deterministic expected output for each supported workload.
 - `benchmarks/competitor_env.py` detects whether PyPy, Numba, Nuitka, Codon, and Rust are available on the local system without attempting unapproved installs.
 - `benchmarks/results/results.json` stores the pass/fail matrix and machine-readable results for the current environment.

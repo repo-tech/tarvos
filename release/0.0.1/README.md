@@ -1,33 +1,33 @@
-# ElectronPy 0.0.1 Release Bundle
+# Tarvos 0.0.1 Release Bundle
 
-This bundle is the clean delivery package for the ElectronPy subset compiler release.
+This bundle is the clean delivery package for the Tarvos subset compiler release.
 
 ## Scope
 
-ElectronPy is not a general-purpose Python interpreter. It is a deterministic Python-to-Rust subset compiler focused on static numerical workloads, arithmetic kernels, and loop-heavy compute.
+Tarvos is not a general-purpose Python interpreter. It is a deterministic Python-to-Rust subset compiler focused on static numerical workloads, arithmetic kernels, and loop-heavy compute.
 
 ## Installation
 
 Source-only mode (Rust not required):
 
 ```bash
-cargo build --release --bin electronpy
-./target/release/electronpy compile examples/simple.py output.rs --source-only
+cargo build --release --bin tarvos
+./target/release/tarvos compile examples/simple.py output.rs --source-only
 ```
 
 Native EXE mode (Rust required for final binary):
 
 ```bash
-cargo build --release --bin electronpy
-./target/release/electronpy build examples/simple.py app.exe
+cargo build --release --bin tarvos
+./target/release/tarvos build examples/simple.py app.exe
 ```
 
 PowerShell:
 
 ```powershell
-cargo build --release --bin electronpy
-.\target\x86_64-pc-windows-msvc\release\electronpy.exe compile .\examples\simple.py .\output.rs --source-only
-.\target\x86_64-pc-windows-msvc\release\electronpy.exe build .\examples\simple.py .\app.exe
+cargo build --release --bin tarvos
+.\target\x86_64-pc-windows-msvc\release\tarvos.exe compile .\examples\simple.py .\output.rs --source-only
+.\target\x86_64-pc-windows-msvc\release\tarvos.exe build .\examples\simple.py .\app.exe
 ```
 
 ## Release notes
@@ -49,7 +49,7 @@ The matrix benchmarks a dynamic `BENCH_LIMIT` / `BENCH_BIAS` workload so the res
 - Numba (if installed)
 - Nuitka (if installed)
 - Codon (if installed)
-- ElectronPy
+- Tarvos
 - Rust reference
 
 ## Fairness check

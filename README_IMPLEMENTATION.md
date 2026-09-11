@@ -1,4 +1,4 @@
-# 🚀 ElectronPy — High-Performance Python Compiler
+# 🚀 Tarvos — High-Performance Python Compiler
 
 > A production-grade compiler that transforms Python code into optimized Rust/WASM, enabling 3-10x performance improvements without rewriting applications.
 
@@ -7,7 +7,7 @@
 **Stage 1 - MVP: Compiler ✅**
 
 - ✅ Python AST Parsing
-- ✅ ElectronPy AST with type annotations
+- ✅ Tarvos AST with type annotations
 - ✅ Type Inference & Checking
 - ✅ Intermediate Representation (IR)
 - ✅ Constant Folding Optimization
@@ -16,7 +16,7 @@
 
 ## 📋 Architecture
 
-ElectronPy follows a modular, layered architecture:
+Tarvos follows a modular, layered architecture:
 
 ```
 Python Source (.py)
@@ -25,15 +25,15 @@ Python AST Exporter (Python script)
     ↓
 JSON AST
     ↓
-[electronpy-ast] AST Nodes
+[tarvos-ast] AST Nodes
     ↓
-[electronpy-analysis] Type Checking & Lowering
+[tarvos-analysis] Type Checking & Lowering
     ↓
-[electronpy-ir] Intermediate Representation
+[tarvos-ir] Intermediate Representation
     ↓
-[electronpy-optimizer] Optimization Passes
+[tarvos-optimizer] Optimization Passes
     ↓
-[electronpy-codegen-rust] Rust Code Generation
+[tarvos-codegen-rust] Rust Code Generation
     ↓
 Generated Rust Source
     ↓
@@ -46,14 +46,14 @@ Native Binary
 
 ```
 crates/
-├── electronpy-types/         # Type system (Int, Float, Bool, String, Array)
-├── electronpy-ast/           # AST node definitions
-├── electronpy-parser/        # Python AST → ElectronPy AST
-├── electronpy-ir/            # Intermediate Representation (core architecture)
-├── electronpy-analysis/      # Type inference, semantic analysis, lowering
-├── electronpy-optimizer/     # Optimization passes (constant folding, DCE)
-├── electronpy-codegen-rust/  # IR → Rust code generation
-└── electronpy-cli/           # CLI entry point
+├── tarvos-types/         # Type system (Int, Float, Bool, String, Array)
+├── tarvos-ast/           # AST node definitions
+├── tarvos-parser/        # Python AST → Tarvos AST
+├── tarvos-ir/            # Intermediate Representation (core architecture)
+├── tarvos-analysis/      # Type inference, semantic analysis, lowering
+├── tarvos-optimizer/     # Optimization passes (constant folding, DCE)
+├── tarvos-codegen-rust/  # IR → Rust code generation
+└── tarvos-cli/           # CLI entry point
 ```
 
 Each crate has a clear responsibility, enabling modular testing and future extension.
@@ -67,7 +67,7 @@ cargo build --release
 
 ### Compile Python
 ```bash
-./target/release/electronpy examples/simple.py output.rs
+./target/release/tarvos examples/simple.py output.rs
 ```
 
 ### Verify Generated Code
@@ -110,8 +110,8 @@ print(z)
 
 **Execution:**
 ```bash
-$ electronpy simple.py output.rs
-=== ElectronPy Compiler ===
+$ tarvos simple.py output.rs
+=== Tarvos Compiler ===
 
 Input: simple.py
   [1/6] Exporting Python AST...
@@ -184,13 +184,13 @@ diff python_out.txt rust_out.txt
 
 ## 📚 Key Modules
 
-### [electronpy-types](crates/electronpy-types/)
-Defines the ElectronPy type system:
+### [tarvos-types](crates/tarvos-types/)
+Defines the Tarvos type system:
 - `Type::Int`, `Type::Float`, `Type::Bool`, `Type::String`, `Type::None`
 - `Type::Array<T>`, `Type::Tuple<T...>` (for future)
 - Type errors with clear diagnostics
 
-### [electronpy-ir](crates/electronpy-ir/)
+### [tarvos-ir](crates/tarvos-ir/)
 **The architectural center** - defines:
 - `Module` - root compilation unit
 - `Stmt` - statements (Let, If, While, For, Function, Return)
@@ -200,20 +200,20 @@ Defines the ElectronPy type system:
 
 Designed for optimization: immutable, acyclic, strongly typed.
 
-### [electronpy-analysis](crates/electronpy-analysis/)
+### [tarvos-analysis](crates/tarvos-analysis/)
 **Type checking + Lowering**:
 - `TypeInference` - infer types from expressions
 - `Lowerer` - convert AST → IR with type checking
 - Catches type mismatches, undefined variables
 - Manages symbol table
 
-### [electronpy-optimizer](crates/electronpy-optimizer/)
+### [tarvos-optimizer](crates/tarvos-optimizer/)
 **Optimization passes**:
 - Constant folding (evaluates `10 + 20` → `30` at compile time)
 - Dead code elimination (framework ready)
 - Designed for future: loop invariant code motion, vectorization
 
-### [electronpy-codegen-rust](crates/electronpy-codegen-rust/)
+### [tarvos-codegen-rust](crates/tarvos-codegen-rust/)
 **IR → Rust**:
 - Maps `Type` → Rust types
 - Emits `let`, `if`, `while`, `for` statements
@@ -222,10 +222,10 @@ Designed for optimization: immutable, acyclic, strongly typed.
 ## 🚦 Compilation Pipeline Steps
 
 1. **Python → JSON AST** (via `ast_export.py`)
-2. **JSON AST → ElectronPy AST** (via `electronpy-parser`)
-3. **AST → IR** (via `electronpy-analysis` with type checking)
-4. **Optimize IR** (via `electronpy-optimizer`)
-5. **IR → Rust** (via `electronpy-codegen-rust`)
+2. **JSON AST → Tarvos AST** (via `tarvos-parser`)
+3. **AST → IR** (via `tarvos-analysis` with type checking)
+4. **Optimize IR** (via `tarvos-optimizer`)
+5. **IR → Rust** (via `tarvos-codegen-rust`)
 6. **Rust → Binary** (via `rustc`/LLVM)
 
 Each step is:
@@ -251,7 +251,7 @@ Each step is:
 - Bounds analysis
 
 **Phase 3 - Profiler**
-- `electronpy analyze` - find hotspots
+- `tarvos analyze` - find hotspots
 - CPU/memory profiling
 - Optimization candidate detection
 
@@ -276,13 +276,13 @@ Each step is:
 
 ## 📖 Language Design
 
-ElectronPy is NOT full Python. It's a **curated subset** designed for:
+Tarvos is NOT full Python. It's a **curated subset** designed for:
 - Static analysis
 - Type specialization
 - Efficient compilation
 - Predictable performance
 
-Example: A function without type hints is compilable, but ElectronPy uses **inference + specialization**:
+Example: A function without type hints is compilable, but Tarvos uses **inference + specialization**:
 ```python
 def add(x, y):
     return x + y
@@ -319,7 +319,7 @@ test(codegen): add differential tests for arithmetic
 
 ## 📄 License
 
-TBD (ElectronPy is in early development)
+TBD (Tarvos is in early development)
 
 ---
 

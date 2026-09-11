@@ -1,4 +1,4 @@
-# ElectronPy 0.0.1 Release Checklist
+# Tarvos 0.0.1 Release Checklist
 
 Status: ready for a narrowly scoped release as a subset compiler for static numeric Python workloads.
 
@@ -28,7 +28,7 @@ Status: ready for a narrowly scoped release as a subset compiler for static nume
 ## Documentation and communication
 
 - [ ] README clearly states the compiler subset, supported semantics, and known limitations.
-- [ ] Release notes include the difference between ElectronPy and CPython/PyPy/Numba/Nuitka/Codon.
+- [ ] Release notes include the difference between Tarvos and CPython/PyPy/Numba/Nuitka/Codon.
 - [ ] Compatibility boundaries are explicit: not a general interpreter, not a universal package runner.
 
 ## Distribution and operations

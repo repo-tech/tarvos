@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-if [[ ! -f "$ROOT/target/release/electronpy" && ! -f "$ROOT/target/release/electronpy.exe" ]]; then
-  cargo build --release --bin electronpy
+if [[ ! -f "$ROOT/target/release/tarvos" && ! -f "$ROOT/target/release/tarvos.exe" ]]; then
+  cargo build --release --bin tarvos
 fi
 
 python benchmarks/benchmark_matrix.py --repeats 3 --runtime all

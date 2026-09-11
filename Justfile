@@ -2,13 +2,13 @@ default:
     @echo "Available targets: bench-dev, bench-release, bench-cranelift, build-dev, build-release, check"
 
 build-dev:
-    cargo build --bin electronpy
+    cargo build --bin tarvos
 
 build-release:
-    cargo build --release --bin electronpy
+    cargo build --release --bin tarvos
 
 check:
-    cargo check --bin electronpy
+    cargo check --bin tarvos
 
 bench-dev:
     python benchmarks/run_benchmarks.py --preset dev

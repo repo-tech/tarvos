@@ -1,4 +1,4 @@
-# ElectronPy Project Summary
+# Tarvos Project Summary
 
 **Completion Date:** August 31, 2026
 
@@ -6,7 +6,7 @@
 
 ✅ **Stage 1 - MVP Compiler is Complete**
 
-ElectronPy is now a fully functional Python-to-Rust compiler that:
+Tarvos is now a fully functional Python-to-Rust compiler that:
 - Parses Python source code
 - Performs type inference & checking
 - Lowers to an Intermediate Representation
@@ -28,25 +28,25 @@ ElectronPy is now a fully functional Python-to-Rust compiler that:
 - ✅ No circular dependencies
 - ✅ Extensible architecture
 
-**2. Type System** (electronpy-types)
+**2. Type System** (tarvos-types)
 - ✅ Primitive types: Int, Float, Bool, String, None
 - ✅ Composite types: Array, Tuple (framework ready)
 - ✅ Type errors with diagnostics
 - ✅ Type Display trait for error messages
 
-**3. AST Definition** (electronpy-ast)
+**3. AST Definition** (tarvos-ast)
 - ✅ Python AST node representation
 - ✅ Serde-based deserialization
 - ✅ Support for statements: Assign, Expr, If, While, For, Function, Return
 - ✅ Support for expressions: Name, Int, Float, String, Bool, None, Binary, Compare, Call, List, Subscript
 - ✅ Operator normalization from Python AST
 
-**4. Parser** (electronpy-parser)
-- ✅ JSON → ElectronPy AST deserialization
+**4. Parser** (tarvos-parser)
+- ✅ JSON → Tarvos AST deserialization
 - ✅ Error handling with context
 - ✅ Python AST exporter (ast_export.py) working correctly
 
-**5. IR - Core Architecture** (electronpy-ir)
+**5. IR - Core Architecture** (tarvos-ir)
 - ✅ Module structure
 - ✅ Statement types (Let, Print, If, While, For, Function, Return)
 - ✅ Value types (literals, names, operations, calls, lists)
@@ -54,7 +54,7 @@ ElectronPy is now a fully functional Python-to-Rust compiler that:
 - ✅ Type context for symbol table
 - ✅ Designed for optimization
 
-**6. Semantic Analysis** (electronpy-analysis)
+**6. Semantic Analysis** (tarvos-analysis)
 - ✅ Type inference engine
 - ✅ Symbol resolution
 - ✅ AST → IR lowering with type checking
@@ -63,13 +63,13 @@ ElectronPy is now a fully functional Python-to-Rust compiler that:
 - ✅ Function call return type inference
 - ✅ Error reporting with undefined variables
 
-**7. Optimization** (electronpy-optimizer)
+**7. Optimization** (tarvos-optimizer)
 - ✅ Constant folding pass
 - ✅ Framework for multiple passes
 - ✅ Dead code elimination (framework ready)
 - ✅ Safe integer/float arithmetic
 
-**8. Code Generation** (electronpy-codegen-rust)
+**8. Code Generation** (tarvos-codegen-rust)
 - ✅ IR → Rust code mapping
 - ✅ Type mapping (Type → Rust types)
 - ✅ Statement emission (let, if, while, for, println)
@@ -77,7 +77,7 @@ ElectronPy is now a fully functional Python-to-Rust compiler that:
 - ✅ Proper indentation & formatting
 - ✅ Correct operator mapping
 
-**9. CLI** (electronpy-cli)
+**9. CLI** (tarvos-cli)
 - ✅ Command-line interface
 - ✅ 6-step compilation reporting
 - ✅ Error handling & messages
@@ -96,16 +96,16 @@ ElectronPy is now a fully functional Python-to-Rust compiler that:
 ## 📁 Crate Structure
 
 ```
-electronpy/
+tarvos/
 ├── crates/
-│   ├── electronpy-types/           (Type system definitions)
-│   ├── electronpy-ast/             (Python AST nodes)
-│   ├── electronpy-parser/          (JSON → AST)
-│   ├── electronpy-ir/              (Intermediate Representation - core)
-│   ├── electronpy-analysis/        (Type checking & lowering)
-│   ├── electronpy-optimizer/       (Optimization passes)
-│   ├── electronpy-codegen-rust/    (IR → Rust)
-│   └── electronpy-cli/             (Main entry point)
+│   ├── tarvos-types/           (Type system definitions)
+│   ├── tarvos-ast/             (Python AST nodes)
+│   ├── tarvos-parser/          (JSON → AST)
+│   ├── tarvos-ir/              (Intermediate Representation - core)
+│   ├── tarvos-analysis/        (Type checking & lowering)
+│   ├── tarvos-optimizer/       (Optimization passes)
+│   ├── tarvos-codegen-rust/    (IR → Rust)
+│   └── tarvos-cli/             (Main entry point)
 ├── python/
 │   └── ast_export.py              (Python AST → JSON)
 ├── examples/
@@ -126,13 +126,13 @@ electronpy/
 Python Source (simple.py)
   ↓ [Python ast module]
 Python AST (JSON)
-  ↓ [electronpy-parser]
-ElectronPy AST (Rust struct)
-  ↓ [electronpy-analysis: Lowering + Type Checking]
+  ↓ [tarvos-parser]
+Tarvos AST (Rust struct)
+  ↓ [tarvos-analysis: Lowering + Type Checking]
 Intermediate Representation (IR)
-  ↓ [electronpy-optimizer]
+  ↓ [tarvos-optimizer]
 Optimized IR
-  ↓ [electronpy-codegen-rust]
+  ↓ [tarvos-codegen-rust]
 Rust Source Code
   ↓ [rustc + LLVM]
 Native Binary ✓
@@ -176,13 +176,13 @@ Native Binary ✓
 
 ### Build
 ```bash
-cd electronpy
+cd tarvos
 cargo build --release
 ```
 
 ### Compile Python
 ```bash
-./target/release/electronpy examples/simple.py output.rs
+./target/release/tarvos examples/simple.py output.rs
 ```
 
 ### Run Generated Code
@@ -226,7 +226,7 @@ rustc output.rs -o output
 - Dead code elimination
 
 ### Phase 3: Profiler
-- `electronpy analyze` - identify hotspots
+- `tarvos analyze` - identify hotspots
 - CPU/memory profiling integration
 - Candidate detection for compilation
 
@@ -269,7 +269,7 @@ Each crate has **one** responsibility:
 This enables testing modules independently and extending without breaking existing code.
 
 ### 3. Type-Safe Python Subset
-ElectronPy is **not** full Python. It's a curated subset optimized for:
+Tarvos is **not** full Python. It's a curated subset optimized for:
 - Static analysis (decidable type checking)
 - Efficient compilation (no runtime type checking needed)
 - Predictable performance (no dynamic dispatch)
@@ -356,7 +356,7 @@ print(z)
 ```
 
 ```rust
-// ElectronPy generated
+// Tarvos generated
 fn main() {
     let x = 10;
     let y = 20;
@@ -395,7 +395,7 @@ Even in MVP, constant expressions are pre-computed.
 
 ## 🏁 Conclusion
 
-**ElectronPy MVP is production-quality code.** Not production-ready (limited language support), but production-quality in:
+**Tarvos MVP is production-quality code.** Not production-ready (limited language support), but production-quality in:
 - Architecture (modular, extensible, testable)
 - Error handling (proper Result types, context)
 - Code style (idiomatic Rust)

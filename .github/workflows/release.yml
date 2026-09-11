@@ -1,0 +1,80 @@
+name: Production Release & Distribution
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Package Release (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: tarvos.exe
+            archive_name: tarvos-windows-x86_64-msvc.zip
+          - os: windows-latest
+            target: x86_64-pc-windows-gnu
+            binary_name: tarvos.exe
+            archive_name: tarvos-windows-x86_64-gnu.zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_name: tarvos
+            archive_name: tarvos-linux-x86_64.tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary_name: tarvos
+            archive_name: tarvos-macos-x86_64.tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary_name: tarvos
+            archive_name: tarvos-macos-aarch64.tar.gz
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install MinGW for GNU Windows
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: |
+          choco install mingw -y
+          echo "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin" >> $GITHUB_PATH
+
+      - name: Cargo Build Release
+        run: cargo build --release --target ${{ matrix.target }} -p tarvos-cli
+
+      - name: Package Binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = "target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
+          Compress-Archive -Path $bin, "README.md" -DestinationPath "${{ matrix.archive_name }}"
+          (Get-FileHash -Path "${{ matrix.archive_name }}" -Algorithm SHA256).Hash > "${{ matrix.archive_name }}.sha256"
+
+      - name: Package Binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          tar -czvf "${{ matrix.archive_name }}" -C "target/${{ matrix.target }}/release" "${{ matrix.binary_name }}" README.md
+          shasum -a 256 "${{ matrix.archive_name }}" > "${{ matrix.archive_name }}.sha256"
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.archive_name }}
+            ${{ matrix.archive_name }}.sha256
+          draft: false
+          prerelease: false
+          generate_release_notes: true

@@ -2,11 +2,11 @@
 
 ## Scope
 
-This review audited the actual execution paths used by ElectronPy: the CLI, the Python AST exporter, the benchmark harness, and the installation scripts for benchmarking competitors.
+This review audited the actual execution paths used by Tarvos: the CLI, the Python AST exporter, the benchmark harness, and the installation scripts for benchmarking competitors.
 
 ## Summary
 
-The codebase does not contain obvious direct shell-injection patterns in the main compiler path, and the hot path uses argument arrays rather than shell strings. This is good practice. The main risk is not classic injection in the Python source itself; the risk is that ElectronPy is a code execution engine that invokes Python, Rust, and external toolchains. That means it should be treated as privileged tooling and used only in trusted environments.
+The codebase does not contain obvious direct shell-injection patterns in the main compiler path, and the hot path uses argument arrays rather than shell strings. This is good practice. The main risk is not classic injection in the Python source itself; the risk is that Tarvos is a code execution engine that invokes Python, Rust, and external toolchains. That means it should be treated as privileged tooling and used only in trusted environments.
 
 ## Findings
 
@@ -77,3 +77,20 @@ Mitigation implemented:
 ## Final assessment
 
 The project is now safer for local trusted use and is far better aligned with a documented subset-compiler release model. It still should not be considered a general-purpose, untrusted runtime. The correct release posture is: trusted local compiler for a defined subset, not a fully sandboxed general execution engine.
+
+## Production execution policy
+
+Tarvos is a compiler and compatibility runner, not a security sandbox.
+Before compiling or running a file:
+
+- treat the Python source and every imported module as trusted code
+- run builds in a dedicated workspace with no secrets in its environment
+- use a restricted OS account or container for CI jobs processing untrusted input
+- keep network access disabled unless the workload explicitly requires it
+- do not expose `tarvos run` as a service endpoint without an external
+  sandbox, resource limits, and process isolation
+- review generated native binaries before distributing them
+
+The `--python-fallback` mode delegates execution to the local CPython
+interpreter. It preserves compatibility, but it does not reduce the trust
+requirements of the input program.

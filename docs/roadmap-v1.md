@@ -1,8 +1,8 @@
-# ElectronPy 1.0 Roadmap
+# Tarvos 1.0 Roadmap
 
 ## Mission
 
-Take ElectronPy from a credible 0.0.1 subset compiler to a production-grade 1.0 release for deterministic, numeric, and loop-heavy Python workloads.
+Take Tarvos from a credible 0.0.1 subset compiler to a production-grade 1.0 release for deterministic, numeric, and loop-heavy Python workloads.
 
 The 1.0 scope is intentionally clear:
 
@@ -58,17 +58,19 @@ Deliverables:
 - stable default behavior and consistent exit codes
 - clear handling of missing Rust / toolchain fallback flows
 - safe path enforcement and no accidental workspace escapes
+- content-addressed incremental translation cache for repeated local builds
 
 Acceptance criteria:
 - command behavior is consistent across local developer setups
 - direct EXE flow works when Rust is available
 - source-only flow works without requiring Rust
 - unsafe or ambiguous paths are rejected before execution
+- unchanged source can be recompiled from the local cache and cleaned explicitly
 
 ### Objective 4: build a trustworthy benchmark harness
 
 Deliverables:
-- reproducible benchmark script for CPython, ElectronPy, and optional competitors
+- reproducible benchmark script for CPython, Tarvos, and optional competitors
 - separate reporting for compile time vs runtime time
 - stable fairness workloads that prevent trivial compile-time constant folding
 - JSON/CSV artifact export for release benchmarking
@@ -160,7 +162,7 @@ Exit criteria:
 
 ## Success definition for 1.0
 
-ElectronPy 1.0 is successful when it is a trustworthy, documented, and reproducible compiler for a clearly bounded subset of Python that:
+Tarvos 1.0 is successful when it is a trustworthy, documented, and reproducible compiler for a clearly bounded subset of Python that:
 
 - compiles supported workloads reliably
 - matches CPython behavior on the audited workload set

@@ -2,7 +2,7 @@
 
 ## Goal
 
-Turn ElectronPy from a promising subset compiler into a hardened, reproducible, and trusted build tool for static numeric Python workloads.
+Turn Tarvos from a promising subset compiler into a hardened, reproducible, and trusted build tool for static numeric Python workloads.
 
 ## Milestone 1: Secure execution boundary
 
@@ -77,7 +77,7 @@ Acceptance criteria:
 
 ## Exit criteria for Phase 2
 
-Phase 2 is complete when ElectronPy is:
+Phase 2 is complete when Tarvos is:
 - secure enough to run in a trusted local environment
 - confirmed correct for the audited subset
 - benchmarked with honest, reproducible evidence

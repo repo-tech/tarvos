@@ -1,4 +1,4 @@
-# ElectronPy Implementation - Final Summary
+# Tarvos Implementation - Final Summary
 
 **Status:** ✅ **MVP COMPLETE AND TESTED**
 
@@ -9,18 +9,18 @@
 **Built a production-quality Python-to-Rust compiler with:**
 
 1. **Modular Architecture** (8 crates)
-   - electronpy-types: Type system
-   - electronpy-ast: AST node definitions  
-   - electronpy-parser: JSON AST deserialization
-   - electronpy-ir: Intermediate Representation (core)
-   - electronpy-analysis: Type checking & lowering
-   - electronpy-optimizer: Optimization passes
-   - electronpy-codegen-rust: Rust code generation
-   - electronpy-cli: CLI entry point
+   - tarvos-types: Type system
+   - tarvos-ast: AST node definitions  
+   - tarvos-parser: JSON AST deserialization
+   - tarvos-ir: Intermediate Representation (core)
+   - tarvos-analysis: Type checking & lowering
+   - tarvos-optimizer: Optimization passes
+   - tarvos-codegen-rust: Rust code generation
+   - tarvos-cli: CLI entry point
 
 2. **Complete Pipeline**
    - Python source → JSON AST (Python's ast module)
-   - JSON AST → ElectronPy AST (deserialization)
+   - JSON AST → Tarvos AST (deserialization)
    - AST → IR (type checking + lowering)
    - IR → Optimized IR (constant folding)
    - IR → Rust source (code generation)
@@ -88,16 +88,16 @@ print(z)
 ## File Structure
 
 ```
-electronpy/
+tarvos/
 ├── crates/                         (8 Rust crates)
-│   ├── electronpy-types/
-│   ├── electronpy-ast/
-│   ├── electronpy-parser/
-│   ├── electronpy-ir/
-│   ├── electronpy-analysis/
-│   ├── electronpy-optimizer/
-│   ├── electronpy-codegen-rust/
-│   └── electronpy-cli/
+│   ├── tarvos-types/
+│   ├── tarvos-ast/
+│   ├── tarvos-parser/
+│   ├── tarvos-ir/
+│   ├── tarvos-analysis/
+│   ├── tarvos-optimizer/
+│   ├── tarvos-codegen-rust/
+│   └── tarvos-cli/
 ├── python/
 │   └── ast_export.py              (Enhanced with If, While, For, Compare, etc.)
 ├── examples/
@@ -122,7 +122,7 @@ The Intermediate Representation is the architectural heart, enabling:
 - Future support for WASM, LLVM without frontend changes
 
 ### Type-Safe Python Subset
-ElectronPy compiles a **curated subset** of Python designed for:
+Tarvos compiles a **curated subset** of Python designed for:
 - Static analysis (decidable type checking)
 - Efficient compilation
 - Predictable performance
@@ -144,7 +144,7 @@ This enables independent testing and future extension.
 cargo build --release
 
 # Compile Python
-./target/release/electronpy examples/simple.py output.rs
+./target/release/tarvos examples/simple.py output.rs
 
 # Generate and run Rust binary
 rustc output.rs -o output
@@ -197,7 +197,7 @@ rustc output.rs -o output
 
 ## Conclusion
 
-**ElectronPy MVP represents a solid foundation for a production Python compiler.**
+**Tarvos MVP represents a solid foundation for a production Python compiler.**
 
 The architecture is:
 - ✅ Correct (MVP case verified end-to-end)

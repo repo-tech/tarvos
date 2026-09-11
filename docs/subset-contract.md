@@ -1,8 +1,8 @@
-# ElectronPy 1.0 Subset Contract
+# Tarvos 1.0 Subset Contract
 
 ## Scope
 
-ElectronPy 1.0 is a compiler for a narrow but reliable subset of Python. The supported subset is intentionally limited to code patterns that can be analyzed statically and lowered predictably to Rust.
+Tarvos 1.0 is a compiler for a narrow but reliable subset of Python. The supported subset is intentionally limited to code patterns that can be analyzed statically and lowered predictably to Rust.
 
 The product is designed for deterministic, loop-heavy, numeric, and transformation-oriented workloads. It is not a full Python interpreter and it does not try to support arbitrary dynamic behavior.
 
@@ -21,6 +21,7 @@ The 1.0 contract will support the following categories:
 - simple function definitions with typed parameters and return annotations
 - function calls within the supported subset
 - list literals and simple index reads/writes
+- statically typed dictionary literals, lookups, and string-key updates
 - deterministic iteration and accumulator patterns
 
 ## Supported type model
@@ -32,6 +33,7 @@ The 1.0 type system supports:
 - `bool` -> mapped to Rust `bool`
 - `string` -> mapped to Rust `String`
 - `list[T]` -> mapped to Rust `Vec<T>` for supported element types
+- `dict[K, V]` -> mapped to Rust `HashMap<K, V>` for scalar, homogeneous keys and values
 - `None` -> unsupported as a value in executable lowering and treated as a rejected pattern
 
 ## Explicitly unsupported constructs
@@ -49,6 +51,7 @@ The following are considered out of scope for 1.0 and must fail with clear diagn
 - monkey patching and runtime reflection
 - nested dynamic scopes beyond the supported typed functions
 - untyped or unknown runtime values that cannot be lowered safely
+- dynamic dictionary methods, dictionary unpacking, and heterogeneous dictionaries
 
 ## Supported semantics
 

@@ -1,4 +1,4 @@
-# ElectronPy Architecture Document
+# Tarvos Architecture Document
 
 ## Core Design Principles
 
@@ -11,7 +11,7 @@
 ## Type System Architecture
 
 ```
-Type (from electronpy-types)
+Type (from tarvos-types)
 ├── Primitive
 │   ├── Int (i64)
 │   ├── Float (f64)
@@ -60,15 +60,15 @@ Value (Expression)
 **Input:** Python source code
 **Output:** JSON string
 
-### Stage 2: AST Parsing (electronpy-parser)
+### Stage 2: AST Parsing (tarvos-parser)
 - Deserializes JSON into `Module` struct
 - Validates AST structure via Rust type system
 - Caught by serde during deserialization
 
 **Input:** JSON string
-**Output:** `electronpy_ast::Module`
+**Output:** `tarvos_ast::Module`
 
-### Stage 3: Semantic Analysis & Lowering (electronpy-analysis)
+### Stage 3: Semantic Analysis & Lowering (tarvos-analysis)
 
 #### 3a: Type Inference
 - Literals → their types (10 → Int, "hello" → String)
@@ -82,7 +82,7 @@ Value (Expression)
 3. **Transform** - Convert AST nodes to IR
 4. **Validate** - Ensure type consistency
 
-### Stage 4: Optimization (electronpy-optimizer)
+### Stage 4: Optimization (tarvos-optimizer)
 
 #### Constant Folding
 Evaluates constant expressions at compile time:
@@ -92,7 +92,7 @@ Evaluates constant expressions at compile time:
 #### Dead Code Elimination (framework ready)
 Remove unreachable statements
 
-### Stage 5: Code Generation (electronpy-codegen-rust)
+### Stage 5: Code Generation (tarvos-codegen-rust)
 
 Map IR to Rust:
 
@@ -127,21 +127,21 @@ Operations:
 ## Module Dependencies
 
 ```
-electronpy-cli (main entry point)
-├── electronpy-parser
-│   └── electronpy-ast
-├── electronpy-analysis
-│   ├── electronpy-ast
-│   ├── electronpy-ir
-│   └── electronpy-types
-├── electronpy-optimizer
-│   └── electronpy-ir
-└── electronpy-codegen-rust
-    ├── electronpy-ir
-    └── electronpy-types
+tarvos-cli (main entry point)
+├── tarvos-parser
+│   └── tarvos-ast
+├── tarvos-analysis
+│   ├── tarvos-ast
+│   ├── tarvos-ir
+│   └── tarvos-types
+├── tarvos-optimizer
+│   └── tarvos-ir
+└── tarvos-codegen-rust
+    ├── tarvos-ir
+    └── tarvos-types
 
-electronpy-ir
-└── electronpy-types
+tarvos-ir
+└── tarvos-types
 ```
 
 **Key:** No circular dependencies. Dependency tree is acyclic.
@@ -163,13 +163,13 @@ All changes are **localized** to specific modules.
 ## Future Extensibility
 
 ### New Backends
-Add `electronpy-codegen-wasm/` without modifying existing code.
+Add `tarvos-codegen-wasm/` without modifying existing code.
 
 ### New Optimizations
 Add new passes without affecting others.
 
 ### New Frontends
-Add `electronpy-frontend-*` for PyTorch, NumPy, etc.
+Add `tarvos-frontend-*` for PyTorch, NumPy, etc.
 
 ---
 

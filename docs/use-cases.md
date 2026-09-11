@@ -1,8 +1,8 @@
-# ElectronPy Use Cases
+# Tarvos Use Cases
 
 ## Why this matters
 
-ElectronPy is not a replacement for the entire Python ecosystem. It is a compiler for a defined, reliable subset of Python that is especially useful for numeric, loop-heavy, and deterministic compute workloads.
+Tarvos is not a replacement for the entire Python ecosystem. It is a compiler for a defined, reliable subset of Python that is especially useful for numeric, loop-heavy, and deterministic compute workloads.
 
 That makes it valuable for teams that want:
 
@@ -14,7 +14,7 @@ That makes it valuable for teams that want:
 
 ## Who should use it
 
-ElectronPy fits teams that already write Python logic for:
+Tarvos fits teams that already write Python logic for:
 
 - scientific and engineering calculations
 - pricing and risk engines
@@ -45,7 +45,7 @@ def compute_total(limit: int) -> int:
 print(compute_total(1_000_000))
 ```
 
-This kind of code is a natural fit for ElectronPy because it is static, loop-driven, and arithmetic-heavy.
+This kind of code is a natural fit for Tarvos because it is static, loop-driven, and arithmetic-heavy.
 
 Benefits:
 
@@ -78,11 +78,11 @@ In a real enterprise environment this can become:
 - pricing and tax computation
 - internal data operations tools
 
-For these workflows, ElectronPy helps by converting stable compute kernels into native binaries while preserving a Python-first authoring workflow.
+For these workflows, Tarvos helps by converting stable compute kernels into native binaries while preserving a Python-first authoring workflow.
 
 ### 3. Internal tooling and operational automation
 
-Many companies use Python for internal tools, but those tools frequently end up as shell utilities or scheduled jobs. If the core logic is numeric and loop-heavy, ElectronPy can help convert the script into a native executable with clearer operational boundaries.
+Many companies use Python for internal tools, but those tools frequently end up as shell utilities or scheduled jobs. If the core logic is numeric and loop-heavy, Tarvos can help convert the script into a native executable with clearer operational boundaries.
 
 Example scenarios:
 
@@ -101,7 +101,7 @@ This matters because compiled executables are often easier to:
 
 ### 4. Performance-sensitive prototypes before full rewrite
 
-ElectronPy is useful when engineering teams want to prototype in Python and gradually move the hot path to native code without rewriting everything into Rust or C++ from day one.
+Tarvos is useful when engineering teams want to prototype in Python and gradually move the hot path to native code without rewriting everything into Rust or C++ from day one.
 
 This is especially helpful for:
 
@@ -112,14 +112,14 @@ This is especially helpful for:
 
 The product works best when the code is close to a pure compute kernel: loops, arithmetic, functions, branching, and numerical transforms.
 
-## How to use ElectronPy in a Python workflow
+## How to use Tarvos in a Python workflow
 
 ### Option A: Source-only generation
 
 Use this when you want generated Rust source without requiring a local Rust toolchain.
 
 ```bash
-electronpy compile my_workload.py output.rs
+tarvos compile my_workload.py output.rs
 ```
 
 This is ideal for:
@@ -134,13 +134,13 @@ This is ideal for:
 Use this when you want a final compiled binary.
 
 ```bash
-electronpy build my_workload.py app.exe
+tarvos build my_workload.py app.exe
 ```
 
 Or the shorthand path:
 
 ```bash
-electronpy my_workload.py output.rs
+tarvos my_workload.py output.rs
 ```
 
 This is useful when the workload is intended for:
@@ -153,14 +153,14 @@ This is useful when the workload is intended for:
 ### Option C: Run and benchmark the workload
 
 ```bash
-electronpy run my_workload.py
+tarvos run my_workload.py
 ```
 
 ```bash
-electronpy benchmark my_workload.py my_workload.rs --repeats 10
+tarvos benchmark my_workload.py my_workload.rs --repeats 10
 ```
 
-This makes ElectronPy useful for teams comparing Python baseline behavior against generated native output.
+This makes Tarvos useful for teams comparing Python baseline behavior against generated native output.
 
 ## Example: a realistic enterprise workload
 
@@ -182,7 +182,7 @@ This is exactly the kind of logic that can live in a Python prototype and then b
 
 ## Why it helps a large company or global team
 
-For an enterprise environment, ElectronPy is useful because it gives engineering teams a middle path:
+For an enterprise environment, Tarvos is useful because it gives engineering teams a middle path:
 
 - Python remains the authoring language
 - the subset is statically analyzable
@@ -199,7 +199,7 @@ This is especially relevant for companies that:
 
 ## Honest positioning for production adoption
 
-ElectronPy is not intended to replace the entire Python ecosystem or general-purpose Python execution.
+Tarvos is not intended to replace the entire Python ecosystem or general-purpose Python execution.
 
 It is best suited for:
 
@@ -224,7 +224,7 @@ For a mature engineering team, the best path is:
 1. keep the Python prototype
 2. identify the hot compute subset
 3. validate the logic against CPython
-4. compile via ElectronPy
+4. compile via Tarvos
 5. benchmark and compare execution
 6. deploy the generated native output for the stable path
 
@@ -232,7 +232,7 @@ This gives a practical release model without overpromising universal Python supp
 
 ## Bottom line
 
-ElectronPy is a strong fit when a team wants to keep Python as the development language but needs native execution for a clearly defined subset of performance-sensitive workloads.
+Tarvos is a strong fit when a team wants to keep Python as the development language but needs native execution for a clearly defined subset of performance-sensitive workloads.
 
 It is especially effective for:
 

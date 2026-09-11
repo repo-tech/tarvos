@@ -1,20 +1,61 @@
-target/
-__pycache__/
-*.pyc
+# Rust build and native artifacts
+/target/
+**/target/
+*.rlib
+*.rmeta
 *.pdb
 *.exe
+*.dll
+*.so
+*.dylib
+
+# Temporary compiler output
+/.build-tmp/
+/tmp_build/
+*.rs.tmp
+*.out
 *.log
+*.tmp
+tarvos-export/
+tarvos-cache-v1.2/
+.tarvos_cache/
+
+# Python runtime and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+ENV/
+.bench-venv/
+
+# Benchmark and generated reports
+/benchmarks/results/
+/benchmark-results/
+*.bench.json
+*.benchmark.json
+*_benchmark.json
+
+# IDE and operating-system files
 .vscode/
 .idea/
+.cargo/
 .DS_Store
-benchmarks/results/
-tools/
-true/
+Thumbs.db
+desktop.ini
+
+# Local-only tools and scratch files
+/tools/
+/true/
+dummy*
 output.rs
 temp_output.rs
 tmp_app.rs
 tmp_fair.rs
-fair_no_fold_rust.exe
-fair_no_fold_rust.pdb
-dummy_no_fold.exe
-dummy_no_fold_out.exe
+output_rust_out*
+fair_no_fold_rust*
+*_release.pdb

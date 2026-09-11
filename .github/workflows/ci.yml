@@ -1,44 +1,81 @@
-name: CI
+name: Production CI Pipeline
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main, master, develop ]
     tags: [ 'v*' ]
   pull_request:
-    branches: [ main, develop ]
+    branches: [ main, master, develop ]
 
 jobs:
-  build:
-    runs-on: windows-latest
+  test-and-build:
+    name: Build & Test (${{ matrix.os }} - ${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        target: [ x86_64-pc-windows-gnu, x86_64-pc-windows-msvc ]
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: tarvos.exe
+            use_cross: false
+          - os: windows-latest
+            target: x86_64-pc-windows-gnu
+            binary_name: tarvos.exe
+            use_cross: false
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_name: tarvos
+            use_cross: false
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary_name: tarvos
+            use_cross: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary_name: tarvos
+            use_cross: false
+
     steps:
-      - name: Checkout repository
+      - name: Checkout Codebase
         uses: actions/checkout@v4
 
-      - name: Set up Rust
-        uses: actions-rs/toolchain@v1
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          target: ${{ matrix.target }}
-          profile: minimal
-          override: true
+          targets: ${{ matrix.target }}
 
-      - name: Install GNU linker (if needed)
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Windows GNU Toolchain (if needed)
         if: matrix.target == 'x86_64-pc-windows-gnu'
         run: |
           choco install mingw -y
-          echo "C:\\ProgramData\\chocolatey\\lib\\mingw\\tools\\install\\mingw64\\bin" >> $GITHUB_PATH
+          echo "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin" >> $GITHUB_PATH
 
-      - name: Cargo build (release)
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Cargo Build (Release)
+        run: cargo build --release --target ${{ matrix.target }} -p tarvos-cli
 
-      - name: Run tests
-        run: cargo test --release --target ${{ matrix.target }}
+      - name: Run Full Test Suite
+        if: matrix.target != 'aarch64-apple-darwin' || runner.arch == 'ARM64'
+        run: cargo test --all --target ${{ matrix.target }}
 
-      - name: Upload binary artifact
+      - name: Run 1.0 Production Validation Suite
+        if: matrix.os == 'windows-latest' && matrix.target == 'x86_64-pc-windows-msvc'
+        run: python validation/run_validation.py
+
+      - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: electronpy-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/electronpy.exe
+          name: tarvos-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary_name }}
+          if-no-files-found: error
+
