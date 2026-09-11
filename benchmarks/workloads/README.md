@@ -1,6 +1,6 @@
 # Deterministic benchmark workloads
 
-This directory contains a minimal set of deterministic Python workloads covering the main benchmark categories used for correctness and performance comparison. Each workload is written to be simple, reproducible, and comparable across CPython, PyPy, Numba, Nuitka, Codon, and ElectronPy when supported.
+This directory contains a minimal set of deterministic Python workloads covering the main benchmark categories used for correctness and performance comparison. Each workload is written to be simple, reproducible, and comparable across CPython, PyPy, Numba, Nuitka, Codon, and Tarvos when supported.
 
 ## Categories
 
@@ -39,10 +39,11 @@ The workload set is currently validated through `benchmarks/workloads/expected_o
 
 The `benchmarks/competitor_env.py` script reports whether PyPy, Numba, Nuitka, Codon, and Rust are available in the current environment without forcing installs.
 
-For actual runtime comparison, use `benchmarks/run_benchmarks.py --runtime-matrix` to benchmark the supported workload corpus across every available runtime. The current environment reports:
+For actual runtime comparison, use the benchmark matrix script to compare the
+fair workload across every available runtime. The current environment reports:
 
 - CPython: available
-- ElectronPy: available
+- Tarvos: available
 - PyPy: unavailable
 - Numba: unavailable
 - Codon: unavailable
@@ -51,5 +52,5 @@ For actual runtime comparison, use `benchmarks/run_benchmarks.py --runtime-matri
 The command is:
 
 ```bash
-python benchmarks/run_benchmarks.py --runtime-matrix --runtimes cpython pypy numba codon electronpy rust --repeats 3 --export-json benchmarks/results/runtime_benchmarks.json
+python benchmarks/benchmark_matrix.py --runtime all --repeats 3 --json-output benchmarks/results/runtime_matrix.json
 ```

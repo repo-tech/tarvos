@@ -105,7 +105,7 @@ def safe_run(args, **kwargs):
 
 
 def get_rustflags():
-    flags = os.environ.get("ELECTRONPY_RUSTFLAGS", "")
+    flags = os.environ.get("TARVOS_RUSTFLAGS", "")
     return shlex.split(flags) if flags else []
 
 

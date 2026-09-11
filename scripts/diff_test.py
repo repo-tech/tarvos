@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""ElectronPy differential test runner.
+"""Tarvos differential test runner.
 
-Runs CPython and ElectronPy-generated Rust against the project workload set and
+Runs CPython and Tarvos-generated Rust against the project workload set and
 compares the final stdout.
 """
 
@@ -17,6 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "benchmarks" / "workloads" / "expected_outputs.json"
 DEFAULT_REPORT = ROOT / "benchmarks" / "results" / "results.json"
+BUILD_TMP_ROOT = ROOT / ".build-tmp"
 
 PASS = "[PASS]"
 FAIL = "[FAIL]"
@@ -57,21 +58,21 @@ def resolve_binary(path_arg: str | None) -> Path:
         return Path(path_arg).expanduser().resolve()
 
     candidates = [
-        ROOT / "target" / "x86_64-pc-windows-gnu" / "release" / "electronpy.exe",
-        ROOT / "target" / "x86_64-pc-windows-gnu" / "debug" / "electronpy.exe",
-        ROOT / "target" / "release" / "electronpy.exe",
-        ROOT / "target" / "release" / "electronpy",
-        ROOT / "target" / "debug" / "electronpy.exe",
-        ROOT / "target" / "debug" / "electronpy",
-        Path("target") / "release" / "electronpy.exe",
-        Path("target") / "release" / "electronpy",
-        Path("target") / "debug" / "electronpy.exe",
-        Path("target") / "debug" / "electronpy",
+        ROOT / "target" / "x86_64-pc-windows-gnu" / "release" / "tarvos.exe",
+        ROOT / "target" / "x86_64-pc-windows-gnu" / "debug" / "tarvos.exe",
+        ROOT / "target" / "release" / "tarvos.exe",
+        ROOT / "target" / "release" / "tarvos",
+        ROOT / "target" / "debug" / "tarvos.exe",
+        ROOT / "target" / "debug" / "tarvos",
+        Path("target") / "release" / "tarvos.exe",
+        Path("target") / "release" / "tarvos",
+        Path("target") / "debug" / "tarvos.exe",
+        Path("target") / "debug" / "tarvos",
     ]
     existing = [c for c in candidates if c.exists()]
     if not existing:
         raise FileNotFoundError(
-            "Could not find electronpy binary. Run: cargo build --bin electronpy"
+            "Could not find tarvos binary. Run: cargo build --bin tarvos"
         )
     existing.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return existing[0]
@@ -82,11 +83,17 @@ def run_python(python: str, script: Path) -> tuple[int, str, str]:
     return r.returncode, r.stdout, r.stderr
 
 
-def run_electronpy(binary: Path, script: Path, tmpdir: str) -> tuple[int, str, str]:
+def run_tarvos(binary: Path, script: Path, tmpdir: str) -> tuple[int, str, str]:
     rs_path = Path(tmpdir) / "epy_out.rs"
     exe_path = Path(tmpdir) / "epy_out.exe" if sys.platform == "win32" else Path(tmpdir) / "epy_out"
 
-    r = subprocess.run([str(binary), "compile", str(script), str(rs_path)], capture_output=True, text=True, timeout=30, cwd=str(ROOT))
+    r = subprocess.run(
+        [str(binary), "compile", str(script), "--output", str(rs_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(ROOT),
+    )
     if r.returncode != 0:
         return r.returncode, "", r.stderr + r.stdout
 
@@ -110,9 +117,9 @@ def discover_targets(directory: Path, include_all: bool, known_files: set[str]) 
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ElectronPy differential test runner")
+    parser = argparse.ArgumentParser(description="Tarvos differential test runner")
     parser.add_argument("--workloads-dir", default=str(DEFAULT_MANIFEST.parent), help="Directory containing workload .py files")
-    parser.add_argument("--binary", default=None, help="Path to electronpy binary")
+    parser.add_argument("--binary", default=None, help="Path to tarvos binary")
     parser.add_argument("--all", action="store_true", help="Test every .py file in the workload directory")
     parser.add_argument("--manifest", default=str(DEFAULT_MANIFEST), help="Path to JSON expected-output manifest")
     parser.add_argument("--json-output", default=str(DEFAULT_REPORT), help="Write summary JSON to this path")
@@ -136,7 +143,7 @@ def main():
     if not targets:
         sys.exit(f"No Python workload files found in {workload_dir}")
 
-    print(f"\nElectronPy Differential Test Runner")
+    print(f"\nTarvos Differential Test Runner")
     print(f"{'=' * 60}")
     print(f"  Python:        {python}")
     print(f"  Binary:        {binary}")
@@ -146,11 +153,17 @@ def main():
     print(f"{'=' * 60}\n")
 
     results = []
-    with tempfile.TemporaryDirectory(prefix="electronpy_diff_") as tmpdir:
+    BUILD_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="tarvos_diff_", dir=str(BUILD_TMP_ROOT)) as tmpdir:
         for script in targets:
             name = script.name
             expected = expected_outputs.get(name, "")
             t0 = time.monotonic()
+            source = script.read_text(encoding="utf-8")
+            if any(line.lstrip().startswith(("import ", "from ")) for line in source.splitlines()):
+                print(f"  {SKIP}  {name}  (uses imports outside the Tarvos native subset)")
+                results.append({"name": name, "status": "skip", "reason": "imports are outside the supported subset"})
+                continue
 
             py_rc, py_out, py_err = run_python(python, script)
             if py_rc != 0:
@@ -159,7 +172,7 @@ def main():
                 continue
 
             try:
-                ep_rc, ep_out, ep_err = run_electronpy(binary, script, tmpdir)
+                ep_rc, ep_out, ep_err = run_tarvos(binary, script, tmpdir)
             except subprocess.TimeoutExpired:
                 print(f"  {FAIL}  {name}  TIMEOUT")
                 results.append({"name": name, "status": "fail", "reason": "timeout"})
@@ -171,7 +184,7 @@ def main():
 
             elapsed = time.monotonic() - t0
             if ep_rc != 0:
-                print(f"  {FAIL}  {name}  (electronpy/rustc error)")
+                print(f"  {FAIL}  {name}  (tarvos/rustc error)")
                 print(f"         {ep_err.strip()[:200]}")
                 results.append({"name": name, "status": "fail", "reason": ep_err.strip()})
                 continue
@@ -189,20 +202,20 @@ def main():
                     "name": name,
                     "status": "pass",
                     "python_stdout": py_norm,
-                    "electronpy_stdout": ep_norm,
+                    "tarvos_stdout": ep_norm,
                     "expected_stdout": expected_norm,
                 })
             else:
                 print(f"  {FAIL}  {name}  (output mismatch)")
                 print(f"         Python:     {repr(py_norm[:120])}")
                 print(f"         Expected:   {repr(expected_norm[:120])}")
-                print(f"         ElectronPy: {repr(ep_norm[:120])}")
+                print(f"         Tarvos: {repr(ep_norm[:120])}")
                 results.append({
                     "name": name,
                     "status": "fail",
                     "reason": "output mismatch",
                     "python_stdout": py_norm,
-                    "electronpy_stdout": ep_norm,
+                    "tarvos_stdout": ep_norm,
                     "expected_stdout": expected_norm,
                 })
 
@@ -211,7 +224,7 @@ def main():
     skipped = sum(1 for r in results if r.get("status") == "skip")
 
     summary = {
-        "project": "ElectronPy",
+        "project": "Tarvos",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "workload_directory": str(workload_dir),
         "total": len(results),

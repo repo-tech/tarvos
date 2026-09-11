@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a reproducible runtime matrix for CPython, ElectronPy, and supported competitors.
+"""Run a reproducible runtime matrix for CPython, Tarvos, and supported competitors.
 
 This script benchmarks a dynamic workload whose limit and bias are read from the
 process environment so the reference cases are not trivially constant folded by the
@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -112,12 +113,12 @@ def benchmark_codon(script: Path, repeats: int):
     return {"runtime": "codon", "avg_s": sum(samples) / len(samples), "samples_ms": [s * 1000.0 for s in samples]}
 
 
-def benchmark_electronpy(script: Path, repeats: int):
-    root_bin = ROOT / "target" / "release" / ("electronpy.exe" if os.name == "nt" else "electronpy")
+def benchmark_tarvos(script: Path, repeats: int):
+    root_bin = ROOT / "target" / "release" / ("tarvos.exe" if os.name == "nt" else "tarvos")
     if not root_bin.exists():
-        root_bin = ROOT / "target" / "debug" / ("electronpy.exe" if os.name == "nt" else "electronpy")
+        root_bin = ROOT / "target" / "debug" / ("tarvos.exe" if os.name == "nt" else "tarvos")
     if not root_bin.exists():
-        return {"runtime": "electronpy", "status": "unavailable", "reason": "ElectronPy binary not built"}
+        return {"runtime": "tarvos", "status": "unavailable", "reason": "Tarvos binary not built"}
     tmpdir = ROOT / ".build-tmp" / "matrix-run"
     tmpdir.mkdir(parents=True, exist_ok=True)
     out_rs = tmpdir / "matrix_bench.rs"
@@ -125,13 +126,13 @@ def benchmark_electronpy(script: Path, repeats: int):
     run_checked([str(root_bin), "compile", str(script), str(out_rs)], cwd=str(ROOT), env={**os.environ, "BENCH_LIMIT": "10000000", "BENCH_BIAS": "0"})
     rustc = subprocess.run(["rustc", "-O", "-C", "target-cpu=native", "-o", str(out_bin), str(out_rs)], capture_output=True, text=True, env={**os.environ, "BENCH_LIMIT": "10000000", "BENCH_BIAS": "0"})
     if rustc.returncode != 0:
-        return {"runtime": "electronpy", "status": "failed", "reason": rustc.stderr.strip() or rustc.stdout.strip()}
+        return {"runtime": "tarvos", "status": "failed", "reason": rustc.stderr.strip() or rustc.stdout.strip()}
     samples = []
     for _ in range(repeats):
         start = time.perf_counter()
         run_checked([str(out_bin)], cwd=str(ROOT), env={**os.environ, "BENCH_LIMIT": "10000000", "BENCH_BIAS": "0"})
         samples.append(time.perf_counter() - start)
-    return {"runtime": "electronpy", "avg_s": sum(samples) / len(samples), "samples_ms": [s * 1000.0 for s in samples]}
+    return {"runtime": "tarvos", "avg_s": sum(samples) / len(samples), "samples_ms": [s * 1000.0 for s in samples]}
 
 
 def benchmark_rust(script: Path, repeats: int):
@@ -158,11 +159,11 @@ def benchmark_rust(script: Path, repeats: int):
 def main():
     parser = argparse.ArgumentParser(description="Run a reproducible fairness matrix for the subset compiler benchmark suite.")
     parser.add_argument("--repeats", type=int, default=5, help="Number of runs per runtime")
-    parser.add_argument("--runtime", choices=["cpython", "pypy", "numba", "nuitka", "codon", "electronpy", "rust", "all"], default="all")
+    parser.add_argument("--runtime", choices=["cpython", "pypy", "numba", "nuitka", "codon", "tarvos", "rust", "all"], default="all")
     parser.add_argument("--json-output", type=str, default=str(ROOT / "benchmarks" / "results" / "runtime_matrix.json"), help="JSON file to write")
     args = parser.parse_args()
 
-    runtimes = ["cpython", "pypy", "numba", "nuitka", "codon", "electronpy", "rust"] if args.runtime == "all" else [args.runtime]
+    runtimes = ["cpython", "pypy", "numba", "nuitka", "codon", "tarvos", "rust"] if args.runtime == "all" else [args.runtime]
     rows = []
     for name in runtimes:
         if name == "cpython":
@@ -175,14 +176,23 @@ def main():
             rows.append({"workload": SUPPORTED_PY.name, **benchmark_nuitka(SUPPORTED_PY, args.repeats)})
         elif name == "codon":
             rows.append({"workload": SUPPORTED_PY.name, **benchmark_codon(SUPPORTED_PY, args.repeats)})
-        elif name == "electronpy":
-            rows.append({"workload": SUPPORTED_PY.name, **benchmark_electronpy(SUPPORTED_PY, args.repeats)})
+        elif name == "tarvos":
+            rows.append({"workload": SUPPORTED_PY.name, **benchmark_tarvos(SUPPORTED_PY, args.repeats)})
         elif name == "rust":
             rows.append({"workload": FAIR_RS.name, **benchmark_rust(FAIR_RS, args.repeats)})
 
     path = Path(args.json_output)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+    report = {
+        "schema_version": 1,
+        "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "platform": platform.platform(),
+        "python": sys.version,
+        "workload": str(FAIR_PY.relative_to(ROOT)),
+        "repeats": args.repeats,
+        "rows": rows,
+    }
+    path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     for row in rows:
         if row.get("status") in {"unavailable", "failed"}:
