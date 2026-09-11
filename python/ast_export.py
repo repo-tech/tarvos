@@ -24,12 +24,47 @@ def convert_annotation(node):
 
 
 class PythonAstExporter(ast.NodeVisitor):
+    def __init__(self):
+        self.numpy_aliases = set()
+
+    @staticmethod
+    def location(node):
+        line = getattr(node, "lineno", None)
+        column = getattr(node, "col_offset", None)
+        if line is None:
+            return ""
+        return f" at line {line}, column {(column or 0) + 1}"
+
     def visit_Module(self, node):
+        self.numpy_aliases = {
+            alias.asname or alias.name.split(".")[0]
+            for statement in node.body
+            if isinstance(statement, ast.Import)
+            for alias in statement.names
+            if alias.name == "numpy"
+        }
         return {"type": "module", "body": [self.visit(stmt) for stmt in node.body]}
+
+    def visit_Import(self, node):
+        return {
+            "type": "import",
+            "names": [{"name": alias.name, "asname": alias.asname} for alias in node.names],
+        }
+
+    def visit_ImportFrom(self, node):
+        if node.module is None:
+            raise ValueError(f"relative imports are not supported{self.location(node)}")
+        return {
+            "type": "import_from",
+            "module": node.module,
+            "names": [{"name": alias.name, "asname": alias.asname} for alias in node.names],
+        }
 
     def visit_Assign(self, node):
         if len(node.targets) != 1:
-            raise ValueError("multiple assignment targets are not supported")
+            raise ValueError(
+                f"multiple assignment targets are not supported{self.location(node)}"
+            )
         return {"type": "assign", "target": self.visit(node.targets[0]), "value": self.visit(node.value)}
 
     def visit_AnnAssign(self, node):
@@ -41,7 +76,10 @@ class PythonAstExporter(ast.NodeVisitor):
         operators = {ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul", ast.Div: "div", ast.Mod: "mod"}
         op_type = type(node.op)
         if op_type not in operators:
-            raise ValueError(f"unsupported augmented assignment operator: {op_type.__name__}")
+            raise ValueError(
+                f"unsupported augmented assignment operator: {op_type.__name__}"
+                f"{self.location(node)}"
+            )
         return {
             "type": "assign",
             "target": self.visit(node.target),
@@ -69,13 +107,37 @@ class PythonAstExporter(ast.NodeVisitor):
         raise ValueError(f"unsupported constant: {type(value).__name__}")
 
     def visit_BinOp(self, node):
-        operators = {ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul", ast.Div: "div", ast.Mod: "mod", ast.BitAnd: "and", ast.BitOr: "or"}
+        operators = {ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul", ast.Div: "div", ast.Mod: "mod", ast.Pow: "pow", ast.BitAnd: "and", ast.BitOr: "or"}
         op_type = type(node.op)
         if op_type not in operators:
-            raise ValueError(f"unsupported operator: {op_type.__name__}")
+            raise ValueError(
+                f"unsupported operator: {op_type.__name__}{self.location(node)}"
+            )
         return {"type": "binary", "left": self.visit(node.left), "operator": operators[op_type], "right": self.visit(node.right)}
 
     def visit_Call(self, node):
+        if isinstance(node.func, ast.Attribute):
+            if (
+                isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.numpy_aliases
+                and node.func.attr in {"arange", "zeros", "ones"}
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, int)
+                and node.args[0].value >= 0
+            ):
+                size = node.args[0].value
+                if node.func.attr == "arange":
+                    elements = [{"type": "int", "value": value} for value in range(size)]
+                else:
+                    elements = [{"type": "int", "value": 0} for _ in range(size)]
+                return {"type": "list", "elements": elements}
+            return {
+                "type": "method_call",
+                "object": self.visit(node.func.value),
+                "method": node.func.attr,
+                "args": [self.visit(arg) for arg in node.args],
+            }
         return {"type": "call", "function": self.visit(node.func), "args": [self.visit(arg) for arg in node.args], "keywords": [self.visit(keyword) for keyword in node.keywords]}
 
     def visit_keyword(self, node):
@@ -87,7 +149,9 @@ class PythonAstExporter(ast.NodeVisitor):
         for op in node.ops:
             op_type = type(op)
             if op_type not in operators:
-                raise ValueError(f"unsupported comparison: {op_type.__name__}")
+                raise ValueError(
+                    f"unsupported comparison: {op_type.__name__}{self.location(node)}"
+                )
             ops.append(operators[op_type])
         return {"type": "compare", "left": self.visit(node.left), "operators": ops, "comparators": [self.visit(c) for c in node.comparators]}
 
@@ -114,18 +178,45 @@ class PythonAstExporter(ast.NodeVisitor):
     def visit_Return(self, node):
         return {"type": "return", "value": self.visit(node.value) if node.value is not None else None}
 
+    def visit_Break(self, node):
+        return {"type": "break"}
+
     def visit_List(self, node):
         return {"type": "list", "elements": [self.visit(x) for x in node.elts]}
+
+    def visit_Tuple(self, node):
+        return {"type": "tuple", "elements": [self.visit(x) for x in node.elts]}
+
+    def visit_Dict(self, node):
+        if any(key is None for key in node.keys):
+            raise ValueError(
+                "dictionary unpacking (**mapping) is not supported"
+                f"{self.location(node)}"
+            )
+        return {
+            "type": "dict",
+            "keys": [self.visit(key) for key in node.keys],
+            "values": [self.visit(value) for value in node.values],
+        }
 
     def visit_Subscript(self, node):
         return {"type": "subscript", "value": self.visit(node.value), "index": self.visit(node.slice)}
 
     def generic_visit(self, node):
-        raise ValueError(f"unsupported AST node: {type(node).__name__}")
+        raise ValueError(
+            f"unsupported AST node: {type(node).__name__}{self.location(node)}"
+        )
 
 
 def export_python_ast(source):
-    tree = ast.parse(source)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as error:
+        line = error.lineno or 0
+        column = (error.offset or 1)
+        raise ValueError(
+            f"Python syntax error at line {line}, column {column}: {error.msg}"
+        ) from error
     exporter = PythonAstExporter()
     result = exporter.visit(tree)
     print("Native Python AST Visitor re-enabled via ast.NodeVisitor", file=sys.stderr)
@@ -133,5 +224,10 @@ def export_python_ast(source):
 
 
 if __name__ == "__main__":
-    source = sys.stdin.read()
+    try:
+        source = sys.stdin.buffer.read().decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(
+            f"Python source is not valid UTF-8 at byte offset {error.start}"
+        ) from error
     print(export_python_ast(source))
