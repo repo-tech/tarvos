@@ -1,80 +1,126 @@
-name: Production Release & Distribution
+name: Tarvos Production Release
 
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build-release:
-    name: Package Release (${{ matrix.target }})
+  build:
+    name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
+          - platform: windows-x86_64
+            os: windows-latest
+            asset_name: tarvos-windows-x86_64.exe
             binary_name: tarvos.exe
-            archive_name: tarvos-windows-x86_64-msvc.zip
-          - os: windows-latest
-            target: x86_64-pc-windows-gnu
-            binary_name: tarvos.exe
-            archive_name: tarvos-windows-x86_64-gnu.zip
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+          - platform: linux-x86_64
+            os: ubuntu-latest
+            asset_name: tarvos-linux-x86_64
             binary_name: tarvos
-            archive_name: tarvos-linux-x86_64.tar.gz
-          - os: macos-latest
-            target: x86_64-apple-darwin
+          - platform: macos-x86_64
+            os: macos-latest
+            asset_name: tarvos-macos-x86_64
             binary_name: tarvos
-            archive_name: tarvos-macos-x86_64.tar.gz
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            binary_name: tarvos
-            archive_name: tarvos-macos-aarch64.tar.gz
+
+    env:
+      RUSTFLAGS: "-C opt-level=3 -C strip=symbols -C target-cpu=native"
+      CARGO_INCREMENTAL: "0"
 
     steps:
-      - name: Checkout Repository
+      - name: Check out tagged source
         uses: actions/checkout@v4
 
-      - name: Setup Rust Toolchain
+      - name: Set up stable Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
-      - name: Install MinGW for GNU Windows
-        if: matrix.target == 'x86_64-pc-windows-gnu'
-        run: |
-          choco install mingw -y
-          echo "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin" >> $GITHUB_PATH
+      - name: Build optimized CLI
+        run: cargo build --release --bin tarvos
 
-      - name: Cargo Build Release
-        run: cargo build --release --target ${{ matrix.target }} -p tarvos-cli
-
-      - name: Package Binary (Windows)
+      - name: Stage Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $bin = "target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
-          Compress-Archive -Path $bin, "README.md" -DestinationPath "${{ matrix.archive_name }}"
-          (Get-FileHash -Path "${{ matrix.archive_name }}" -Algorithm SHA256).Hash > "${{ matrix.archive_name }}.sha256"
+          $source = Join-Path $env:GITHUB_WORKSPACE "target\release\${{ matrix.binary_name }}"
+          $destination = Join-Path $env:GITHUB_WORKSPACE "${{ matrix.asset_name }}"
+          if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "Expected release binary was not produced: $source"
+          }
+          Copy-Item -LiteralPath $source -Destination $destination
+          $hash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  ${{ matrix.asset_name }}" | Set-Content -LiteralPath "$destination.sha256" -NoNewline
 
-      - name: Package Binary (Unix)
+      - name: Stage Unix binary
         if: runner.os != 'Windows'
+        shell: bash
         run: |
-          tar -czvf "${{ matrix.archive_name }}" -C "target/${{ matrix.target }}/release" "${{ matrix.binary_name }}" README.md
-          shasum -a 256 "${{ matrix.archive_name }}" > "${{ matrix.archive_name }}.sha256"
+          set -euo pipefail
+          source="target/release/${{ matrix.binary_name }}"
+          destination="${{ matrix.asset_name }}"
+          test -f "$source"
+          cp "$source" "$destination"
+          chmod 0755 "$destination"
+          shasum -a 256 "$destination" > "$destination.sha256"
 
-      - name: Upload Release Asset
+      - name: Upload staged binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: |
+            ${{ matrix.asset_name }}
+            ${{ matrix.asset_name }}.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish release assets
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download production binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tarvos-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Verify release asset boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=(
+            "tarvos-windows-x86_64.exe"
+            "tarvos-linux-x86_64"
+            "tarvos-macos-x86_64"
+          )
+          for asset in "${expected[@]}"; do
+            test -f "release-assets/$asset"
+            test -f "release-assets/$asset.sha256"
+          done
+          find release-assets -type f -printf '%f\n' | sort
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 6
+
+      - name: Upload production binaries to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}
           files: |
-            ${{ matrix.archive_name }}
-            ${{ matrix.archive_name }}.sha256
+            release-assets/tarvos-windows-x86_64.exe
+            release-assets/tarvos-windows-x86_64.exe.sha256
+            release-assets/tarvos-linux-x86_64
+            release-assets/tarvos-linux-x86_64.sha256
+            release-assets/tarvos-macos-x86_64
+            release-assets/tarvos-macos-x86_64.sha256
           draft: false
-          prerelease: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
