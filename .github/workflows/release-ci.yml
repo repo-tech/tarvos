@@ -1,4 +1,4 @@
-name: Tarvos 0.0.1 release validation
+name: Tarvos 1.5.0 release validation
 
 on:
   push:
@@ -24,11 +24,14 @@ jobs:
       - name: Build Tarvos
         run: cargo build --release --bin tarvos
 
-      - name: Validate same-output fairness case
-        run: bash scripts/verify_same_output.sh
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      - name: Run production validation suite
+        run: python validation/run_validation.py
 
       - name: Run benchmark matrix
-        run: python benchmarks/benchmark_matrix.py --runtime all --repeats 1
+        run: python benchmarks/benchmark_matrix.py --runtime all --repeats 1 --json-output benchmarks/results/runtime_matrix.json
 
       - name: Upload runtime matrix JSON
         uses: actions/upload-artifact@v4
