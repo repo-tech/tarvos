@@ -1,0 +1,22 @@
+[package]
+name = "tarvos-cli"
+version = "1.2.0"
+edition = "2021"
+
+[[bin]]
+name = "tarvos"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+clap = { version = "4.5", features = ["derive"] }
+colored = "2.1"
+rustpython-parser = "0.4"
+tarvos-core = { path = "../tarvos-core" }
+tarvos-ast = { path = "../tarvos-ast" }
+tarvos-parser = { path = "../tarvos-parser" }
+tarvos-ir = { path = "../tarvos-ir" }
+tarvos-analysis = { path = "../tarvos-analysis" }
+tarvos-optimizer = { path = "../tarvos-optimizer" }
+tarvos-codegen-rust = { path = "../tarvos-codegen-rust" }
