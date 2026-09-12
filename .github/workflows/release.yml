@@ -123,10 +123,14 @@ jobs:
       - name: Download production binaries
         uses: actions/download-artifact@v4
         with:
-          pattern: |
-            tarvos-*
-            Tarvos-Setup-Windows-x86_64
+          pattern: tarvos-*
           merge-multiple: true
+          path: release-assets
+
+      - name: Download Windows setup executable
+        uses: actions/download-artifact@v4
+        with:
+          name: Tarvos-Setup-Windows-x86_64
           path: release-assets
 
       - name: Verify release asset boundary
