@@ -118,6 +118,11 @@ tarvos clean
 
 Tarvos targets numerical kernels, loop induction, and algorithmic recursion. Below are typical speedups over CPython 3.12:
 
+CI benchmark reports are reproducible, not universal performance promises. Each
+run uses one excluded warm-up, seven measured samples, median/minimum/maximum,
+standard deviation, separate compiler time, stdout parity, and fixed
+toolchain/runner metadata. See [the benchmark methodology](docs/BENCHMARKING.md).
+
 | Workload | CPython 3.12 | Tarvos (Native Rust) | Speedup |
 | :--- | :--- | :--- | :--- |
 | **Gauss Arithmetic Loop** | 1,240 ms | **0.01 ms** (Closed-form induction) | **>1000x** |

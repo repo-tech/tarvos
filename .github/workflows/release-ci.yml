@@ -30,8 +30,18 @@ jobs:
       - name: Run production validation suite
         run: python validation/run_validation.py
 
+      - name: Verify Python to Rust and native executable flows
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .build-tmp/ci-smoke
+          ./target/release/tarvos compile examples/simple.py --output .build-tmp/ci-smoke/simple.rs
+          ./target/release/tarvos build examples/simple.py --output .build-tmp/ci-smoke/simple
+          test -s .build-tmp/ci-smoke/simple.rs
+          test "$(.build-tmp/ci-smoke/simple)" = "50000005000000"
+
       - name: Run benchmark matrix
-        run: python benchmarks/benchmark_matrix.py --runtime all --repeats 1 --json-output benchmarks/results/runtime_matrix.json
+        run: python benchmarks/benchmark_matrix.py --runtime all --repeats 7 --json-output benchmarks/results/runtime_matrix.json
 
       - name: Upload runtime matrix JSON
         uses: actions/upload-artifact@v4

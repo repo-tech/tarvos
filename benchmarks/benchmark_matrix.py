@@ -13,6 +13,7 @@ import json
 import os
 import platform
 import shutil
+import statistics
 import subprocess
 import sys
 import time
@@ -48,13 +49,42 @@ def measure_once(cmd):
     return elapsed, proc.stdout.strip()
 
 
-def benchmark_python(script: Path, repeats: int):
+def summarize(runtime, samples, output, compile_s=None, warmup_s=None):
+    values_ms = [sample * 1000.0 for sample in samples]
+    return {
+        "runtime": runtime,
+        "compile_s": compile_s,
+        "warmup_s": None if warmup_s is None else warmup_s,
+        "execution_ms": {
+            "samples": values_ms,
+            "median": statistics.median(values_ms),
+            "minimum": min(values_ms),
+            "maximum": max(values_ms),
+            "standard_deviation": statistics.stdev(values_ms) if len(values_ms) > 1 else 0.0,
+        },
+        "output": output,
+    }
+
+
+def execute_with_warmup(command, cwd, env, repeats):
+    warmup_start = time.perf_counter()
+    warmup = run_checked(command, cwd=cwd, env=env)
+    warmup_s = time.perf_counter() - warmup_start
     samples = []
+    output = warmup.stdout.strip()
     for _ in range(repeats):
         start = time.perf_counter()
-        run_checked([sys.executable, str(script)], cwd=str(script.parent), env={**os.environ, "BENCH_LIMIT": "10000000", "BENCH_BIAS": "0"})
+        result = run_checked(command, cwd=cwd, env=env)
         samples.append(time.perf_counter() - start)
-    return {"runtime": "cpython", "avg_s": sum(samples) / len(samples), "samples_ms": [s * 1000.0 for s in samples]}
+        if result.stdout.strip() != output:
+            raise RuntimeError(f"non-deterministic output from {' '.join(map(str, command))}")
+    return samples, output, warmup_s
+
+
+def benchmark_python(script: Path, repeats: int):
+    env = {**os.environ, "BENCH_LIMIT": "10000000", "BENCH_BIAS": "0"}
+    samples, output, warmup_s = execute_with_warmup([sys.executable, str(script)], str(script.parent), env, repeats)
+    return summarize("cpython", samples, output, warmup_s=warmup_s)
 
 
 def benchmark_pypy(script: Path, repeats: int):
@@ -123,16 +153,17 @@ def benchmark_tarvos(script: Path, repeats: int):
     tmpdir.mkdir(parents=True, exist_ok=True)
     out_rs = tmpdir / "matrix_bench.rs"
     out_bin = tmpdir / ("matrix_bench.exe" if os.name == "nt" else "matrix_bench")
+    compile_start = time.perf_counter()
     run_checked([str(root_bin), "compile", str(script), "--output", str(out_rs)], cwd=str(ROOT), env={**os.environ, "BENCH_LIMIT": "10000000", "BENCH_BIAS": "0"})
+    compile_s = time.perf_counter() - compile_start
+    rust_compile_start = time.perf_counter()
     rustc = subprocess.run(["rustc", "-O", "-C", "target-cpu=native", "-o", str(out_bin), str(out_rs)], capture_output=True, text=True, env={**os.environ, "BENCH_LIMIT": "10000000", "BENCH_BIAS": "0"})
     if rustc.returncode != 0:
         return {"runtime": "tarvos", "status": "failed", "reason": rustc.stderr.strip() or rustc.stdout.strip()}
-    samples = []
-    for _ in range(repeats):
-        start = time.perf_counter()
-        run_checked([str(out_bin)], cwd=str(ROOT), env={**os.environ, "BENCH_LIMIT": "10000000", "BENCH_BIAS": "0"})
-        samples.append(time.perf_counter() - start)
-    return {"runtime": "tarvos", "avg_s": sum(samples) / len(samples), "samples_ms": [s * 1000.0 for s in samples]}
+    compile_s += time.perf_counter() - rust_compile_start
+    env = {**os.environ, "BENCH_LIMIT": "10000000", "BENCH_BIAS": "0"}
+    samples, output, warmup_s = execute_with_warmup([str(out_bin)], str(ROOT), env, repeats)
+    return summarize("tarvos", samples, output, compile_s=compile_s, warmup_s=warmup_s)
 
 
 def benchmark_rust(script: Path, repeats: int):
@@ -145,15 +176,14 @@ def benchmark_rust(script: Path, repeats: int):
     if os.name == "nt":
         out_bin = ROOT / ".build-tmp" / "rust_matrix_bench.exe"
     compile_cmd = [rustc_bin, "-O", "-C", "target-cpu=native", "-o", str(out_bin), str(script)]
+    rust_compile_start = time.perf_counter()
     rustc = subprocess.run(compile_cmd, capture_output=True, text=True, env={**os.environ, "BENCH_LIMIT": "10000000", "BENCH_BIAS": "0"})
     if rustc.returncode != 0:
         return {"runtime": "rust", "status": "failed", "reason": rustc.stderr.strip() or rustc.stdout.strip()}
-    samples = []
-    for _ in range(repeats):
-        start = time.perf_counter()
-        run_checked([str(out_bin)], cwd=str(ROOT), env={**os.environ, "BENCH_LIMIT": "10000000", "BENCH_BIAS": "0"})
-        samples.append(time.perf_counter() - start)
-    return {"runtime": "rust", "avg_s": sum(samples) / len(samples), "samples_ms": [s * 1000.0 for s in samples]}
+    compile_s = time.perf_counter() - rust_compile_start
+    env = {**os.environ, "BENCH_LIMIT": "10000000", "BENCH_BIAS": "0"}
+    samples, output, warmup_s = execute_with_warmup([str(out_bin)], str(ROOT), env, repeats)
+    return summarize("rust", samples, output, compile_s=compile_s, warmup_s=warmup_s)
 
 
 def main():
@@ -162,6 +192,19 @@ def main():
     parser.add_argument("--runtime", choices=["cpython", "pypy", "numba", "nuitka", "codon", "tarvos", "rust", "all"], default="all")
     parser.add_argument("--json-output", type=str, default=str(ROOT / "benchmarks" / "results" / "runtime_matrix.json"), help="JSON file to write")
     args = parser.parse_args()
+    tarvos_binary = ROOT / "target" / ("release" if (ROOT / "target" / "release").exists() else "debug") / (
+        "tarvos.exe" if os.name == "nt" else "tarvos"
+    )
+    toolchain = {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip()
+        if shutil.which("rustc")
+        else "unavailable",
+        "tarvos": subprocess.check_output([str(tarvos_binary), "--version"], text=True).strip()
+        if tarvos_binary.exists()
+        else "unavailable",
+    }
 
     runtimes = ["cpython", "pypy", "numba", "nuitka", "codon", "tarvos", "rust"] if args.runtime == "all" else [args.runtime]
     rows = []
@@ -183,13 +226,21 @@ def main():
 
     path = Path(args.json_output)
     path.parent.mkdir(parents=True, exist_ok=True)
+    available_outputs = {row["output"] for row in rows if row.get("output") is not None}
+    output_comparison = {
+        "status": "pass" if len(available_outputs) <= 1 else "fail",
+        "outputs": sorted(available_outputs),
+    }
     report = {
         "schema_version": 1,
         "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "platform": platform.platform(),
         "python": sys.version,
+        "toolchain": toolchain,
         "workload": str(FAIR_PY.relative_to(ROOT)),
         "repeats": args.repeats,
+        "warmup_runs": 1,
+        "output_comparison": output_comparison,
         "rows": rows,
     }
     path.write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -198,8 +249,16 @@ def main():
         if row.get("status") in {"unavailable", "failed"}:
             print(f"{row['runtime']}: {row.get('status')} - {row.get('reason', 'unknown reason')}")
         else:
-            print(f"{row['runtime']}: {row['avg_s'] * 1000.0:.2f} ms avg")
+            stats = row["execution_ms"]
+            print(
+                f"{row['runtime']}: median {stats['median']:.2f} ms "
+                f"(min {stats['minimum']:.2f}, max {stats['maximum']:.2f}, "
+                f"stdev {stats['standard_deviation']:.2f})"
+            )
 
+    print(f"Output comparison: {output_comparison['status']}")
+    if output_comparison["status"] == "fail":
+        raise SystemExit("Benchmark output parity failed")
     print(f"\nMatrix output written to: {path}")
     return 0
 
