@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-analysis"
-version = "1.2.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "tarvos-ast",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-ast"
-version = "1.2.0"
+version = "1.5.0"
 dependencies = [
  "serde",
  "tarvos-types",
@@ -655,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-codegen-rust"
-version = "1.2.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "tarvos-ir",
@@ -664,7 +664,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-core"
-version = "1.2.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "tarvos-analysis",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-ir"
-version = "1.2.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "tarvos-ast",
@@ -684,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-optimizer"
-version = "1.2.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "tarvos-ir",
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-parser"
-version = "1.2.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-tests"
-version = "1.2.0"
+version = "1.5.0"
 dependencies = [
  "tarvos-analysis",
  "tarvos-ast",
@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-types"
-version = "1.2.0"
+version = "1.5.0"
 dependencies = [
  "serde",
  "thiserror",

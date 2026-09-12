@@ -31,9 +31,15 @@ tarvos analyze .\app.py --hot-functions
 ```
 
 ```powershell
-# Run the automated one-line installer
+# Install the v1.5.0 public release without administrator rights.
 .\install.ps1
 ```
+
+For a private fork, set `TARVOS_GITHUB_TOKEN` to a fine-grained token with
+repository Contents read access before running the installer. The installer
+stores the executable in `%USERPROFILE%\.tarvos\bin` and updates only the
+current user's `PATH`. To replace an existing installation, use
+`.\install.ps1 -Force`.
 
 ### Linux & macOS (Bash)
 ```bash
@@ -45,6 +51,17 @@ curl -sSf https://raw.githubusercontent.com/repo-tech/Tarvos/main/install.sh | b
 ```bash
 cargo install --locked --path crates/tarvos-cli --force
 ```
+
+### Via the Python wrapper
+```powershell
+python -m pip install .
+$env:TARVOS_GITHUB_TOKEN = "github_pat_..."
+tarvos --version
+```
+
+The Python wrapper lazily downloads the matching private-release binary on its
+first invocation and verifies its SHA-256 checksum. Set `TARVOS_VERSION` to a
+specific release tag when required.
 
 ---
 
