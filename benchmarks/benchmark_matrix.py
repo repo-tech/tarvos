@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Run a reproducible runtime matrix for CPython, Tarvos, and supported competitors.
 
-This script benchmarks a dynamic workload whose limit and bias are read from the
-process environment so the reference cases are not trivially constant folded by the
-compiler toolchain during the measurement.
+This script benchmarks one deterministic workload shared by CPython, Tarvos, and
+Rust. Keeping the workload inside Tarvos's supported static subset makes CI
+failures represent real regressions instead of unsupported-language features.
 """
 
 from __future__ import annotations
