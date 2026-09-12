@@ -60,6 +60,22 @@ jobs:
           $hash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  ${{ matrix.asset_name }}" | Set-Content -LiteralPath "$destination.sha256" -NoNewline
 
+      - name: Build blue Windows setup executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress --yes
+          New-Item -ItemType Directory -Force -Path installer\payload | Out-Null
+          Copy-Item "${{ matrix.asset_name }}" installer\payload\tarvos.exe
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\Tarvos.iss
+          $setup = "installer\output\Tarvos-Setup-Windows-x86_64.exe"
+          if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) {
+            throw "Windows setup executable was not produced."
+          }
+          Copy-Item $setup Tarvos-Setup-Windows-x86_64.exe
+          $hash = (Get-FileHash Tarvos-Setup-Windows-x86_64.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  Tarvos-Setup-Windows-x86_64.exe" | Set-Content Tarvos-Setup-Windows-x86_64.exe.sha256 -NoNewline
+
       - name: Stage Unix binary
         if: runner.os != 'Windows'
         shell: bash
@@ -79,6 +95,17 @@ jobs:
           path: |
             ${{ matrix.asset_name }}
             ${{ matrix.asset_name }}.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload Windows setup executable
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tarvos-Setup-Windows-x86_64
+          path: |
+            Tarvos-Setup-Windows-x86_64.exe
+            Tarvos-Setup-Windows-x86_64.exe.sha256
           if-no-files-found: error
           retention-days: 1
 
@@ -107,8 +134,10 @@ jobs:
             test -f "release-assets/$asset"
             test -f "release-assets/$asset.sha256"
           done
+          test -f release-assets/Tarvos-Setup-Windows-x86_64.exe
+          test -f release-assets/Tarvos-Setup-Windows-x86_64.exe.sha256
           find release-assets -type f -printf '%f\n' | sort
-          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 6
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 8
 
       - name: Upload production binaries to GitHub Release
         uses: softprops/action-gh-release@v2
@@ -119,6 +148,8 @@ jobs:
           files: |
             release-assets/tarvos-windows-x86_64.exe
             release-assets/tarvos-windows-x86_64.exe.sha256
+            release-assets/Tarvos-Setup-Windows-x86_64.exe
+            release-assets/Tarvos-Setup-Windows-x86_64.exe.sha256
             release-assets/tarvos-linux-x86_64
             release-assets/tarvos-linux-x86_64.sha256
             release-assets/tarvos-macos-x86_64
