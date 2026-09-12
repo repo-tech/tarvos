@@ -117,7 +117,9 @@ jobs:
       - name: Download production binaries
         uses: actions/download-artifact@v4
         with:
-          pattern: tarvos-*
+          pattern: |
+            tarvos-*
+            Tarvos-Setup-Windows-x86_64
           merge-multiple: true
           path: release-assets
 
