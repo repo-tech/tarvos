@@ -113,6 +113,8 @@ jobs:
       - name: Upload production binaries to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          repository: repo-tech/tarvos-engine
+          token: ${{ secrets.TARVOS_DISTRIBUTION_TOKEN }}
           tag_name: ${{ github.ref_name }}
           files: |
             release-assets/tarvos-windows-x86_64.exe
