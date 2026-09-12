@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to publish"
+        required: true
+        default: "v1.5.0"
 
 permissions:
   contents: write
@@ -146,7 +152,7 @@ jobs:
         with:
           repository: repo-tech/tarvos-engine
           token: ${{ secrets.TARVOS_DISTRIBUTION_TOKEN }}
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
           files: |
             release-assets/tarvos-windows-x86_64.exe
             release-assets/tarvos-windows-x86_64.exe.sha256
@@ -157,5 +163,5 @@ jobs:
             release-assets/tarvos-macos-x86_64
             release-assets/tarvos-macos-x86_64.sha256
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(inputs.release_tag || github.ref_name, '-') }}
           generate_release_notes: true
