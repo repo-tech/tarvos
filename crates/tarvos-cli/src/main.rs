@@ -661,6 +661,7 @@ fn scan_project_mode(input: &Path) -> Result<()> {
     }
     let detector = NativeSubsetDetector::default();
     let mut total_loops = 0;
+    let mut scan_errors = 0;
     println!("=== Tarvos Native Subset & Library Loop Scan ===");
     println!("Project: {}", input.display());
     for file in &files {
@@ -668,6 +669,7 @@ fn scan_project_mode(input: &Path) -> Result<()> {
             Ok(source) => source,
             Err(error) => {
                 println!("\nFile: {}\n  Scan error: {}", file.display(), error);
+                scan_errors += 1;
                 continue;
             }
         };
@@ -675,6 +677,7 @@ fn scan_project_mode(input: &Path) -> Result<()> {
             Ok(ast_json) => ast_json,
             Err(error) => {
                 println!("\nFile: {}\n  Scan error: {}", file.display(), error);
+                scan_errors += 1;
                 continue;
             }
         };
@@ -682,6 +685,7 @@ fn scan_project_mode(input: &Path) -> Result<()> {
             Ok(module) => module,
             Err(error) => {
                 println!("\nFile: {}\n  Scan error: {}", file.display(), error);
+                scan_errors += 1;
                 continue;
             }
         };
@@ -746,6 +750,12 @@ fn scan_project_mode(input: &Path) -> Result<()> {
         files.len(),
         total_loops
     );
+    if scan_errors > 0 {
+        return Err(anyhow::anyhow!(
+            "scan completed with {} unsupported or unreadable file(s); review the diagnostics above",
+            scan_errors
+        ));
+    }
     Ok(())
 }
 
