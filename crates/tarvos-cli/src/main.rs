@@ -974,7 +974,7 @@ fn transpile_python_to_rust(input_path: &Path) -> Result<String> {
         .with_context(|| format!("failed to create cache directory {}", cache_dir.display()))?;
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    "tarvos-cache-v1.5-codegen-v11-main-wrapper".hash(&mut hasher);
+    "tarvos-cache-v1.0-codegen-v12-main-wrapper".hash(&mut hasher);
     source.hash(&mut hasher);
     let cache_path = cache_dir.join(format!("{:016x}.rs", hasher.finish()));
 
@@ -1013,7 +1013,7 @@ fn tarvos_cache_dir() -> Result<PathBuf> {
     }
     .map(PathBuf::from)
     .ok_or_else(|| anyhow::anyhow!("could not determine the current user's home directory"))?;
-    Ok(home.join(".tarvos").join("cache").join("tarvos-cache-v1.5"))
+    Ok(home.join(".tarvos").join("cache").join("tarvos-cache-v1.0"))
 }
 
 fn write_rust_output(output_path: &Path, rust_source: &str) -> Result<()> {
