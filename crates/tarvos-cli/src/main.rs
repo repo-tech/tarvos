@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use std::{
     env, fs,
     hash::{Hash, Hasher},
@@ -27,15 +27,11 @@ use tarvos_parser::parse_python_ast;
 
 /// Tarvos — Ultra-fast Python to Native Rust Transpiler & Compiler
 #[derive(Parser, Debug)]
-#[command(name = "tarvos", disable_version_flag = true)]
+#[command(name = "tarvos")]
 #[command(author = "Himanshu & Repo-Tech Team")]
 #[command(version = "1.0.0")]
 #[command(about = "Transpiles and compiles Python code to native high-performance Rust executables", long_about = None)]
 struct Cli {
-    /// Print the Tarvos version.
-    #[arg(short = 'v', long = "version", action = ArgAction::Version)]
-    version: bool,
-
     #[command(subcommand)]
     command: Option<Commands>,
 
@@ -188,6 +184,10 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
+    if std::env::args().skip(1).any(|arg| arg == "-v") {
+        println!("tarvos 1.0.0");
+        return Ok(());
+    }
     let cli = Cli::parse();
 
     match cli.command {
