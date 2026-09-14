@@ -31,7 +31,7 @@ tarvos analyze .\app.py --hot-functions
 ```
 
 ```powershell
-# Install the v1.5.0 public release without administrator rights.
+# Install the v1.0.0 public release without administrator rights.
 .\install.ps1
 ```
 

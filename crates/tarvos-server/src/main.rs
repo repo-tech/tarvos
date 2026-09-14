@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind(address).await?;
 
     println!(
-        "Tarvos v1.5.0 gateway listening on http://{}",
+        "Tarvos v1.0.0 gateway listening on http://{}",
         listener.local_addr()?
     );
 

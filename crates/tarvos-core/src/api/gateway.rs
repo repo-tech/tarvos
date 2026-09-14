@@ -42,7 +42,7 @@ use crate::CompilePipeline;
 
 const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
 const SANDBOX_IMAGE_ENV: &str = "TARVOS_SANDBOX_IMAGE";
-const DEFAULT_SANDBOX_IMAGE: &str = "tarvos/sandbox:1.5.0";
+const DEFAULT_SANDBOX_IMAGE: &str = "tarvos/sandbox:1.0.0";
 
 #[derive(Clone, Debug)]
 pub struct GatewayConfig {
@@ -258,7 +258,7 @@ async fn terminal_session(mut socket: WebSocket, config: GatewayConfig) {
     let _ = send_event(
         &mut socket,
         TerminalEvent::Stdout {
-            data: "Tarvos v1.5.0 sandbox gateway ready\r\n".to_owned(),
+            data: "Tarvos v1.0.0 sandbox gateway ready\r\n".to_owned(),
         },
     )
     .await;
@@ -454,7 +454,7 @@ fn cache_root() -> PathBuf {
         .or_else(|| env::var_os("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir);
-    home.join(".tarvos").join("cache").join("v1.5.0")
+    home.join(".tarvos").join("cache").join("v1.0.0")
 }
 
 fn unique_path(root: &Path, prefix: &str) -> PathBuf {

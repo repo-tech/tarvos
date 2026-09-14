@@ -9,7 +9,7 @@ on:
       release_tag:
         description: "Existing release tag to publish"
         required: true
-        default: "v1.5.0"
+        default: "v1.0.0"
 
 permissions:
   contents: write
@@ -40,7 +40,7 @@ jobs:
             binary_name: tarvos
 
     env:
-      RUSTFLAGS: "-C opt-level=3 -C strip=symbols -C target-cpu=native"
+      RUSTFLAGS: "-C opt-level=z -C strip=symbols -C target-cpu=native"
       CARGO_INCREMENTAL: "0"
 
     steps:

@@ -1,4 +1,4 @@
-name: Tarvos 1.5.0 release validation
+name: Tarvos 1.0.0 release validation
 
 on:
   push:

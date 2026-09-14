@@ -1,11 +1,11 @@
-# Tarvos v1.5.0 hybrid production image.
+# Tarvos v1.0.0 hybrid production image.
 # Runtime includes Python for the embedded AST exporter and rustc/sysroot for
 # generated Rust builds, but never includes the repository source tree or Cargo.
 
 FROM rust:1.80-slim AS builder
 
 WORKDIR /workspace
-ENV RUSTFLAGS="-C opt-level=3 -C strip=symbols -C target-cpu=native"
+ENV RUSTFLAGS="-C opt-level=z -C strip=symbols -C target-cpu=native"
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
