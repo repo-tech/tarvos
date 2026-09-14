@@ -181,6 +181,60 @@ class PythonAstExporter(ast.NodeVisitor):
     def visit_Break(self, node):
         return {"type": "break"}
 
+    def visit_Continue(self, node):
+        return {"type": "continue"}
+
+    def visit_Raise(self, node):
+        return {"type": "raise", "exc": self.visit(node.exc) if node.exc is not None else None}
+
+    def visit_Try(self, node):
+        handlers = []
+        for handler in node.handlers:
+            handlers.append({
+                "name": handler.name,
+                "exc_type": self.visit(handler.type) if handler.type is not None else None,
+                "body": [self.visit(x) for x in handler.body],
+            })
+        return {
+            "type": "try",
+            "body": [self.visit(x) for x in node.body],
+            "handlers": handlers,
+            "orelse": [self.visit(x) for x in node.orelse],
+            "finalbody": [self.visit(x) for x in node.finalbody],
+        }
+
+    def visit_With(self, node):
+        items = []
+        for item in node.items:
+            items.append({
+                "context_expr": self.visit(item.context_expr),
+                "optional_vars": self.visit(item.optional_vars) if item.optional_vars is not None else None,
+            })
+        return {
+            "type": "with",
+            "items": items,
+            "body": [self.visit(x) for x in node.body],
+        }
+
+    def visit_Slice(self, node):
+        return {
+            "type": "slice",
+            "lower": self.visit(node.lower) if node.lower is not None else None,
+            "upper": self.visit(node.upper) if node.upper is not None else None,
+            "step": self.visit(node.step) if node.step is not None else None,
+        }
+
+    def visit_UnaryOp(self, node):
+        operators = {ast.USub: "usub", ast.UAdd: "uadd", ast.Not: "not", ast.Invert: "invert"}
+        op_type = type(node.op)
+        if op_type not in operators:
+            raise ValueError(f"unsupported unary operator: {op_type.__name__}{self.location(node)}")
+        return {
+            "type": "unary",
+            "operator": operators[op_type],
+            "operand": self.visit(node.operand),
+        }
+
     def visit_List(self, node):
         return {"type": "list", "elements": [self.visit(x) for x in node.elts]}
 
@@ -201,6 +255,24 @@ class PythonAstExporter(ast.NodeVisitor):
 
     def visit_Subscript(self, node):
         return {"type": "subscript", "value": self.visit(node.value), "index": self.visit(node.slice)}
+
+    def visit_JoinedStr(self, node):
+        parts = []
+        for part in node.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                parts.append({"type": "literal", "value": part.value})
+            elif isinstance(part, ast.FormattedValue):
+                if part.conversion != -1 or part.format_spec is not None:
+                    raise ValueError(
+                        "f-string conversions and format specifications are not supported"
+                        f"{self.location(part)}"
+                    )
+                parts.append({"type": "value", "value": self.visit(part.value)})
+            else:
+                raise ValueError(
+                    f"unsupported f-string part: {type(part).__name__}{self.location(part)}"
+                )
+        return {"type": "format_string", "parts": parts}
 
     def generic_visit(self, node):
         raise ValueError(
@@ -226,8 +298,8 @@ def export_python_ast(source):
 if __name__ == "__main__":
     try:
         source = sys.stdin.buffer.read().decode("utf-8")
+        print(export_python_ast(source))
     except UnicodeDecodeError as error:
         raise ValueError(
             f"Python source is not valid UTF-8 at byte offset {error.start}"
         ) from error
-    print(export_python_ast(source))

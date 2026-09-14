@@ -18,6 +18,7 @@ use tarvos_analysis::native_detector::{ModuleReport, NativePlan, NativeSubsetDet
 use tarvos_analysis::native_specialization::{
     specialize_module, wire_specialization_runtime, SpecializedLoop,
 };
+use tarvos_analysis::vectorize::{detect_vector_plans, emit_runtime_helpers};
 use tarvos_core::{
     export_python_ast as core_export_python_ast, find_python_command as core_find_python_command,
     CompilePipeline,
@@ -28,7 +29,7 @@ use tarvos_parser::parse_python_ast;
 #[derive(Parser, Debug)]
 #[command(name = "tarvos")]
 #[command(author = "Himanshu & Repo-Tech Team")]
-#[command(version = "1.5.0")]
+#[command(version = "1.0.0")]
 #[command(about = "Transpiles and compiles Python code to native high-performance Rust executables", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -62,6 +63,10 @@ enum Commands {
         /// Generate only Rust source without invoking native rustc compiler
         #[arg(long)]
         source_only: bool,
+
+        /// Code generation target: native (default) or embedded (strict no_std subset)
+        #[arg(long, default_value = "native")]
+        target: String,
     },
 
     /// Build a native binary executable directly from Python
@@ -187,6 +192,7 @@ fn main() -> Result<()> {
             output,
             format,
             source_only,
+            target,
         }) => {
             let mut args = vec![input.to_string_lossy().to_string()];
             if format != "rust" {
@@ -199,6 +205,10 @@ fn main() -> Result<()> {
             }
             if source_only {
                 args.push("--source-only".to_string());
+            }
+            if target != "native" {
+                args.push("--target".to_string());
+                args.push(target);
             }
             compile_mode(&args)
         }
@@ -290,6 +300,7 @@ pub(crate) fn compile_mode(args: &[String]) -> Result<()> {
     let mut output_file = "output.rs".to_string();
     let mut format = "rust".to_string();
     let mut source_only = false;
+    let mut target = "native".to_string();
     let mut iter = args.iter();
     let input_file = iter
         .next()
@@ -306,6 +317,9 @@ pub(crate) fn compile_mode(args: &[String]) -> Result<()> {
             "--source-only" => {
                 source_only = true;
             }
+            "--target" => {
+                target = iter.next().cloned().unwrap_or_else(|| "native".to_string());
+            }
             _ => {
                 if output_file == "output.rs" {
                     output_file = arg.clone();
@@ -317,7 +331,15 @@ pub(crate) fn compile_mode(args: &[String]) -> Result<()> {
     let working_dir = env::current_dir()?;
     let input_path = secure_input_path(input_file, &working_dir)?;
     let output_path = secure_output_path(&output_file, &working_dir)?;
-    let rust_source = transpile_python_to_rust(&input_path)?;
+    let rust_source = match target.as_str() {
+        "native" => transpile_python_to_rust(&input_path)?,
+        "embedded" => CompilePipeline::transpile_file_embedded(&input_path)?,
+        other => {
+            return Err(anyhow::anyhow!(
+                "unsupported target `{other}`; choose `native` or `embedded`"
+            ))
+        }
+    };
 
     println!("=== Tarvos Compiler ===\n");
     println!("Input: {}", input_path.display());
@@ -473,7 +495,7 @@ fn package_project_mode(
     fs::write(
         output.join("Cargo.toml"),
         format!(
-            "[package]\nname = \"{}\"\nversion = \"1.5.0\"\nedition = \"2021\"\n\n[profile.release]\nopt-level = 3\nlto = \"thin\"\ncodegen-units = 1\nstrip = \"symbols\"\npanic = \"abort\"\n",
+            "[workspace]\n\n[package]\nname = \"{}\"\nversion = \"1.0.0\"\nedition = \"2021\"\n\n[profile.release]\nopt-level = \"z\"         # Optimize aggressively for strict minimum size\nlto = true              # Enable whole-program Link-Time Optimization\ncodegen-units = 1       # Reduce parallel blocks to maximize single-binary optimization\npanic = \"abort\"         # Completely terminate stack unwinding code tables\nstrip = true            # Guarantee complete binary stripping of metadata and symbols\n",
             project_name
         ),
     )?;
@@ -938,7 +960,7 @@ fn transpile_python_to_rust(input_path: &Path) -> Result<String> {
         .with_context(|| format!("failed to create cache directory {}", cache_dir.display()))?;
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    "tarvos-cache-v1.2".hash(&mut hasher);
+    "tarvos-cache-v1.5-codegen-v11-main-wrapper".hash(&mut hasher);
     source.hash(&mut hasher);
     let cache_path = cache_dir.join(format!("{:016x}.rs", hasher.finish()));
 
@@ -957,6 +979,8 @@ fn transpile_python_to_rust(input_path: &Path) -> Result<String> {
     let detected = NativeSubsetDetector::default().analyze(&module);
     let specialization = specialize_module(&module, &detected);
     let rust_source = wire_specialization_runtime(&rust_source, &specialization);
+    let vector_plans = detect_vector_plans(&module);
+    let rust_source = format!("{}\n{}", rust_source, emit_runtime_helpers(&vector_plans));
     fs::write(&cache_path, &rust_source).with_context(|| {
         format!(
             "failed to write cached translation {}",
@@ -975,7 +999,7 @@ fn tarvos_cache_dir() -> Result<PathBuf> {
     }
     .map(PathBuf::from)
     .ok_or_else(|| anyhow::anyhow!("could not determine the current user's home directory"))?;
-    Ok(home.join(".tarvos").join("cache").join("tarvos-cache-v1.2"))
+    Ok(home.join(".tarvos").join("cache").join("tarvos-cache-v1.5"))
 }
 
 fn write_rust_output(output_path: &Path, rust_source: &str) -> Result<()> {
@@ -1007,13 +1031,17 @@ fn compile_rust_binary(output_path: &Path, rust_source: &str) -> Result<()> {
         .with_context(|| format!("failed to write {}", rust_file.display()))?;
     let status = Command::new(&rustc)
         .arg("-C")
-        .arg("opt-level=3")
+        .arg("opt-level=z")
         .arg("-C")
         .arg("target-cpu=native")
         .arg("-C")
         .arg("strip=symbols")
         .arg("-C")
-        .arg("panic=abort")
+        .arg(if rust_source.contains("catch_unwind") {
+            "panic=unwind"
+        } else {
+            "panic=abort"
+        })
         .arg("-o")
         .arg(output_path)
         .arg(&rust_file)
@@ -1249,8 +1277,9 @@ pub(crate) fn benchmark_mode(args: &[String]) -> Result<()> {
         secure_input_path(&reference_file, &repo_root)?
     };
 
-    // Keep benchmark staging in the user's writable Tarvos cache, not the repository.
-    let stage_dir = tarvos_cache_dir()?.join("benchmarks").join(format!(
+    // Keep staged inputs inside the repository-safe build root because the
+    // compiler intentionally rejects paths outside the current project.
+    let stage_dir = repo_root.join(".build-tmp").join(format!(
         "cli-benchmark-{}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

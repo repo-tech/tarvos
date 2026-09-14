@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/tarvos-cli",
+    "crates/tarvos-server",
     "crates/tarvos-core",
     "crates/tarvos-ast",
     "crates/tarvos-parser",
@@ -20,13 +21,12 @@ debug = 0
 opt-level = 0
 
 [profile.release]
-opt-level = 3
-codegen-units = 8
-incremental = true
-lto = "thin"
+opt-level = "z"
+codegen-units = 1
+lto = true
 debug = 0
 panic = "abort"
-strip = "symbols"
+strip = true
 
 [profile.release-fast]
 inherits = "release"

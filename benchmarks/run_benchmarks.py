@@ -306,11 +306,15 @@ def benchmark_tarvos(py_file, generated_rs_name="tarvos_generated.rs", repeats=5
             env=sanitize_environment(),
         )
         if r.returncode != 0:
+            details = (r.stderr or r.stdout or "").strip()
             raise subprocess.CalledProcessError(
                 r.returncode,
                 [compiler, "compile", str(py_file), "--output", str(output_path)],
                 output=r.stdout,
-                stderr=r.stderr,
+                stderr=(
+                    f"Tarvos compilation failed for {py_file} (exit {r.returncode}).\n"
+                    f"{details}"
+                ),
             )
         transpile_time = time.perf_counter() - transpile_start
 
@@ -751,12 +755,17 @@ if __name__ == "__main__":
     if args.rust_opt_level is not None:
         os.environ["TARVOS_RUSTFLAGS"] = " ".join(["-C", f"opt-level={args.rust_opt_level}", "-C", "debuginfo=0", "-C", "codegen-units=1"])
 
-    if args.runtime_matrix:
-        runtimes = args.runtimes if args.runtimes else ["cpython", "pypy", "numba", "codon", "tarvos", "rust"]
-        run_runtime_benchmark_matrix(Path(args.workloads_dir), runtime_names=runtimes, repeats=max(1, args.repeats), json_output=args.export_json)
-    elif args.matrix or args.presets:
-        preset_names = args.presets if args.presets else [args.preset]
-        results = run_benchmark_matrix(preset_names, repeats=max(1, args.repeats), cache_aware=args.cache_aware, csv_path=args.export_csv, json_path=args.export_json)
-    else:
-        result = run_benchmark(Path(args.py_file), Path(args.rs_file), args.name, preset_name=args.preset, repeats=max(1, args.repeats), cache_aware=args.cache_aware)
-        export_results([result], csv_path=args.export_csv, json_path=args.export_json)
+    try:
+        if args.runtime_matrix:
+            runtimes = args.runtimes if args.runtimes else ["cpython", "pypy", "numba", "codon", "tarvos", "rust"]
+            run_runtime_benchmark_matrix(Path(args.workloads_dir), runtime_names=runtimes, repeats=max(1, args.repeats), json_output=args.export_json)
+        elif args.matrix or args.presets:
+            preset_names = args.presets if args.presets else [args.preset]
+            results = run_benchmark_matrix(preset_names, repeats=max(1, args.repeats), cache_aware=args.cache_aware, csv_path=args.export_csv, json_path=args.export_json)
+        else:
+            result = run_benchmark(Path(args.py_file), Path(args.rs_file), args.name, preset_name=args.preset, repeats=max(1, args.repeats), cache_aware=args.cache_aware)
+            export_results([result], csv_path=args.export_csv, json_path=args.export_json)
+    except subprocess.CalledProcessError as error:
+        details = error.stderr or error.output or "no compiler diagnostics were captured"
+        print(f"Benchmark failed: {details}", file=sys.stderr)
+        raise SystemExit(error.returncode or 1)

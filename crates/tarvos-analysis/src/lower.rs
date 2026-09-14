@@ -292,6 +292,94 @@ impl Lowerer {
                 }
                 Ok(Stmt::Break)
             }
+            tarvos_ast::Stmt::Continue => {
+                if self.loop_depth == 0 {
+                    bail!("continue is only supported inside a loop");
+                }
+                Ok(Stmt::Continue)
+            }
+            tarvos_ast::Stmt::Raise { exc } => {
+                let exc_ir = exc.as_ref().map(|e| self.lower_expr(e)).transpose()?;
+                Ok(Stmt::Raise(exc_ir))
+            }
+            tarvos_ast::Stmt::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                let body_ir = body
+                    .iter()
+                    .map(|s| self.lower_stmt(s))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut handlers_ir = Vec::new();
+                for h in handlers {
+                    let exc_type = h.exc_type.as_ref().map(|e| match e {
+                        tarvos_ast::Expr::Name { id } => id.clone(),
+                        tarvos_ast::Expr::Call { function, .. } => match function.as_ref() {
+                            tarvos_ast::Expr::Name { id } => id.clone(),
+                            _ => "Exception".to_string(),
+                        },
+                        _ => "Exception".to_string(),
+                    });
+                    let saved_ctx = self.type_context.clone();
+                    if let Some(ref var_name) = h.name {
+                        self.type_context.declare(var_name.clone(), Type::String);
+                    }
+                    let handler_body = h
+                        .body
+                        .iter()
+                        .map(|s| self.lower_stmt(s))
+                        .collect::<Result<Vec<_>>>()?;
+                    self.type_context = saved_ctx;
+                    handlers_ir.push(tarvos_ir::ExceptHandler {
+                        name: h.name.clone(),
+                        exc_type,
+                        body: handler_body,
+                    });
+                }
+                let orelse_ir = orelse
+                    .iter()
+                    .map(|s| self.lower_stmt(s))
+                    .collect::<Result<Vec<_>>>()?;
+                let finalbody_ir = finalbody
+                    .iter()
+                    .map(|s| self.lower_stmt(s))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Stmt::Try {
+                    body: body_ir,
+                    handlers: handlers_ir,
+                    orelse: orelse_ir,
+                    finalbody: finalbody_ir,
+                })
+            }
+            tarvos_ast::Stmt::With { items, body } => {
+                let mut items_ir = Vec::new();
+                let saved_ctx = self.type_context.clone();
+                for item in items {
+                    let ctx_val = self.lower_expr(&item.context_expr)?;
+                    let target_name = item.optional_vars.as_ref().and_then(|v| match v {
+                        tarvos_ast::Expr::Name { id } => Some(id.clone()),
+                        _ => None,
+                    });
+                    if let Some(ref name) = target_name {
+                        self.type_context.declare(name.clone(), Type::String);
+                    }
+                    items_ir.push(tarvos_ir::WithItem {
+                        context_expr: ctx_val,
+                        target: target_name,
+                    });
+                }
+                let body_ir = body
+                    .iter()
+                    .map(|s| self.lower_stmt(s))
+                    .collect::<Result<Vec<_>>>()?;
+                self.type_context = saved_ctx;
+                Ok(Stmt::With {
+                    items: items_ir,
+                    body: body_ir,
+                })
+            }
         }
     }
 
@@ -350,6 +438,12 @@ impl Lowerer {
                 keywords,
             } => {
                 if let tarvos_ast::Expr::Name { id } = function.as_ref() {
+                    if id == "__import__"
+                        && args.len() == 1
+                        && matches!(&args[0], tarvos_ast::Expr::String { value } if value == "time")
+                    {
+                        return Ok(Value::String("time".into()));
+                    }
                     let args_ir = self.lower_call_args(id, args, keywords)?;
                     let return_type = self.infer_call_return_type(id, &args_ir)?;
 
@@ -361,6 +455,20 @@ impl Lowerer {
                 } else {
                     bail!("only direct function calls are supported")
                 }
+            }
+            tarvos_ast::Expr::MethodCall {
+                object,
+                method,
+                args,
+            } if matches!(object.as_ref(), tarvos_ast::Expr::Name { id } if id == "time_mod" || id == "time")
+                && method == "perf_counter"
+                && args.is_empty() =>
+            {
+                Ok(Value::Call {
+                    function: "tarvos_perf_counter".into(),
+                    args: Vec::new(),
+                    return_type: Type::Float,
+                })
             }
             tarvos_ast::Expr::MethodCall { .. } => {
                 bail!("method calls are only supported as list.append(value) statements; dictionary methods (including clear()) are unsupported")
@@ -394,6 +502,20 @@ impl Lowerer {
                     elements: values,
                     element_types,
                 })
+            }
+            tarvos_ast::Expr::FormatString { parts } => {
+                let parts = parts
+                    .iter()
+                    .map(|part| match part {
+                        tarvos_ast::FormatPart::Literal { value } => {
+                            Ok(tarvos_ir::FormatPart::Literal(value.clone()))
+                        }
+                        tarvos_ast::FormatPart::Value { value } => Ok(
+                            tarvos_ir::FormatPart::Value(Box::new(self.lower_expr(value)?)),
+                        ),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Value::FormatString { parts })
             }
             tarvos_ast::Expr::Dict { keys, values } => {
                 if keys.len() != values.len() {
@@ -442,12 +564,59 @@ impl Lowerer {
                     value_type,
                 })
             }
+            tarvos_ast::Expr::Unary { operator, operand } => {
+                let operand_ir = self.lower_expr(operand)?;
+                let op_type = self.value_type(&operand_ir)?;
+                let op = match operator.as_str() {
+                    "usub" | "-" => tarvos_ir::UnaryOp::Neg,
+                    "not" => tarvos_ir::UnaryOp::Not,
+                    _ => bail!("unsupported unary operator: {}", operator),
+                };
+                let res_type = match op {
+                    tarvos_ir::UnaryOp::Neg => op_type,
+                    tarvos_ir::UnaryOp::Not => Type::Bool,
+                };
+                Ok(Value::Unary {
+                    op,
+                    operand: Box::new(operand_ir),
+                    ty: res_type,
+                })
+            }
+            tarvos_ast::Expr::Slice { lower, upper, step } => {
+                let lower_ir = lower.as_ref().map(|l| self.lower_expr(l)).transpose()?;
+                let upper_ir = upper.as_ref().map(|u| self.lower_expr(u)).transpose()?;
+                let step_ir = step.as_ref().map(|s| self.lower_expr(s)).transpose()?;
+                Ok(Value::Slice {
+                    container: Box::new(Value::List {
+                        elements: vec![],
+                        element_type: Type::Unknown,
+                    }),
+                    lower: lower_ir.map(Box::new),
+                    upper: upper_ir.map(Box::new),
+                    step: step_ir.map(Box::new),
+                    container_type: Type::Unknown,
+                })
+            }
             tarvos_ast::Expr::Subscript { value, index } => {
                 let container_ir = self.lower_expr(value)?;
+                let container_type = self.value_type(&container_ir)?;
+
+                if let tarvos_ast::Expr::Slice { lower, upper, step } = index.as_ref() {
+                    let lower_ir = lower.as_ref().map(|l| self.lower_expr(l)).transpose()?;
+                    let upper_ir = upper.as_ref().map(|u| self.lower_expr(u)).transpose()?;
+                    let step_ir = step.as_ref().map(|s| self.lower_expr(s)).transpose()?;
+                    return Ok(Value::Slice {
+                        container: Box::new(container_ir),
+                        lower: lower_ir.map(Box::new),
+                        upper: upper_ir.map(Box::new),
+                        step: step_ir.map(Box::new),
+                        container_type,
+                    });
+                }
+
                 let index_ir = self.lower_expr(index)?;
 
                 // Infer element type from the container
-                let container_type = self.value_type(&container_ir)?;
                 let element_type = match container_type.clone() {
                     Type::Array(inner) => *inner,
                     Type::Dict { key, value } => {
@@ -562,6 +731,7 @@ impl Lowerer {
                 .lookup(id)
                 .cloned()
                 .unwrap_or(Type::Unknown)),
+            Value::Unary { ty, .. } => Ok(ty.clone()),
             Value::Binary { ty, .. } => Ok(ty.clone()),
             Value::Call { return_type, .. } => Ok(return_type.clone()),
             Value::List { element_type, .. } => Ok(Type::Array(Box::new(element_type.clone()))),
@@ -575,6 +745,8 @@ impl Lowerer {
                 value: Box::new(value_type.clone()),
             }),
             Value::Index { element_type, .. } => Ok(element_type.clone()),
+            Value::Slice { container_type, .. } => Ok(container_type.clone()),
+            Value::FormatString { .. } => Ok(Type::String),
         }
     }
 
@@ -601,6 +773,14 @@ impl Lowerer {
             (Type::Float, Type::Float, BinaryOp::Mul) => Ok(Type::Float),
             (Type::Float, Type::Float, BinaryOp::Div) => Ok(Type::Float),
             (Type::Float, Type::Float, BinaryOp::Pow) => Ok(Type::Float),
+            (Type::Int, Type::Float, BinaryOp::Add)
+            | (Type::Int, Type::Float, BinaryOp::Sub)
+            | (Type::Int, Type::Float, BinaryOp::Mul)
+            | (Type::Int, Type::Float, BinaryOp::Div)
+            | (Type::Float, Type::Int, BinaryOp::Add)
+            | (Type::Float, Type::Int, BinaryOp::Sub)
+            | (Type::Float, Type::Int, BinaryOp::Mul)
+            | (Type::Float, Type::Int, BinaryOp::Div) => Ok(Type::Float),
             (Type::Int, Type::Float, BinaryOp::Pow) | (Type::Float, Type::Int, BinaryOp::Pow) => {
                 Ok(Type::Float)
             }
@@ -662,6 +842,47 @@ impl Lowerer {
                     }
                 }
                 tarvos_ast::Stmt::While { body, .. } | tarvos_ast::Stmt::For { body, .. } => {
+                    if let Some(ty) = self.infer_return_type_from_body(body) {
+                        inferred = Some(match inferred {
+                            Some(existing) => Self::merge_return_types(&existing, &ty),
+                            None => ty,
+                        });
+                    }
+                }
+                tarvos_ast::Stmt::Try {
+                    body,
+                    handlers,
+                    orelse,
+                    finalbody,
+                } => {
+                    if let Some(ty) = self.infer_return_type_from_body(body) {
+                        inferred = Some(match inferred {
+                            Some(existing) => Self::merge_return_types(&existing, &ty),
+                            None => ty,
+                        });
+                    }
+                    for h in handlers {
+                        if let Some(ty) = self.infer_return_type_from_body(&h.body) {
+                            inferred = Some(match inferred {
+                                Some(existing) => Self::merge_return_types(&existing, &ty),
+                                None => ty,
+                            });
+                        }
+                    }
+                    if let Some(ty) = self.infer_return_type_from_body(orelse) {
+                        inferred = Some(match inferred {
+                            Some(existing) => Self::merge_return_types(&existing, &ty),
+                            None => ty,
+                        });
+                    }
+                    if let Some(ty) = self.infer_return_type_from_body(finalbody) {
+                        inferred = Some(match inferred {
+                            Some(existing) => Self::merge_return_types(&existing, &ty),
+                            None => ty,
+                        });
+                    }
+                }
+                tarvos_ast::Stmt::With { body, .. } => {
                     if let Some(ty) = self.infer_return_type_from_body(body) {
                         inferred = Some(match inferred {
                             Some(existing) => Self::merge_return_types(&existing, &ty),

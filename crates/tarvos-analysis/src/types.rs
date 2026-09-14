@@ -54,6 +54,8 @@ impl TypeInference {
                         "float" => Ok(Type::Float),
                         "bool" => Ok(Type::Bool),
                         "range" => Ok(Type::Array(Box::new(Type::Int))),
+                        "__import__" => Ok(Type::String),
+                        "tarvos_perf_counter" => Ok(Type::Float),
                         _ => Err(anyhow!("unknown function: {}", id)),
                     }
                 } else {
@@ -86,6 +88,18 @@ impl TypeInference {
             }
             tarvos_ast::Expr::Subscript { .. } => Ok(Type::Unknown),
             tarvos_ast::Expr::MethodCall { .. } => Ok(Type::None),
+            tarvos_ast::Expr::Unary { operand, operator } => {
+                let operand_type = self.infer_expr(operand)?;
+                match operator.as_str() {
+                    "usub" | "uadd" if matches!(operand_type, Type::Int | Type::Float) => {
+                        Ok(operand_type)
+                    }
+                    "not" => Ok(Type::Bool),
+                    _ => Err(anyhow!("unsupported unary operator: {}", operator)),
+                }
+            }
+            tarvos_ast::Expr::Slice { .. } => Ok(Type::Unknown),
+            tarvos_ast::Expr::FormatString { .. } => Ok(Type::String),
         }
     }
 

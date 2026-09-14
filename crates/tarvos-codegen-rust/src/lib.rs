@@ -9,7 +9,9 @@ impl RustCodegen {
     pub fn generate(module: &Module) -> Result<String> {
         let mut out = String::new();
         out.push_str("#![allow(unused_mut, unused_variables, dead_code, unused_parens, unused_assignments)]\n\n");
-        out.push_str("use std::collections::HashMap;\n\n");
+        if module.statements.iter().any(Self::statement_uses_hash_map) {
+            out.push_str("use std::collections::HashMap;\n\n");
+        }
 
         let mut functions = Vec::new();
         let mut main_stmts = Vec::new();
@@ -24,19 +26,231 @@ impl RustCodegen {
         }
 
         // Emit top-level functions
-        for f in functions {
+        for f in &functions {
             Self::emit_stmt(&mut out, f, 0, &mut declared)?;
             out.push('\n');
         }
 
         // Emit fn main()
         out.push_str("fn main() {\n");
+        if main_stmts.iter().any(|stmt| Self::statement_uses_try(stmt))
+            || functions.iter().any(|stmt| Self::statement_uses_try(stmt))
+        {
+            out.push_str("    std::panic::set_hook(Box::new(|_| {}));\n");
+        }
         for stmt in main_stmts {
             Self::emit_stmt(&mut out, stmt, 1, &mut declared)?;
         }
         out.push_str("}\n");
 
         Ok(out)
+    }
+
+    /// Generate a deliberately small, freestanding entry point for embedded
+    /// integer programs. The normal backend remains `std`-based because
+    /// Python printing, collections, timing, and exception handling require it.
+    pub fn generate_embedded(module: &Module) -> Result<String> {
+        let mut out = String::from(
+            "#![no_std]\n\n\
+             use core::panic::PanicInfo;\n\n\
+             #[panic_handler]\n\
+             fn panic(_info: &PanicInfo) -> ! { loop {} }\n\n",
+        );
+        let mut declared = HashSet::new();
+        let mut last_value = "0_i64".to_string();
+
+        for stmt in &module.statements {
+            match stmt {
+                Stmt::Let { name, ty, value } => {
+                    if !matches!(ty, Type::Int) {
+                        return Err(anyhow::anyhow!(
+                            "embedded target supports only integer bindings; `{name}` is {:?}",
+                            ty
+                        ));
+                    }
+                    let value = Self::embedded_value(value)?;
+                    if declared.insert(name.clone()) {
+                        out.push_str(&format!("static mut __TARVOS_{name}: i64 = {value};\n"));
+                    } else {
+                        out.push_str(&format!(
+                            "// reassignment to `{name}` is not supported in embedded mode\n"
+                        ));
+                    }
+                    last_value = format!("unsafe {{ __TARVOS_{name} }}");
+                }
+                Stmt::Assign { name, value } => {
+                    let _ = (name, value);
+                    return Err(anyhow::anyhow!(
+                        "embedded target does not support reassignment; use a single integer expression"
+                    ));
+                }
+                Stmt::Expr(value) => last_value = Self::embedded_value(value)?,
+                Stmt::Return(Some(value)) => last_value = Self::embedded_value(value)?,
+                Stmt::Return(None) => last_value = "0_i64".to_string(),
+                Stmt::Print(_) => {
+                    return Err(anyhow::anyhow!(
+                        "embedded target does not provide an operating-system console; use --target native for print()"
+                    ));
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "embedded target supports only integer bindings and expressions; unsupported statement: {stmt:?}"
+                    ));
+                }
+            }
+        }
+        out.push_str("\n#[no_mangle]\npub extern \"C\" fn tarvos_entry() -> i64 {\n");
+        out.push_str(&format!("    {last_value}\n}}\n"));
+        Ok(out)
+    }
+
+    fn embedded_value(value: &Value) -> Result<String> {
+        match value {
+            Value::Int(value) => Ok(format!("{value}_i64")),
+            Value::Name(name) => Ok(format!("unsafe {{ __TARVOS_{name} }}")),
+            Value::Bool(value) => Ok(if *value { "1_i64" } else { "0_i64" }.to_string()),
+            Value::Unary { operand, op, .. } => {
+                let operand = Self::embedded_value(operand)?;
+                Ok(match op {
+                    tarvos_ir::UnaryOp::Neg => format!("-({operand})"),
+                    tarvos_ir::UnaryOp::Not => format!("(({operand}) == 0) as i64"),
+                })
+            }
+            Value::Binary {
+                left, op, right, ..
+            } => {
+                let left = Self::embedded_value(left)?;
+                let right = Self::embedded_value(right)?;
+                let operator = match op {
+                    BinaryOp::Add => "+",
+                    BinaryOp::Sub => "-",
+                    BinaryOp::Mul => "*",
+                    BinaryOp::Div => "/",
+                    BinaryOp::Mod => "%",
+                    BinaryOp::Eq => "==",
+                    BinaryOp::NotEq => "!=",
+                    BinaryOp::Lt => "<",
+                    BinaryOp::LtEq => "<=",
+                    BinaryOp::Gt => ">",
+                    BinaryOp::GtEq => ">=",
+                    _ => return Err(anyhow::anyhow!("unsupported embedded binary operator")),
+                };
+                if matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::NotEq
+                        | BinaryOp::Lt
+                        | BinaryOp::LtEq
+                        | BinaryOp::Gt
+                        | BinaryOp::GtEq
+                ) {
+                    Ok(format!("(({left}) {operator} ({right})) as i64"))
+                } else {
+                    Ok(format!("({left}) {operator} ({right})"))
+                }
+            }
+            _ => Err(anyhow::anyhow!(
+                "embedded target supports only integer arithmetic expressions"
+            )),
+        }
+    }
+
+    fn statement_uses_hash_map(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Let { value, .. } | Stmt::Assign { value, .. } => {
+                Self::value_uses_hash_map(value)
+            }
+            Stmt::Print(values) => values.iter().any(Self::value_uses_hash_map),
+            Stmt::IndexAssign { index, value, .. } => {
+                Self::value_uses_hash_map(index) || Self::value_uses_hash_map(value)
+            }
+            Stmt::If { test, body, orelse } => {
+                Self::value_uses_hash_map(test)
+                    || body.iter().any(Self::statement_uses_hash_map)
+                    || orelse.iter().any(Self::statement_uses_hash_map)
+            }
+            Stmt::While { test, body } => {
+                Self::value_uses_hash_map(test) || body.iter().any(Self::statement_uses_hash_map)
+            }
+            Stmt::For { iter, body, .. } => {
+                Self::value_uses_hash_map(iter) || body.iter().any(Self::statement_uses_hash_map)
+            }
+            Stmt::Function { body, .. } => body.iter().any(Self::statement_uses_hash_map),
+            Stmt::Return(value) => value.as_ref().is_some_and(Self::value_uses_hash_map),
+            Stmt::ListAppend { value, .. } | Stmt::Expr(value) => Self::value_uses_hash_map(value),
+            Stmt::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                body.iter().any(Self::statement_uses_hash_map)
+                    || handlers
+                        .iter()
+                        .any(|handler| handler.body.iter().any(Self::statement_uses_hash_map))
+                    || orelse.iter().any(Self::statement_uses_hash_map)
+                    || finalbody.iter().any(Self::statement_uses_hash_map)
+            }
+            Stmt::With { body, items } => {
+                items
+                    .iter()
+                    .any(|item| Self::value_uses_hash_map(&item.context_expr))
+                    || body.iter().any(Self::statement_uses_hash_map)
+            }
+            Stmt::Break | Stmt::Continue | Stmt::Raise(_) => false,
+        }
+    }
+
+    fn statement_uses_try(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Try { .. } => true,
+            Stmt::If { body, orelse, .. } => {
+                body.iter().any(Self::statement_uses_try)
+                    || orelse.iter().any(Self::statement_uses_try)
+            }
+            Stmt::While { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::Function { body, .. }
+            | Stmt::With { body, .. } => body.iter().any(Self::statement_uses_try),
+            _ => false,
+        }
+    }
+
+    fn value_uses_hash_map(value: &Value) -> bool {
+        match value {
+            Value::Dict { .. } => true,
+            Value::Binary { left, right, .. } => {
+                Self::value_uses_hash_map(left) || Self::value_uses_hash_map(right)
+            }
+            Value::Call { args, .. }
+            | Value::List { elements: args, .. }
+            | Value::Tuple { elements: args, .. } => args.iter().any(Self::value_uses_hash_map),
+            Value::Unary { operand, .. } => Self::value_uses_hash_map(operand),
+            Value::Index {
+                container, index, ..
+            } => Self::value_uses_hash_map(container) || Self::value_uses_hash_map(index),
+            Value::Slice {
+                container,
+                lower,
+                upper,
+                step,
+                ..
+            } => {
+                Self::value_uses_hash_map(container)
+                    || lower.as_ref().is_some_and(|v| Self::value_uses_hash_map(v))
+                    || upper.as_ref().is_some_and(|v| Self::value_uses_hash_map(v))
+                    || step.as_ref().is_some_and(|v| Self::value_uses_hash_map(v))
+            }
+            Value::FormatString { parts } => parts.iter().any(|part| match part {
+                tarvos_ir::FormatPart::Literal(_) => false,
+                tarvos_ir::FormatPart::Value(value) => Self::value_uses_hash_map(value),
+            }),
+            Value::Int(_)
+            | Value::Float(_)
+            | Value::String(_)
+            | Value::Bool(_)
+            | Value::Name(_) => false,
+        }
     }
 
     fn emit_stmt(
@@ -90,6 +304,65 @@ impl RustCodegen {
                 out.push_str(&format!("{}{}.push({});\n", ind, target, value_str));
             }
             Stmt::Break => out.push_str(&format!("{}break;\n", ind)),
+            Stmt::Continue => out.push_str(&format!("{}continue;\n", ind)),
+            Stmt::Raise(value) => {
+                let message = value
+                    .as_ref()
+                    .map(Self::emit_value)
+                    .transpose()?
+                    .unwrap_or_else(|| "\"Tarvos raised an exception\"".to_string());
+                out.push_str(&format!("{}panic!(\"{{}}\", {});\n", ind, message));
+            }
+            Stmt::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                let mut try_vars = HashSet::new();
+                Self::collect_assignment_targets(body, &mut try_vars);
+                for handler in handlers {
+                    Self::collect_assignment_targets(&handler.body, &mut try_vars);
+                }
+                Self::collect_assignment_targets(orelse, &mut try_vars);
+                Self::collect_assignment_targets(finalbody, &mut try_vars);
+                for name in try_vars {
+                    if !declared.contains(&name) {
+                        let init = Self::zero_for_type_by_name(&name, body, &[])?;
+                        declared.insert(name.clone());
+                        out.push_str(&format!("{}let mut {} = {};\n", ind, name, init));
+                    }
+                }
+                out.push_str(&format!("{}let __tarvos_try_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{\n", ind));
+                for nested in body {
+                    Self::emit_stmt(out, nested, indent + 1, declared)?;
+                }
+                out.push_str(&format!("{}}}));\n", ind));
+                out.push_str(&format!("{}if __tarvos_try_result.is_ok() {{\n", ind));
+                for nested in orelse {
+                    Self::emit_stmt(out, nested, indent + 1, declared)?;
+                }
+                out.push_str(&format!("{}}} else {{\n", ind));
+                if let Some(handler) = handlers.first() {
+                    for nested in &handler.body {
+                        Self::emit_stmt(out, nested, indent + 1, declared)?;
+                    }
+                } else {
+                    out.push_str(&format!(
+                        "{}    std::panic::resume_unwind(__tarvos_try_result.unwrap_err());\n",
+                        ind
+                    ));
+                }
+                out.push_str(&format!("{}}}\n", ind));
+                for nested in finalbody {
+                    Self::emit_stmt(out, nested, indent, declared)?;
+                }
+            }
+            Stmt::With { body, .. } => {
+                for nested in body {
+                    Self::emit_stmt(out, nested, indent, declared)?;
+                }
+            }
             Stmt::Expr(value) => {
                 out.push_str(&format!("{}{};\n", ind, Self::emit_value(value)?));
             }
@@ -190,6 +463,11 @@ impl RustCodegen {
                 return_type,
                 body,
             } => {
+                let emitted_name = if name == "main" {
+                    "__tarvos_main"
+                } else {
+                    name.as_str()
+                };
                 let return_type_str = Self::type_to_rust(return_type);
                 let params_str = params
                     .iter()
@@ -200,12 +478,12 @@ impl RustCodegen {
                 if return_type_str == "()" {
                     out.push_str(&format!(
                         "{}#[inline(always)]\n{}fn {}({}) {{\n",
-                        ind, ind, name, params_str
+                        ind, ind, emitted_name, params_str
                     ));
                 } else {
                     out.push_str(&format!(
                         "{}#[inline(always)]\n{}fn {}({}) -> {} {{\n",
-                        ind, ind, name, params_str, return_type_str
+                        ind, ind, emitted_name, params_str, return_type_str
                     ));
                 }
 
@@ -241,6 +519,19 @@ impl RustCodegen {
                 Stmt::While { body, .. } | Stmt::For { body, .. } => {
                     Self::collect_assignment_targets(body, out);
                 }
+                Stmt::Try {
+                    body,
+                    handlers,
+                    orelse,
+                    finalbody,
+                } => {
+                    Self::collect_assignment_targets(body, out);
+                    for handler in handlers {
+                        Self::collect_assignment_targets(&handler.body, out);
+                    }
+                    Self::collect_assignment_targets(orelse, out);
+                    Self::collect_assignment_targets(finalbody, out);
+                }
                 _ => {}
             }
         }
@@ -255,6 +546,19 @@ impl RustCodegen {
             }
             Stmt::While { body, .. } | Stmt::For { body, .. } => {
                 Self::contains_assignment_to(body, target)
+            }
+            Stmt::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                Self::contains_assignment_to(body, target)
+                    || handlers
+                        .iter()
+                        .any(|handler| Self::contains_assignment_to(&handler.body, target))
+                    || Self::contains_assignment_to(orelse, target)
+                    || Self::contains_assignment_to(finalbody, target)
             }
             _ => false,
         })
@@ -295,6 +599,24 @@ impl RustCodegen {
                 } if target == name => return Self::zero_for_value(value),
                 Stmt::If { body, orelse, .. } => {
                     if let Ok(value) = Self::zero_for_type_by_name(name, body, orelse) {
+                        return Ok(value);
+                    }
+                }
+                Stmt::Try {
+                    body,
+                    handlers,
+                    orelse,
+                    finalbody,
+                } => {
+                    if let Ok(value) = Self::zero_for_type_by_name(name, body, orelse) {
+                        return Ok(value);
+                    }
+                    for handler in handlers {
+                        if let Ok(value) = Self::zero_for_type_by_name(name, &handler.body, &[]) {
+                            return Ok(value);
+                        }
+                    }
+                    if let Ok(value) = Self::zero_for_type_by_name(name, finalbody, &[]) {
                         return Ok(value);
                     }
                 }
@@ -351,6 +673,13 @@ impl RustCodegen {
             Value::String(v) => format!("{:?}.to_string()", v),
             Value::Bool(v) => v.to_string(),
             Value::Name(name) => name.clone(),
+            Value::Unary { op, operand, .. } => {
+                let operand = Self::emit_value(operand)?;
+                match op {
+                    tarvos_ir::UnaryOp::Neg => format!("-({})", operand),
+                    tarvos_ir::UnaryOp::Not => format!("!({})", operand),
+                }
+            }
             Value::Binary {
                 left,
                 op,
@@ -369,8 +698,38 @@ impl RustCodegen {
                         _ => return Err(anyhow::anyhow!("power requires numeric operands")),
                     });
                 }
+                if *op == BinaryOp::Div && *ty == Type::Int {
+                    return Ok(format!(
+                        "{}.checked_div({}).expect(\"ZeroDivisionError\")",
+                        left_str, right_str
+                    ));
+                }
+                if *op == BinaryOp::Div
+                    && *ty == Type::Float
+                    && matches!(left.as_ref(), Value::Int(_))
+                    && matches!(right.as_ref(), Value::Int(_))
+                {
+                    return Ok(format!(
+                        "if {} == 0_i64 {{ panic!(\"ZeroDivisionError\") }} else {{ ({} as f64) / ({} as f64) }}",
+                        right_str, left_str, right_str
+                    ));
+                }
                 let op_str = op.symbol();
-                format!("({} {} {})", left_str, op_str, right_str)
+                if *ty == Type::Float {
+                    let left_str = if matches!(left.as_ref(), Value::Int(_)) {
+                        format!("({} as f64)", left_str)
+                    } else {
+                        left_str
+                    };
+                    let right_str = if matches!(right.as_ref(), Value::Int(_)) {
+                        format!("({} as f64)", right_str)
+                    } else {
+                        right_str
+                    };
+                    format!("({} {} {})", left_str, op_str, right_str)
+                } else {
+                    format!("({} {} {})", left_str, op_str, right_str)
+                }
             }
             Value::Call { function, args, .. } => {
                 let args_rendered = args
@@ -393,7 +752,17 @@ impl RustCodegen {
                     "int" => format!("{} as i64", args_str),
                     "float" => format!("{} as f64", args_str),
                     "bool" => format!("({} != 0)", args_str),
-                    _ => format!("{}({})", function, args_str),
+                    "tarvos_perf_counter" => {
+                        "std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect(\"system clock\").as_secs_f64()".to_string()
+                    }
+                    _ => {
+                        let function = if function == "main" {
+                            "__tarvos_main"
+                        } else {
+                            function.as_str()
+                        };
+                        format!("{}({})", function, args_str)
+                    }
                 }
             }
             Value::List { elements, .. } => {
@@ -445,6 +814,54 @@ impl RustCodegen {
                     format!("{}.{}", container_str, index)
                 } else {
                     format!("{}[({} as usize)]", container_str, index_str)
+                }
+            }
+            Value::Slice {
+                container,
+                lower,
+                upper,
+                step,
+                ..
+            } => {
+                if step.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "slice steps are not supported in native Rust codegen"
+                    ));
+                }
+                let container = Self::emit_value(container)?;
+                let lower = lower
+                    .as_ref()
+                    .map(|v| Self::emit_value(v))
+                    .transpose()?
+                    .unwrap_or_else(|| "0_i64".to_string());
+                let upper = upper
+                    .as_ref()
+                    .map(|v| Self::emit_value(v))
+                    .transpose()?
+                    .unwrap_or_else(|| format!("{}.len() as i64", container));
+                format!(
+                    "{}[({} as usize)..({} as usize)].to_vec()",
+                    container, lower, upper
+                )
+            }
+            Value::FormatString { parts } => {
+                let mut format_string = String::new();
+                let mut args = Vec::new();
+                for part in parts {
+                    match part {
+                        tarvos_ir::FormatPart::Literal(value) => {
+                            format_string.push_str(&value.replace('{', "{{").replace('}', "}}"));
+                        }
+                        tarvos_ir::FormatPart::Value(value) => {
+                            format_string.push_str("{}");
+                            args.push(Self::emit_value(value)?);
+                        }
+                    }
+                }
+                if args.is_empty() {
+                    format!("{:?}.to_string()", format_string)
+                } else {
+                    format!("format!({:?}, {})", format_string, args.join(", "))
                 }
             }
         })

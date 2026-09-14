@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 VERSION = os.environ.get("TARVOS_VERSION", "v1.5.0")
-REPOSITORY = os.environ.get("TARVOS_REPOSITORY", "repo-tech/tarvos")
+REPOSITORY = os.environ.get("TARVOS_REPOSITORY", "repo-tech/tarvos-engine")
 TOKEN = os.environ.get("TARVOS_GITHUB_TOKEN")
 
 
@@ -73,13 +73,15 @@ def _download_binary() -> Path:
             return response.read()
 
     temporary = binary.with_suffix(binary.suffix + ".tmp")
-    temporary.write_bytes(read_asset(asset))
-    expected = read_asset(f"{asset}.sha256").decode("ascii").split()[0].lower()
-    actual = hashlib.sha256(temporary.read_bytes()).hexdigest()
-    if actual != expected:
+    try:
+        temporary.write_bytes(read_asset(asset))
+        expected = read_asset(f"{asset}.sha256").decode("ascii").split()[0].lower()
+        actual = hashlib.sha256(temporary.read_bytes()).hexdigest()
+        if actual != expected:
+            raise RuntimeError("Tarvos binary checksum verification failed")
+        temporary.replace(binary)
+    finally:
         temporary.unlink(missing_ok=True)
-        raise RuntimeError("Tarvos binary checksum verification failed")
-    temporary.replace(binary)
     if os.name != "nt":
         binary.chmod(0o755)
     return binary

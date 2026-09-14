@@ -1,12 +1,25 @@
 use anyhow::{Context, Result};
-use std::{fs, io::Write, path::Path, process::Command};
+use std::{
+    fs,
+    io::Write,
+    path::Path,
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use tarvos_analysis::lower_module;
 use tarvos_codegen_rust::RustCodegen;
 use tarvos_optimizer::Optimizer;
 use tarvos_parser::parse_python_ast;
 
+pub mod api;
+
 pub struct CompilePipeline;
+
+const EMBEDDED_AST_EXPORTER: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../python/ast_export.py"
+));
 
 impl CompilePipeline {
     pub fn transpile_file(input_path: &Path) -> Result<String> {
@@ -20,6 +33,21 @@ impl CompilePipeline {
             .with_context(|| format!("failed to generate Rust for {}", input_path.display()))
     }
 
+    pub fn transpile_file_embedded(input_path: &Path) -> Result<String> {
+        let source = fs::read_to_string(input_path)
+            .with_context(|| format!("failed to read {}", input_path.display()))?;
+        let ast_json = export_python_ast(&source)?;
+        let module = parse_python_ast(&ast_json)?;
+        let ir = lower_module(&module)?;
+        let optimized = Optimizer::optimize(&ir)?;
+        RustCodegen::generate_embedded(&optimized).with_context(|| {
+            format!(
+                "failed to generate embedded Rust for {}",
+                input_path.display()
+            )
+        })
+    }
+
     pub fn write_rust_output(output_path: &Path, rust_source: &str) -> Result<()> {
         fs::write(output_path, rust_source)
             .with_context(|| format!("failed to write {}", output_path.display()))?;
@@ -28,11 +56,20 @@ impl CompilePipeline {
 }
 
 pub fn export_python_ast(source: &str) -> Result<String> {
-    let script_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("python")
-        .join("ast_export.py");
+    let script_path = std::env::temp_dir().join(format!(
+        "tarvos-ast-export-{}-{}.py",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before Unix epoch")?
+            .as_nanos()
+    ));
+    fs::write(&script_path, EMBEDDED_AST_EXPORTER).with_context(|| {
+        format!(
+            "failed to materialize embedded AST exporter {}",
+            script_path.display()
+        )
+    })?;
 
     let mut child = Command::new(find_python_command()?)
         .arg(&script_path)
@@ -56,6 +93,13 @@ pub fn export_python_ast(source: &str) -> Result<String> {
     let output = child
         .wait_with_output()
         .context("failed to read Python AST exporter output")?;
+    let cleanup_result = fs::remove_file(&script_path);
+    if let Err(error) = cleanup_result {
+        eprintln!(
+            "Tarvos AST exporter cleanup failed for {}: {error}",
+            script_path.display()
+        );
+    }
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

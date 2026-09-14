@@ -1,0 +1,14 @@
+[package]
+name = "tarvos-server"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "tarvos-server"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+serde_json = "1"
+tarvos-core = { path = "../tarvos-core" }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }

@@ -117,6 +117,33 @@ impl Optimizer {
                         body: Self::optimize_loop_block(body),
                     });
                 }
+                Stmt::Try {
+                    body,
+                    handlers,
+                    orelse,
+                    finalbody,
+                } => {
+                    let handlers = handlers
+                        .iter()
+                        .map(|h| tarvos_ir::ExceptHandler {
+                            name: h.name.clone(),
+                            exc_type: h.exc_type.clone(),
+                            body: Self::optimize_loop_block(&h.body),
+                        })
+                        .collect();
+                    result.push(Stmt::Try {
+                        body: Self::optimize_loop_block(body),
+                        handlers,
+                        orelse: Self::optimize_loop_block(orelse),
+                        finalbody: Self::optimize_loop_block(finalbody),
+                    });
+                }
+                Stmt::With { items, body } => {
+                    result.push(Stmt::With {
+                        items: items.clone(),
+                        body: Self::optimize_loop_block(body),
+                    });
+                }
                 other => result.push(other.clone()),
             }
         }
@@ -198,6 +225,70 @@ impl Optimizer {
                     });
                 }
                 Stmt::Break => result.push(Stmt::Break),
+                Stmt::Continue => result.push(Stmt::Continue),
+                Stmt::Raise(val) => {
+                    result.push(Stmt::Raise(
+                        val.as_ref().map(|v| Self::substitute_value(v, &env)),
+                    ));
+                }
+                Stmt::Try {
+                    body,
+                    handlers,
+                    orelse,
+                    finalbody,
+                } => {
+                    for modified in Self::mutated_in_block(body)
+                        .iter()
+                        .chain(Self::mutated_in_block(orelse).iter())
+                        .chain(Self::mutated_in_block(finalbody).iter())
+                    {
+                        env.remove(modified);
+                    }
+                    for h in handlers {
+                        for modified in Self::mutated_in_block(&h.body) {
+                            env.remove(&modified);
+                        }
+                    }
+                    let new_body = Self::propagate_block(body);
+                    let new_handlers = handlers
+                        .iter()
+                        .map(|h| tarvos_ir::ExceptHandler {
+                            name: h.name.clone(),
+                            exc_type: h.exc_type.clone(),
+                            body: Self::propagate_block(&h.body),
+                        })
+                        .collect();
+                    let new_orelse = Self::propagate_block(orelse);
+                    let new_finalbody = Self::propagate_block(finalbody);
+                    result.push(Stmt::Try {
+                        body: new_body,
+                        handlers: new_handlers,
+                        orelse: new_orelse,
+                        finalbody: new_finalbody,
+                    });
+                }
+                Stmt::With { items, body } => {
+                    let new_items = items
+                        .iter()
+                        .map(|item| {
+                            if let Some(ref t) = item.target {
+                                env.remove(t);
+                            }
+                            tarvos_ir::WithItem {
+                                context_expr: Self::substitute_value(&item.context_expr, &env),
+                                target: item.target.clone(),
+                            }
+                        })
+                        .collect();
+                    for modified in Self::mutated_in_block(body) {
+                        env.remove(&modified);
+                    }
+                    let new_body = Self::propagate_block(body);
+                    result.push(Stmt::With {
+                        items: new_items,
+                        body: new_body,
+                    });
+                }
                 Stmt::Expr(value) => {
                     result.push(Stmt::Expr(Self::substitute_value(value, &env)));
                 }
@@ -281,6 +372,11 @@ impl Optimizer {
                     value.clone()
                 }
             }
+            Value::Unary { op, operand, ty } => Value::Unary {
+                op: *op,
+                operand: Box::new(Self::substitute_value(operand, env)),
+                ty: ty.clone(),
+            },
             Value::Binary {
                 left,
                 op,
@@ -325,6 +421,25 @@ impl Optimizer {
                 element_type: element_type.clone(),
                 container_type: container_type.clone(),
             },
+            Value::Slice {
+                container,
+                lower,
+                upper,
+                step,
+                container_type,
+            } => Value::Slice {
+                container: Box::new(Self::substitute_value(container, env)),
+                lower: lower
+                    .as_ref()
+                    .map(|l| Box::new(Self::substitute_value(l, env))),
+                upper: upper
+                    .as_ref()
+                    .map(|u| Box::new(Self::substitute_value(u, env))),
+                step: step
+                    .as_ref()
+                    .map(|s| Box::new(Self::substitute_value(s, env))),
+                container_type: container_type.clone(),
+            },
             other => other.clone(),
         }
     }
@@ -351,6 +466,27 @@ impl Optimizer {
                     set.extend(Self::mutated_in_block(orelse));
                 }
                 Stmt::While { body, .. } | Stmt::For { body, .. } => {
+                    set.extend(Self::mutated_in_block(body));
+                }
+                Stmt::Try {
+                    body,
+                    handlers,
+                    orelse,
+                    finalbody,
+                } => {
+                    set.extend(Self::mutated_in_block(body));
+                    for h in handlers {
+                        set.extend(Self::mutated_in_block(&h.body));
+                    }
+                    set.extend(Self::mutated_in_block(orelse));
+                    set.extend(Self::mutated_in_block(finalbody));
+                }
+                Stmt::With { items, body } => {
+                    for item in items {
+                        if let Some(ref t) = item.target {
+                            set.insert(t.clone());
+                        }
+                    }
                     set.extend(Self::mutated_in_block(body));
                 }
                 _ => {}
@@ -404,6 +540,65 @@ impl Optimizer {
                 value: Self::fold_value(value)?,
             }),
             Stmt::Break => Ok(Stmt::Break),
+            Stmt::Continue => Ok(Stmt::Continue),
+            Stmt::Raise(value) => Ok(Stmt::Raise(
+                value.as_ref().map(Self::fold_value).transpose()?,
+            )),
+            Stmt::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                let body = body
+                    .iter()
+                    .map(Self::fold_stmt)
+                    .collect::<Result<Vec<_>>>()?;
+                let handlers = handlers
+                    .iter()
+                    .map(|h| {
+                        Ok(tarvos_ir::ExceptHandler {
+                            name: h.name.clone(),
+                            exc_type: h.exc_type.clone(),
+                            body: h
+                                .body
+                                .iter()
+                                .map(Self::fold_stmt)
+                                .collect::<Result<Vec<_>>>()?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let orelse = orelse
+                    .iter()
+                    .map(Self::fold_stmt)
+                    .collect::<Result<Vec<_>>>()?;
+                let finalbody = finalbody
+                    .iter()
+                    .map(Self::fold_stmt)
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Stmt::Try {
+                    body,
+                    handlers,
+                    orelse,
+                    finalbody,
+                })
+            }
+            Stmt::With { items, body } => {
+                let items = items
+                    .iter()
+                    .map(|i| {
+                        Ok(tarvos_ir::WithItem {
+                            context_expr: Self::fold_value(&i.context_expr)?,
+                            target: i.target.clone(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let body = body
+                    .iter()
+                    .map(Self::fold_stmt)
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Stmt::With { items, body })
+            }
             Stmt::Expr(value) => Ok(Stmt::Expr(Self::fold_value(value)?)),
             Stmt::Print(values) => {
                 let folded = values
@@ -471,6 +666,20 @@ impl Optimizer {
 
     fn fold_value(value: &Value) -> Result<Value> {
         match value {
+            Value::Unary { op, operand, ty } => {
+                let operand = Self::fold_value(operand)?;
+                match (&op, &operand) {
+                    (tarvos_ir::UnaryOp::Neg, Value::Int(i)) => return Ok(Value::Int(-i)),
+                    (tarvos_ir::UnaryOp::Neg, Value::Float(f)) => return Ok(Value::Float(-f)),
+                    (tarvos_ir::UnaryOp::Not, Value::Bool(b)) => return Ok(Value::Bool(!b)),
+                    _ => {}
+                }
+                Ok(Value::Unary {
+                    op: *op,
+                    operand: Box::new(operand),
+                    ty: ty.clone(),
+                })
+            }
             Value::Binary {
                 left,
                 op,
@@ -544,6 +753,37 @@ impl Optimizer {
                     container: Box::new(container),
                     index: Box::new(index),
                     element_type: element_type.clone(),
+                    container_type: container_type.clone(),
+                })
+            }
+            Value::Slice {
+                container,
+                lower,
+                upper,
+                step,
+                container_type,
+            } => {
+                let container = Self::fold_value(container)?;
+                let lower = lower
+                    .as_ref()
+                    .map(|value| Self::fold_value(value))
+                    .transpose()?
+                    .map(Box::new);
+                let upper = upper
+                    .as_ref()
+                    .map(|value| Self::fold_value(value))
+                    .transpose()?
+                    .map(Box::new);
+                let step = step
+                    .as_ref()
+                    .map(|value| Self::fold_value(value))
+                    .transpose()?
+                    .map(Box::new);
+                Ok(Value::Slice {
+                    container: Box::new(container),
+                    lower,
+                    upper,
+                    step,
                     container_type: container_type.clone(),
                 })
             }
@@ -658,6 +898,33 @@ impl Optimizer {
                         body: Self::preserve_branch_bindings(body),
                     });
                 }
+                Stmt::Try {
+                    body,
+                    handlers,
+                    orelse,
+                    finalbody,
+                } => {
+                    let handlers = handlers
+                        .iter()
+                        .map(|h| tarvos_ir::ExceptHandler {
+                            name: h.name.clone(),
+                            exc_type: h.exc_type.clone(),
+                            body: Self::preserve_branch_bindings(&h.body),
+                        })
+                        .collect();
+                    simplified.push(Stmt::Try {
+                        body: Self::preserve_branch_bindings(body),
+                        handlers,
+                        orelse: Self::preserve_branch_bindings(orelse),
+                        finalbody: Self::preserve_branch_bindings(finalbody),
+                    });
+                }
+                Stmt::With { items, body } => {
+                    simplified.push(Stmt::With {
+                        items: items.clone(),
+                        body: Self::preserve_branch_bindings(body),
+                    });
+                }
                 other => simplified.push(Self::eliminate_stmt(other)),
             }
         }
@@ -689,6 +956,42 @@ impl Optimizer {
                 value: Self::eliminate_value(value),
             },
             Stmt::Break => Stmt::Break,
+            Stmt::Continue => Stmt::Continue,
+            Stmt::Raise(value) => Stmt::Raise(value.as_ref().map(Self::eliminate_value)),
+            Stmt::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                let handlers = handlers
+                    .iter()
+                    .map(|h| tarvos_ir::ExceptHandler {
+                        name: h.name.clone(),
+                        exc_type: h.exc_type.clone(),
+                        body: Self::preserve_branch_bindings(&h.body),
+                    })
+                    .collect();
+                Stmt::Try {
+                    body: Self::preserve_branch_bindings(body),
+                    handlers,
+                    orelse: Self::preserve_branch_bindings(orelse),
+                    finalbody: Self::preserve_branch_bindings(finalbody),
+                }
+            }
+            Stmt::With { items, body } => {
+                let items = items
+                    .iter()
+                    .map(|i| tarvos_ir::WithItem {
+                        context_expr: Self::eliminate_value(&i.context_expr),
+                        target: i.target.clone(),
+                    })
+                    .collect();
+                Stmt::With {
+                    items,
+                    body: Self::preserve_branch_bindings(body),
+                }
+            }
             Stmt::Expr(value) => Stmt::Expr(Self::eliminate_value(value)),
             Stmt::Print(values) => Stmt::Print(values.iter().map(Self::eliminate_value).collect()),
             Stmt::If { test, body, orelse } => Stmt::If {
@@ -722,6 +1025,11 @@ impl Optimizer {
 
     fn eliminate_value(value: &Value) -> Value {
         match value {
+            Value::Unary { op, operand, ty } => Value::Unary {
+                op: *op,
+                operand: Box::new(Self::eliminate_value(operand)),
+                ty: ty.clone(),
+            },
             Value::Binary {
                 left,
                 op,
@@ -758,6 +1066,19 @@ impl Optimizer {
                 container: Box::new(Self::eliminate_value(container)),
                 index: Box::new(Self::eliminate_value(index)),
                 element_type: element_type.clone(),
+                container_type: container_type.clone(),
+            },
+            Value::Slice {
+                container,
+                lower,
+                upper,
+                step,
+                container_type,
+            } => Value::Slice {
+                container: Box::new(Self::eliminate_value(container)),
+                lower: lower.as_ref().map(|l| Box::new(Self::eliminate_value(l))),
+                upper: upper.as_ref().map(|u| Box::new(Self::eliminate_value(u))),
+                step: step.as_ref().map(|s| Box::new(Self::eliminate_value(s))),
                 container_type: container_type.clone(),
             },
             other => other.clone(),
@@ -843,6 +1164,30 @@ impl Optimizer {
             Stmt::Function { body, .. } => Self::block_reads(body),
             Stmt::Return(value) => value.as_ref().map(Self::value_names).unwrap_or_default(),
             Stmt::Break => HashSet::new(),
+            Stmt::Continue => HashSet::new(),
+            Stmt::Raise(value) => value.as_ref().map(Self::value_names).unwrap_or_default(),
+            Stmt::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                let mut names = Self::block_reads(body);
+                for h in handlers {
+                    names.extend(Self::block_reads(&h.body));
+                }
+                names.extend(Self::block_reads(orelse));
+                names.extend(Self::block_reads(finalbody));
+                names
+            }
+            Stmt::With { items, body } => {
+                let mut names = HashSet::new();
+                for item in items {
+                    names.extend(Self::value_names(&item.context_expr));
+                }
+                names.extend(Self::block_reads(body));
+                names
+            }
             Stmt::Expr(value) => Self::value_names(value),
         }
     }
@@ -860,6 +1205,9 @@ impl Optimizer {
         match value {
             Value::Name(name) => {
                 names.insert(name.clone());
+            }
+            Value::Unary { operand, .. } => {
+                names.extend(Self::value_names(operand));
             }
             Value::Binary { left, right, .. } => {
                 names.extend(Self::value_names(left));
@@ -881,6 +1229,24 @@ impl Optimizer {
                 names.extend(Self::value_names(container));
                 names.extend(Self::value_names(index));
             }
+            Value::Slice {
+                container,
+                lower,
+                upper,
+                step,
+                ..
+            } => {
+                names.extend(Self::value_names(container));
+                if let Some(l) = lower {
+                    names.extend(Self::value_names(l));
+                }
+                if let Some(u) = upper {
+                    names.extend(Self::value_names(u));
+                }
+                if let Some(s) = step {
+                    names.extend(Self::value_names(s));
+                }
+            }
             _ => {}
         }
         names
@@ -890,6 +1256,7 @@ impl Optimizer {
         match value {
             Value::Int(_) | Value::Float(_) | Value::String(_) | Value::Bool(_) => true,
             Value::Name(_) => true,
+            Value::Unary { operand, .. } => Self::is_pure_value(operand),
             Value::Binary { left, right, .. } => {
                 Self::is_pure_value(left) && Self::is_pure_value(right)
             }
@@ -901,6 +1268,22 @@ impl Optimizer {
             Value::Index {
                 container, index, ..
             } => Self::is_pure_value(container) && Self::is_pure_value(index),
+            Value::Slice {
+                container,
+                lower,
+                upper,
+                step,
+                ..
+            } => {
+                Self::is_pure_value(container)
+                    && lower.as_ref().map_or(true, |l| Self::is_pure_value(l))
+                    && upper.as_ref().map_or(true, |u| Self::is_pure_value(u))
+                    && step.as_ref().map_or(true, |s| Self::is_pure_value(s))
+            }
+            Value::FormatString { parts } => parts.iter().all(|part| match part {
+                tarvos_ir::FormatPart::Literal(_) => true,
+                tarvos_ir::FormatPart::Value(value) => Self::is_pure_value(value),
+            }),
             Value::Call { .. } => false,
         }
     }

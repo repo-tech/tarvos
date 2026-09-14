@@ -120,6 +120,44 @@ fn analyze_stmt(stmt: &Stmt, stats: &mut ProfileStats) {
             }
         }
         Stmt::Break => stats.statements += 1,
+        Stmt::Continue => stats.statements += 1,
+        Stmt::Raise { exc } => {
+            stats.statements += 1;
+            if let Some(exc) = exc {
+                analyze_expr(exc, stats);
+            }
+        }
+        Stmt::Try {
+            body,
+            handlers,
+            orelse,
+            finalbody,
+        } => {
+            stats.statements += 1;
+            for stmt in body {
+                analyze_stmt(stmt, stats);
+            }
+            for h in handlers {
+                for stmt in &h.body {
+                    analyze_stmt(stmt, stats);
+                }
+            }
+            for stmt in orelse {
+                analyze_stmt(stmt, stats);
+            }
+            for stmt in finalbody {
+                analyze_stmt(stmt, stats);
+            }
+        }
+        Stmt::With { items, body } => {
+            stats.statements += 1;
+            for item in items {
+                analyze_expr(&item.context_expr, stats);
+            }
+            for stmt in body {
+                analyze_stmt(stmt, stats);
+            }
+        }
     }
 }
 
@@ -178,10 +216,32 @@ fn analyze_expr(expr: &Expr, stats: &mut ProfileStats) {
             analyze_expr(value, stats);
             analyze_expr(index, stats);
         }
+        Expr::Slice { lower, upper, step } => {
+            if let Some(l) = lower {
+                analyze_expr(l, stats);
+            }
+            if let Some(u) = upper {
+                analyze_expr(u, stats);
+            }
+            if let Some(s) = step {
+                analyze_expr(s, stats);
+            }
+        }
+        Expr::Unary { operand, .. } => {
+            stats.estimated_cost += 1;
+            analyze_expr(operand, stats);
+        }
         Expr::MethodCall { object, args, .. } => {
             analyze_expr(object, stats);
             for arg in args {
                 analyze_expr(arg, stats);
+            }
+        }
+        Expr::FormatString { parts } => {
+            for part in parts {
+                if let tarvos_ast::FormatPart::Value { value } = part {
+                    analyze_expr(value, stats);
+                }
             }
         }
         Expr::Name { .. }

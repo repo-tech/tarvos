@@ -156,6 +156,26 @@ impl NativeSubsetDetector {
                     self.visit_stmt(child, imports, ordinal, report);
                 }
             }
+            Stmt::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                for child in body.iter().chain(orelse).chain(finalbody) {
+                    self.visit_stmt(child, imports, ordinal, report);
+                }
+                for h in handlers {
+                    for child in &h.body {
+                        self.visit_stmt(child, imports, ordinal, report);
+                    }
+                }
+            }
+            Stmt::With { body, .. } => {
+                for child in body {
+                    self.visit_stmt(child, imports, ordinal, report);
+                }
+            }
             _ => {}
         }
     }
@@ -442,6 +462,57 @@ fn collect_loop_signals(
                 );
             }
             Stmt::For { body, .. } | Stmt::While { body, .. } => {
+                collect_loop_signals(
+                    body,
+                    calls,
+                    methods,
+                    has_subscript,
+                    has_accumulator,
+                    unsupported,
+                );
+            }
+            Stmt::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                collect_loop_signals(
+                    body,
+                    calls,
+                    methods,
+                    has_subscript,
+                    has_accumulator,
+                    unsupported,
+                );
+                for h in handlers {
+                    collect_loop_signals(
+                        &h.body,
+                        calls,
+                        methods,
+                        has_subscript,
+                        has_accumulator,
+                        unsupported,
+                    );
+                }
+                collect_loop_signals(
+                    orelse,
+                    calls,
+                    methods,
+                    has_subscript,
+                    has_accumulator,
+                    unsupported,
+                );
+                collect_loop_signals(
+                    finalbody,
+                    calls,
+                    methods,
+                    has_subscript,
+                    has_accumulator,
+                    unsupported,
+                );
+            }
+            Stmt::With { body, .. } => {
                 collect_loop_signals(
                     body,
                     calls,

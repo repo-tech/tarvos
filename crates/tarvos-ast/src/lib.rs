@@ -56,6 +56,41 @@ pub enum Stmt {
 
     #[serde(rename = "break")]
     Break,
+
+    #[serde(rename = "continue")]
+    Continue,
+
+    #[serde(rename = "raise")]
+    Raise { exc: Option<Expr> },
+
+    #[serde(rename = "try")]
+    Try {
+        body: Vec<Stmt>,
+        handlers: Vec<ExceptHandler>,
+        #[serde(default)]
+        orelse: Vec<Stmt>,
+        #[serde(default)]
+        finalbody: Vec<Stmt>,
+    },
+
+    #[serde(rename = "with")]
+    With {
+        items: Vec<WithItem>,
+        body: Vec<Stmt>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExceptHandler {
+    pub name: Option<String>,
+    pub exc_type: Option<Expr>,
+    pub body: Vec<Stmt>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WithItem {
+    pub context_expr: Expr,
+    pub optional_vars: Option<Expr>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -92,6 +127,12 @@ pub enum Expr {
         right: Box<Expr>,
     },
 
+    #[serde(rename = "unary")]
+    Unary {
+        operator: String,
+        operand: Box<Expr>,
+    },
+
     #[serde(rename = "compare")]
     Compare {
         left: Box<Expr>,
@@ -125,6 +166,25 @@ pub enum Expr {
 
     #[serde(rename = "subscript")]
     Subscript { value: Box<Expr>, index: Box<Expr> },
+
+    #[serde(rename = "slice")]
+    Slice {
+        lower: Option<Box<Expr>>,
+        upper: Option<Box<Expr>>,
+        step: Option<Box<Expr>>,
+    },
+
+    #[serde(rename = "format_string")]
+    FormatString { parts: Vec<FormatPart> },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum FormatPart {
+    #[serde(rename = "literal")]
+    Literal { value: String },
+    #[serde(rename = "value")]
+    Value { value: Expr },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -144,6 +204,7 @@ impl Expr {
             Expr::Bool { .. } => "bool",
             Expr::None => "None",
             Expr::Binary { .. } => "binary operation",
+            Expr::Unary { .. } => "unary operation",
             Expr::Compare { .. } => "comparison",
             Expr::Call { .. } => "function call",
             Expr::MethodCall { .. } => "method call",
@@ -151,6 +212,8 @@ impl Expr {
             Expr::Tuple { .. } => "tuple",
             Expr::Dict { .. } => "dictionary",
             Expr::Subscript { .. } => "subscript",
+            Expr::Slice { .. } => "slice",
+            Expr::FormatString { .. } => "format string",
         }
     }
 }

@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: tarvos-backend-service
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: TARVOS_FRONTEND_URL
+        sync: false
+      - key: TARVOS_SANDBOX_IMAGE
+        value: "tarvos/sandbox:1.5.0"
