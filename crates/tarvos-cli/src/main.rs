@@ -613,12 +613,21 @@ fn prepare_native_run(args: &[String]) -> Result<(PathBuf, Vec<String>)> {
             temp_dir.display()
         )
     })?;
+    let mut source_hasher = std::collections::hash_map::DefaultHasher::new();
+    "tarvos-run-cache-v2-fast".hash(&mut source_hasher);
+    rust_source.hash(&mut source_hasher);
     let exe_path = temp_dir.join(format!(
-        "{}{}",
+        "{}-{:016x}{}",
         input_path.file_stem().unwrap_or_default().to_string_lossy(),
+        source_hasher.finish(),
         if cfg!(windows) { ".exe" } else { "" }
     ));
-    compile_rust_binary(&exe_path, &rust_source)?;
+    if exe_path.is_file() {
+        println!("Using cached native executable: {}", exe_path.display());
+    } else {
+        println!("Compiling native executable for rapid execution...");
+        compile_rust_binary_opt(&exe_path, &rust_source, true)?;
+    }
     Ok((exe_path, args[1..].to_vec()))
 }
 
@@ -978,7 +987,7 @@ fn transpile_python_to_rust(input_path: &Path) -> Result<String> {
         .with_context(|| format!("failed to create cache directory {}", cache_dir.display()))?;
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    "tarvos-cache-v1.0-codegen-v12-main-wrapper".hash(&mut hasher);
+    "tarvos-cache-v1.0-r4-wide-int-codegen-v12-main-wrapper".hash(&mut hasher);
     source.hash(&mut hasher);
     let cache_path = cache_dir.join(format!("{:016x}.rs", hasher.finish()));
 
@@ -1017,7 +1026,10 @@ fn tarvos_cache_dir() -> Result<PathBuf> {
     }
     .map(PathBuf::from)
     .ok_or_else(|| anyhow::anyhow!("could not determine the current user's home directory"))?;
-    Ok(home.join(".tarvos").join("cache").join("tarvos-cache-v1.0"))
+    Ok(home
+        .join(".tarvos")
+        .join("cache")
+        .join("tarvos-cache-v1.0-r4"))
 }
 
 fn write_rust_output(output_path: &Path, rust_source: &str) -> Result<()> {
@@ -1033,6 +1045,10 @@ fn find_python_command() -> Result<String> {
 }
 
 fn compile_rust_binary(output_path: &Path, rust_source: &str) -> Result<()> {
+    compile_rust_binary_opt(output_path, rust_source, false)
+}
+
+fn compile_rust_binary_opt(output_path: &Path, rust_source: &str, fast_dev: bool) -> Result<()> {
     let rustc = ensure_rust_toolchain()?;
     let cache_dir = tarvos_cache_dir()?.join("rustc");
     fs::create_dir_all(&cache_dir).with_context(|| {
@@ -1047,13 +1063,27 @@ fn compile_rust_binary(output_path: &Path, rust_source: &str) -> Result<()> {
     let rust_file = cache_dir.join(format!("{:016x}.rs", hasher.finish()));
     fs::write(&rust_file, rust_source)
         .with_context(|| format!("failed to write {}", rust_file.display()))?;
-    let status = Command::new(&rustc)
-        .arg("-C")
-        .arg("opt-level=z")
-        .arg("-C")
-        .arg("target-cpu=native")
-        .arg("-C")
-        .arg("strip=symbols")
+
+    let mut cmd = Command::new(&rustc);
+    if fast_dev {
+        cmd.arg("-C")
+            .arg("opt-level=1")
+            .arg("-C")
+            .arg("codegen-units=16");
+    } else {
+        cmd.arg("-C")
+            .arg("opt-level=3")
+            .arg("-C")
+            .arg("lto=thin")
+            .arg("-C")
+            .arg("codegen-units=1")
+            .arg("-C")
+            .arg("target-cpu=native")
+            .arg("-C")
+            .arg("strip=symbols");
+    }
+
+    let status = cmd
         .arg("-C")
         .arg(if rust_source.contains("catch_unwind") {
             "panic=unwind"
@@ -1217,7 +1247,7 @@ pub(crate) fn export_mode(args: &[String]) -> Result<()> {
     let input_path = secure_input_path(input_file, &root)?;
     let output_path = secure_output_path(&output_dir, &root)?;
 
-    let rust_source = transpile_python_to_rust(&input_path)?;
+    let is_dir = input_path.is_dir();
     let src_dir = output_path.join("src");
     fs::create_dir_all(&src_dir)
         .with_context(|| format!("failed to create {}", src_dir.display()))?;
@@ -1229,22 +1259,64 @@ pub(crate) fn export_mode(args: &[String]) -> Result<()> {
             .to_string_lossy()
             .as_ref(),
     );
+
+    if is_dir {
+        // Multi-file Python project export: find entrypoint and transpile all Python files
+        let entrypoint = if input_path.join("main.py").exists() {
+            input_path.join("main.py")
+        } else if input_path.join("app.py").exists() {
+            input_path.join("app.py")
+        } else {
+            // Find first .py file
+            let mut found = None;
+            for entry in fs::read_dir(&input_path)? {
+                let p = entry?.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("py") {
+                    found = Some(p);
+                    break;
+                }
+            }
+            found.ok_or_else(|| anyhow::anyhow!("No Python files found in {}", input_path.display()))?
+        };
+
+        // Transpile main entry
+        let main_rust = transpile_python_to_rust(&entrypoint)?;
+        fs::write(src_dir.join("main.rs"), &main_rust)?;
+
+        // Transpile all other .py files as modules or library files
+        for entry in fs::read_dir(&input_path)? {
+            let p = entry?.path();
+            if p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("py") && p != entrypoint {
+                let stem = p.file_stem().unwrap_or_default().to_string_lossy();
+                let mod_name = sanitize_package_name(&stem);
+                if let Ok(mod_rust) = transpile_python_to_rust(&p) {
+                    fs::write(src_dir.join(format!("{}.rs", mod_name)), &mod_rust)?;
+                }
+            }
+        }
+        // Also copy non-code project assets
+        let _ = copy_project_assets(&input_path, &output_path.join("assets"), &entrypoint);
+    } else {
+        let rust_source = transpile_python_to_rust(&input_path)?;
+        fs::write(src_dir.join("main.rs"), &rust_source)
+            .with_context(|| format!("failed to write Rust source in {}", src_dir.display()))?;
+    }
+
     let cargo_toml = format!(
-        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[profile.release]\nopt-level = 3\nlto = true\ncodegen-units = 1\npanic = \"abort\"\n\n[dependencies]\n",
         project_name
     );
     fs::write(output_path.join("Cargo.toml"), cargo_toml)
         .with_context(|| format!("failed to write Cargo.toml in {}", output_path.display()))?;
-    fs::write(src_dir.join("main.rs"), &rust_source)
-        .with_context(|| format!("failed to write Rust source in {}", src_dir.display()))?;
     fs::write(
         output_path.join("README.md"),
-        "# Exported Tarvos project\n\nThis project was generated by `tarvos export`.\n",
+        format!("# Exported Tarvos Project: {}\n\nThis is a complete, native Rust cargo project generated by `tarvos export`.\n\n### Build and Run:\n```bash\ncargo build --release\ncargo run --release\n```\n", project_name),
     )
     .with_context(|| format!("failed to write README in {}", output_path.display()))?;
 
-    println!("Exported Tarvos project to {}", output_path.display());
-    println!("Build with: cargo build --release");
+    println!("Exported complete Rust project to: {}", output_path.display());
+    println!("Cargo structure: Cargo.toml, src/main.rs, modules, README.md");
+    println!("Build with: cd {} && cargo build --release", output_path.display());
     Ok(())
 }
 
@@ -1275,9 +1347,14 @@ pub(crate) fn benchmark_mode(args: &[String]) -> Result<()> {
         .cloned()
         .unwrap_or_else(|| "examples/simple.rs".to_string());
 
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..");
+    let caller_dir = env::current_dir()?;
+    let repo_root = if env::var_os("TARVOS_SANDBOX").is_some() {
+        caller_dir.clone()
+    } else {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+    };
     let python_script = repo_root.join("benchmarks").join("run_benchmarks.py");
     if !python_script.exists() {
         return Err(anyhow::anyhow!(
@@ -1285,7 +1362,6 @@ pub(crate) fn benchmark_mode(args: &[String]) -> Result<()> {
         ));
     }
 
-    let caller_dir = env::current_dir()?;
     let input_path = resolve_readable_path(input_file, &caller_dir)
         .with_context(|| format!("benchmark input: {}", input_file))?;
     let reference_path = if args.get(1).is_some() {

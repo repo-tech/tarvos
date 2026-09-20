@@ -158,6 +158,40 @@ fn analyze_stmt(stmt: &Stmt, stats: &mut ProfileStats) {
                 analyze_stmt(stmt, stats);
             }
         }
+        Stmt::AugAssign { target, value, .. } => {
+            stats.statements += 1;
+            analyze_expr(target, stats);
+            analyze_expr(value, stats);
+        }
+        Stmt::AnnAssign { target, value, .. } => {
+            stats.statements += 1;
+            analyze_expr(target, stats);
+            if let Some(v) = value {
+                analyze_expr(v, stats);
+            }
+        }
+        Stmt::Global { .. } | Stmt::Nonlocal { .. } => {
+            stats.statements += 1;
+        }
+        Stmt::Delete { targets } => {
+            stats.statements += 1;
+            for t in targets {
+                analyze_expr(t, stats);
+            }
+        }
+        Stmt::Assert { test, msg } => {
+            stats.statements += 1;
+            analyze_expr(test, stats);
+            if let Some(m) = msg {
+                analyze_expr(m, stats);
+            }
+        }
+        Stmt::ClassDef { body, .. } => {
+            stats.statements += 1;
+            for stmt in body {
+                analyze_stmt(stmt, stats);
+            }
+        }
     }
 }
 
@@ -249,7 +283,14 @@ fn analyze_expr(expr: &Expr, stats: &mut ProfileStats) {
         | Expr::Float { .. }
         | Expr::String { .. }
         | Expr::Bool { .. }
-        | Expr::None => {}
+        | Expr::None
+        | Expr::Attribute { .. }
+        | Expr::BoolOp { .. }
+        | Expr::IfExp { .. }
+        | Expr::Lambda { .. }
+        | Expr::ListComp { .. }
+        | Expr::Set { .. }
+        | Expr::Starred { .. } => {}
     }
 }
 

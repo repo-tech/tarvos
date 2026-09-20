@@ -39,11 +39,41 @@ impl RustCodegen {
             out.push_str("    std::panic::set_hook(Box::new(|_| {}));\n");
         }
         for stmt in main_stmts {
+            if let Stmt::If { body, orelse, .. } = stmt {
+                if Self::is_module_entry_guard(stmt) {
+                    for guarded_stmt in body {
+                        Self::emit_stmt(&mut out, guarded_stmt, 1, &mut declared)?;
+                    }
+                    for fallback_stmt in orelse {
+                        Self::emit_stmt(&mut out, fallback_stmt, 1, &mut declared)?;
+                    }
+                    continue;
+                }
+            }
             Self::emit_stmt(&mut out, stmt, 1, &mut declared)?;
         }
         out.push_str("}\n");
 
         Ok(out)
+    }
+
+    fn is_module_entry_guard(stmt: &Stmt) -> bool {
+        let Stmt::If { test, orelse, .. } = stmt else {
+            return false;
+        };
+        if !orelse.is_empty() {
+            return false;
+        }
+        matches!(
+            test,
+            Value::Binary {
+                left,
+                op: BinaryOp::Eq,
+                right,
+                ..
+            } if matches!(left.as_ref(), Value::Name(name) if name == "__name__")
+                && matches!(right.as_ref(), Value::String(name) if name == "__main__")
+        )
     }
 
     /// Generate a deliberately small, freestanding entry point for embedded
@@ -107,6 +137,7 @@ impl RustCodegen {
     fn embedded_value(value: &Value) -> Result<String> {
         match value {
             Value::Int(value) => Ok(format!("{value}_i64")),
+            Value::Int128(value) => Ok(format!("{value}_u128")),
             Value::Name(name) => Ok(format!("unsafe {{ __TARVOS_{name} }}")),
             Value::Bool(value) => Ok(if *value { "1_i64" } else { "0_i64" }.to_string()),
             Value::Unary { operand, op, .. } => {
@@ -246,6 +277,7 @@ impl RustCodegen {
                 tarvos_ir::FormatPart::Value(value) => Self::value_uses_hash_map(value),
             }),
             Value::Int(_)
+            | Value::Int128(_)
             | Value::Float(_)
             | Value::String(_)
             | Value::Bool(_)
@@ -567,6 +599,7 @@ impl RustCodegen {
     fn zero_for_value(value: &Value) -> Result<String> {
         Ok(match value {
             Value::Int(_) => "0_i64".to_string(),
+            Value::Int128(_) => "0_u128".to_string(),
             Value::Float(_) => "0.0_f64".to_string(),
             Value::String(_) => "String::new()".to_string(),
             Value::Bool(_) => "false".to_string(),
@@ -661,6 +694,7 @@ impl RustCodegen {
     fn emit_value(value: &Value) -> Result<String> {
         Ok(match value {
             Value::Int(v) => format!("{}_i64", v),
+            Value::Int128(v) => format!("{}_u128", v),
             Value::Float(v) => {
                 // Ensure floats always have a decimal point for Rust literal validity
                 if v.fract() == 0.0 {
@@ -672,6 +706,7 @@ impl RustCodegen {
             // Strings are stored as Rust `String` (heap), not `&str`
             Value::String(v) => format!("{:?}.to_string()", v),
             Value::Bool(v) => v.to_string(),
+            Value::Name(name) if name == "__name__" => "\"__main__\".to_string()".to_string(),
             Value::Name(name) => name.clone(),
             Value::Unary { op, operand, .. } => {
                 let operand = Self::emit_value(operand)?;
@@ -715,7 +750,9 @@ impl RustCodegen {
                     ));
                 }
                 let op_str = op.symbol();
-                if *ty == Type::Float {
+                if *ty == Type::String && *op == BinaryOp::Add {
+                    format!("format!(\"{{}}{{}}\", {}, {})", left_str, right_str)
+                } else if *ty == Type::Float {
                     let left_str = if matches!(left.as_ref(), Value::Int(_)) {
                         format!("({} as f64)", left_str)
                     } else {
@@ -755,6 +792,20 @@ impl RustCodegen {
                     "tarvos_perf_counter" => {
                         "std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect(\"system clock\").as_secs_f64()".to_string()
                     }
+                    "abs" => format!("({}).abs()", args_str),
+                    "min" => match args_rendered.as_slice() {
+                        [a, b] => format!("({}).min({})", a, b),
+                        _ => format!("std::cmp::min({})", args_str),
+                    },
+                    "max" => match args_rendered.as_slice() {
+                        [a, b] => format!("({}).max({})", a, b),
+                        _ => format!("std::cmp::max({})", args_str),
+                    },
+                    "sum" => format!("{}.iter().sum::<i64>()", args_str),
+                    "__ternary" => match args_rendered.as_slice() {
+                        [test, body, orelse] => format!("(if {} {{ {} }} else {{ {} }})", test, body, orelse),
+                        _ => return Err(anyhow::anyhow!("__ternary requires 3 arguments")),
+                    },
                     _ => {
                         let function = if function == "main" {
                             "__tarvos_main"
@@ -1057,5 +1108,28 @@ mod tests {
         };
         let code = RustCodegen::generate(&module).unwrap();
         assert!(code.contains("30_i64"), "expected 30:\n{}", code);
+    }
+
+    #[test]
+    fn emits_module_name_guard_as_a_string_literal() {
+        let module = Module {
+            statements: vec![Stmt::If {
+                test: Value::Binary {
+                    left: Box::new(Value::Name("__name__".to_string())),
+                    op: BinaryOp::Eq,
+                    right: Box::new(Value::String("__main__".to_string())),
+                    ty: Type::Bool,
+                },
+                body: vec![Stmt::Expr(Value::Call {
+                    function: "main".to_string(),
+                    args: vec![],
+                    return_type: Type::None,
+                })],
+                orelse: vec![],
+            }],
+        };
+        let code = RustCodegen::generate(&module).unwrap();
+        assert!(!code.contains("__name__ =="));
+        assert!(code.contains("__tarvos_main();"));
     }
 }

@@ -100,8 +100,22 @@ impl TypeInference {
             }
             tarvos_ast::Expr::Slice { .. } => Ok(Type::Unknown),
             tarvos_ast::Expr::FormatString { .. } => Ok(Type::String),
+            tarvos_ast::Expr::Attribute { .. } => Ok(Type::Unknown),
+            tarvos_ast::Expr::BoolOp { .. } => Ok(Type::Bool),
+            tarvos_ast::Expr::IfExp { body, .. } => self.infer_expr(body),
+            tarvos_ast::Expr::Lambda { body, .. } => self.infer_expr(body),
+            tarvos_ast::Expr::ListComp { elt, .. } => {
+                let elt_type = self.infer_expr(elt)?;
+                Ok(Type::Array(Box::new(elt_type)))
+            }
+            tarvos_ast::Expr::Set { elements } => {
+                let elem_type = elements.first().map(|e| self.infer_expr(e)).transpose()?.unwrap_or(Type::Unknown);
+                Ok(Type::Array(Box::new(elem_type)))
+            }
+            tarvos_ast::Expr::Starred { value } => self.infer_expr(value),
         }
     }
+
 
     fn infer_binary_op(&self, left: &Type, op: &str, right: &Type) -> Result<Type> {
         match (left, right) {

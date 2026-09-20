@@ -21,8 +21,42 @@ pub enum Stmt {
     #[serde(rename = "assign")]
     Assign { target: Expr, value: Expr },
 
+    #[serde(rename = "aug_assign")]
+    AugAssign {
+        target: Expr,
+        operator: String,
+        value: Expr,
+    },
+
+    #[serde(rename = "ann_assign")]
+    AnnAssign {
+        target: Expr,
+        annotation: String,
+        value: Option<Expr>,
+    },
+
+    #[serde(rename = "global")]
+    Global { names: Vec<String> },
+
+    #[serde(rename = "nonlocal")]
+    Nonlocal { names: Vec<String> },
+
+    #[serde(rename = "delete")]
+    Delete { targets: Vec<Expr> },
+
+    #[serde(rename = "assert")]
+    Assert { test: Expr, msg: Option<Expr> },
+
+    #[serde(rename = "classdef")]
+    ClassDef {
+        name: String,
+        bases: Vec<String>,
+        body: Vec<Stmt>,
+    },
+
     #[serde(rename = "expr")]
     Expr { value: Expr },
+
 
     #[serde(rename = "if")]
     If {
@@ -176,6 +210,47 @@ pub enum Expr {
 
     #[serde(rename = "format_string")]
     FormatString { parts: Vec<FormatPart> },
+
+    /// Attribute access: obj.field
+    #[serde(rename = "attribute")]
+    Attribute { value: Box<Expr>, attr: String },
+
+    /// Boolean operation: a and b, a or b
+    #[serde(rename = "bool_op")]
+    BoolOp { operator: String, values: Vec<Expr> },
+
+    /// Ternary/conditional: value_if_true if test else value_if_false
+    #[serde(rename = "if_exp")]
+    IfExp {
+        test: Box<Expr>,
+        body: Box<Expr>,
+        orelse: Box<Expr>,
+    },
+
+    /// Lambda expression: lambda args: body
+    #[serde(rename = "lambda")]
+    Lambda {
+        args: Vec<String>,
+        body: Box<Expr>,
+    },
+
+    /// List comprehension: [expr for var in iter if cond]
+    #[serde(rename = "list_comp")]
+    ListComp {
+        elt: Box<Expr>,
+        target: String,
+        iter: Box<Expr>,
+        #[serde(default)]
+        condition: Option<Box<Expr>>,
+    },
+
+    /// Set literal: {1, 2, 3}
+    #[serde(rename = "set")]
+    Set { elements: Vec<Expr> },
+
+    /// Starred expression: *args
+    #[serde(rename = "starred")]
+    Starred { value: Box<Expr> },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -214,6 +289,13 @@ impl Expr {
             Expr::Subscript { .. } => "subscript",
             Expr::Slice { .. } => "slice",
             Expr::FormatString { .. } => "format string",
+            Expr::Attribute { .. } => "attribute access",
+            Expr::BoolOp { .. } => "boolean operation",
+            Expr::IfExp { .. } => "ternary expression",
+            Expr::Lambda { .. } => "lambda",
+            Expr::ListComp { .. } => "list comprehension",
+            Expr::Set { .. } => "set",
+            Expr::Starred { .. } => "starred",
         }
     }
 }

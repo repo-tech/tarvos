@@ -44,6 +44,15 @@ def safe_tool_roots():
             roots.append(candidate.resolve())
         except FileNotFoundError:
             roots.append(candidate)
+    for variable in ("CARGO_HOME", "RUSTUP_HOME"):
+        configured = os.environ.get(variable)
+        if configured:
+            try:
+                roots.append(Path(configured).expanduser().resolve())
+            except OSError:
+                roots.append(Path(configured).expanduser())
+    if os.name != "nt":
+        roots.append(Path("/usr/local/cargo/bin"))
     deduped = []
     for root in roots:
         if root not in deduped:
@@ -74,7 +83,8 @@ def resolve_tool_path(name: str, extra_candidates=None):
         except Exception:
             resolved = None
         if resolved:
-            path = Path(resolved).expanduser().resolve(strict=False)
+            raw_path = Path(resolved).expanduser()
+            path = raw_path.resolve(strict=False)
             sibling = None
             if path.name.lower() == "rustup.exe" and name.lower() in {"rustc", "cargo"}:
                 sibling_name = "rustc.exe" if name.lower() == "rustc" else "cargo.exe"
@@ -85,23 +95,13 @@ def resolve_tool_path(name: str, extra_candidates=None):
                 sibling = path
             if sibling and sibling.exists() and is_safe_tool_path(sibling):
                 return str(sibling)
-            if path.exists() and is_safe_tool_path(path):
-                return str(path)
+            if raw_path.exists() and is_safe_tool_path(raw_path):
+                return str(raw_path)
         if candidate and os.path.isabs(candidate):
-            path = Path(candidate).expanduser().resolve(strict=False)
-            if path.exists() and is_safe_tool_path(path):
-                return str(path)
+            raw_path = Path(candidate).expanduser()
+            if raw_path.exists() and is_safe_tool_path(raw_path):
+                return str(raw_path)
 
-    for candidate in ["python3", "python", "rustc", "cargo", "pypy3", "pypy", "nuitka", "codon"]:
-        resolved = shutil.which(candidate)
-        if resolved:
-            path = Path(resolved).expanduser().resolve(strict=False)
-            if path.name.lower() == "rustup.exe" and candidate.lower() in {"rustc", "cargo"}:
-                sibling = path.with_name("rustc.exe" if candidate.lower() == "rustc" else "cargo.exe")
-                if sibling.exists() and is_safe_tool_path(sibling):
-                    return str(sibling)
-            if path.exists() and is_safe_tool_path(path):
-                return str(path)
     return None
 
 

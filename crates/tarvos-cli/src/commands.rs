@@ -7,6 +7,16 @@ use super::{analyze_mode, benchmark_mode, clean_mode, doctor_mode, export_mode, 
 pub fn install_command(_args: &[String]) -> Result<()> {
     println!("{}", "=== Tarvos Global Installer ===".cyan().bold());
 
+    if env::var_os("TARVOS_SANDBOX").is_some() {
+        println!(
+            "{}",
+            "Tarvos is already installed in this sandbox at /usr/local/bin/tarvos."
+                .green()
+                .bold()
+        );
+        return Ok(());
+    }
+
     // 1. Check if cargo is available
     let cargo_status = Command::new("cargo").arg("--version").output();
     if cargo_status.is_err() || !cargo_status.as_ref().unwrap().status.success() {

@@ -65,16 +65,38 @@ impl Optimizer {
                                     if let (Value::Int(start_i), Value::Int(end_i)) =
                                         (&start_val, &end_val)
                                     {
-                                        let count = *end_i - *start_i;
-                                        if count > 0 {
-                                            // Gauss arithmetic series sum: count * (start + end - 1) / 2
-                                            let sum_val = (count * (*start_i + *end_i - 1)) / 2;
+                                        let count = end_i.checked_sub(*start_i);
+                                        if let Some(count) = count.filter(|count| *count > 0) {
+                                            // Widen before multiplying: the i64 product can overflow
+                                            // even when the final Python integer is representable.
+                                            let count = count as u128;
+                                            let start = *start_i as u128;
+                                            let end = *end_i as u128;
+                                            let sum_val = count
+                                                .checked_mul(start + end - 1)
+                                                .expect("closed-form loop exceeds u128")
+                                                / 2;
+                                            if let Some(Stmt::Let { value, .. }) =
+                                                result.iter_mut().rev().find(|stmt| {
+                                                    matches!(stmt, Stmt::Let { name, .. } if name == acc_name)
+                                                })
+                                            {
+                                                if sum_val > i64::MAX as u128 {
+                                                    *value = Value::Int128(0);
+                                                }
+                                            }
                                             result.push(Stmt::Assign {
                                                 name: acc_name.clone(),
                                                 value: Value::Binary {
                                                     left: Box::new(Value::Name(acc_name.clone())),
                                                     op: BinaryOp::Add,
-                                                    right: Box::new(Value::Int(sum_val)),
+                                                    right: Box::new(
+                                                        if sum_val > i64::MAX as u128 {
+                                                            Value::Int128(sum_val)
+                                                        } else {
+                                                            Value::Int(sum_val as i64)
+                                                        },
+                                                    ),
                                                     ty: Type::Int,
                                                 },
                                             });
@@ -447,7 +469,7 @@ impl Optimizer {
     fn is_constant_value(value: &Value) -> bool {
         matches!(
             value,
-            Value::Int(_) | Value::Float(_) | Value::String(_) | Value::Bool(_)
+            Value::Int(_) | Value::Int128(_) | Value::Float(_) | Value::String(_) | Value::Bool(_)
         )
     }
 
@@ -670,6 +692,9 @@ impl Optimizer {
                 let operand = Self::fold_value(operand)?;
                 match (&op, &operand) {
                     (tarvos_ir::UnaryOp::Neg, Value::Int(i)) => return Ok(Value::Int(-i)),
+                    (tarvos_ir::UnaryOp::Neg, Value::Int128(i)) => {
+                        return Ok(Value::Int128(i.wrapping_neg()))
+                    }
                     (tarvos_ir::UnaryOp::Neg, Value::Float(f)) => return Ok(Value::Float(-f)),
                     (tarvos_ir::UnaryOp::Not, Value::Bool(b)) => return Ok(Value::Bool(!b)),
                     _ => {}
@@ -692,6 +717,11 @@ impl Optimizer {
                 if let (Value::Int(lv), Value::Int(rv)) = (&left, &right) {
                     if let Some(folded) = Self::fold_binary_const_int(*lv, *op, *rv) {
                         return Ok(Value::Int(folded));
+                    }
+                    if let (Value::Int128(lv), Value::Int128(rv)) = (&left, &right) {
+                        if let Some(folded) = Self::fold_binary_const_u128(*lv, *op, *rv) {
+                            return Ok(Value::Int128(folded));
+                        }
                     }
                 }
 
@@ -800,6 +830,7 @@ impl Optimizer {
                 if right == 0 {
                     return None;
                 }
+
                 left / right
             }
             BinaryOp::Mod => {
@@ -821,8 +852,20 @@ impl Optimizer {
                 if right == 0.0 {
                     return None;
                 }
+
                 left / right
             }
+            _ => return None,
+        })
+    }
+
+    fn fold_binary_const_u128(left: u128, op: BinaryOp, right: u128) -> Option<u128> {
+        Some(match op {
+            BinaryOp::Add => left.checked_add(right)?,
+            BinaryOp::Sub => left.checked_sub(right)?,
+            BinaryOp::Mul => left.checked_mul(right)?,
+            BinaryOp::Div => left.checked_div(right)?,
+            BinaryOp::Mod => left.checked_rem(right)?,
             _ => return None,
         })
     }
@@ -1254,7 +1297,11 @@ impl Optimizer {
 
     fn is_pure_value(value: &Value) -> bool {
         match value {
-            Value::Int(_) | Value::Float(_) | Value::String(_) | Value::Bool(_) => true,
+            Value::Int(_)
+            | Value::Int128(_)
+            | Value::Float(_)
+            | Value::String(_)
+            | Value::Bool(_) => true,
             Value::Name(_) => true,
             Value::Unary { operand, .. } => Self::is_pure_value(operand),
             Value::Binary { left, right, .. } => {
@@ -1437,5 +1484,51 @@ mod tests {
         assert!(
             matches!(print_stmt, Stmt::Print(ref v) if matches!(v[0], Value::Int(45)) || matches!(v[0], Value::Name(ref n) if n == "total"))
         );
+    }
+
+    #[test]
+    fn widens_large_closed_form_reduction_without_overflow() {
+        let module = Module {
+            statements: vec![
+                Stmt::Let {
+                    name: "total".into(),
+                    ty: Type::Int,
+                    value: Value::Int(0),
+                },
+                Stmt::For {
+                    target: "i".into(),
+                    iter: Value::Call {
+                        function: "range".into(),
+                        args: vec![Value::Int(350_000_000_000)],
+                        return_type: Type::Array(Box::new(Type::Int)),
+                    },
+                    body: vec![Stmt::Assign {
+                        name: "total".into(),
+                        value: Value::Binary {
+                            left: Box::new(Value::Name("total".into())),
+                            op: BinaryOp::Add,
+                            right: Box::new(Value::Name("i".into())),
+                            ty: Type::Int,
+                        },
+                    }],
+                },
+            ],
+        };
+
+        let optimized = Optimizer::optimize(&module).unwrap();
+        let expected = 350_000_000_000_u128 * 349_999_999_999_u128 / 2;
+        assert!(matches!(
+            optimized.statements.as_slice(),
+            [
+                Stmt::Let {
+                    value: Value::Int128(0),
+                    ..
+                },
+                Stmt::Assign {
+                    value: Value::Binary { right, .. },
+                    ..
+                }
+            ] if matches!(right.as_ref(), Value::Int128(value) if *value == expected)
+        ));
     }
 }

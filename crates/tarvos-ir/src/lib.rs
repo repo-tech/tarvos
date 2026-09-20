@@ -95,6 +95,8 @@ pub struct WithItem {
 pub enum Value {
     // Constants
     Int(i64),
+    /// Wide integer used for compile-time reductions that exceed i64.
+    Int128(u128),
     Float(f64),
     String(String),
     Bool(bool),
