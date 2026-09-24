@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::{
     fs,
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -23,9 +23,7 @@ const EMBEDDED_AST_EXPORTER: &str = include_str!(concat!(
 
 impl CompilePipeline {
     pub fn transpile_file(input_path: &Path) -> Result<String> {
-        let source = fs::read_to_string(input_path)
-            .with_context(|| format!("failed to read {}", input_path.display()))?;
-        let ast_json = export_python_ast(&source)?;
+        let ast_json = Self::export_project_ast(input_path)?;
         let module = parse_python_ast(&ast_json)?;
         let ir = lower_module(&module)?;
         let optimized = Optimizer::optimize(&ir)?;
@@ -34,9 +32,7 @@ impl CompilePipeline {
     }
 
     pub fn transpile_file_embedded(input_path: &Path) -> Result<String> {
-        let source = fs::read_to_string(input_path)
-            .with_context(|| format!("failed to read {}", input_path.display()))?;
-        let ast_json = export_python_ast(&source)?;
+        let ast_json = Self::export_project_ast(input_path)?;
         let module = parse_python_ast(&ast_json)?;
         let ir = lower_module(&module)?;
         let optimized = Optimizer::optimize(&ir)?;
@@ -48,10 +44,272 @@ impl CompilePipeline {
         })
     }
 
+    fn export_project_ast(input_path: &Path) -> Result<String> {
+        let root = input_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()
+            .with_context(|| format!("failed to resolve project root {}", input_path.display()))?;
+        let mut visiting = Vec::new();
+        let module = Self::load_project_module(input_path, &root, &mut visiting)?;
+        serde_json::to_string(&module).context("failed to serialize merged project AST")
+    }
+
+    fn load_project_module(
+        input_path: &Path,
+        root: &Path,
+        visiting: &mut Vec<PathBuf>,
+    ) -> Result<serde_json::Value> {
+        let canonical = input_path
+            .canonicalize()
+            .with_context(|| format!("failed to resolve module {}", input_path.display()))?;
+        if !canonical.starts_with(root) {
+            return Err(anyhow::anyhow!(
+                "module import escapes the project root: {}",
+                input_path.display()
+            ));
+        }
+        if visiting.iter().any(|path| path == &canonical) {
+            let chain = visiting
+                .iter()
+                .chain(std::iter::once(&canonical))
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            return Err(anyhow::anyhow!("circular local import detected: {chain}"));
+        }
+
+        visiting.push(canonical.clone());
+        let source = fs::read_to_string(&canonical)
+            .with_context(|| format!("failed to read {}", canonical.display()))?;
+        let ast_json = export_python_ast(&source)?;
+        let mut module: serde_json::Value =
+            serde_json::from_str(&ast_json).context("failed to parse exported project AST")?;
+        let body = module
+            .get_mut("body")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or_else(|| anyhow::anyhow!("exported AST has no module body"))?;
+        let original_body = std::mem::take(body);
+        let mut merged_body = Vec::new();
+        let mut module_exports =
+            std::collections::HashMap::<String, std::collections::HashSet<String>>::new();
+
+        for statement in &original_body {
+            let Some(statement_type) = statement.get("type").and_then(serde_json::Value::as_str)
+            else {
+                merged_body.push(statement.clone());
+                continue;
+            };
+            if statement_type != "import_from" && statement_type != "import" {
+                merged_body.push(rewrite_local_module_references(
+                    statement.clone(),
+                    &module_exports,
+                ));
+                continue;
+            }
+
+            if statement_type == "import_from" {
+                let Some(module_name) = statement.get("module").and_then(serde_json::Value::as_str)
+                else {
+                    merged_body.push(statement.clone());
+                    continue;
+                };
+                let Some(local_path) = Self::resolve_local_module(&canonical, root, module_name)?
+                else {
+                    merged_body.push(statement.clone());
+                    continue;
+                };
+                let imported_module = Self::load_project_module(&local_path, root, visiting)?;
+                let imported_body = imported_module
+                    .get("body")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("imported module has no body"))?;
+                let requested_names = statement
+                    .get("names")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("import statement has no names"))?;
+                for requested in requested_names {
+                    let imported_name =
+                        requested
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| anyhow::anyhow!("imported symbol has no name"))?;
+                    if imported_name == "*" {
+                        merged_body.extend(imported_body.iter().cloned());
+                        continue;
+                    }
+                    let matching = imported_body.iter().filter(|candidate| {
+                        candidate.get("name").and_then(serde_json::Value::as_str)
+                            == Some(imported_name)
+                    });
+                    let before = merged_body.len();
+                    merged_body.extend(matching.cloned());
+                    if merged_body.len() == before {
+                        return Err(anyhow::anyhow!(
+                            "local module '{}' does not export '{}'",
+                            module_name,
+                            imported_name
+                        ));
+                    }
+                }
+                continue;
+            }
+
+            let requested_names = statement
+                .get("names")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("import statement has no names"))?;
+            for requested in requested_names {
+                let module_name = requested
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("imported module has no name"))?;
+                let Some(local_path) = Self::resolve_local_module(&canonical, root, module_name)?
+                else {
+                    merged_body.push(statement.clone());
+                    continue;
+                };
+                let imported_module = Self::load_project_module(&local_path, root, visiting)?;
+                let imported_body = imported_module
+                    .get("body")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("imported module has no body"))?;
+                let exports = imported_body
+                    .iter()
+                    .filter_map(|candidate| {
+                        candidate
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
+                    .collect::<std::collections::HashSet<_>>();
+                let binding = requested
+                    .get("asname")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| module_name.split('.').next().unwrap_or(module_name));
+                module_exports.insert(binding.to_owned(), exports);
+                merged_body.extend(imported_body.iter().cloned());
+            }
+        }
+
+        *body = merged_body
+            .into_iter()
+            .map(|statement| rewrite_local_module_references(statement, &module_exports))
+            .collect();
+        visiting.pop();
+        Ok(module)
+    }
+
+    fn resolve_local_module(
+        importing_file: &Path,
+        root: &Path,
+        module_name: &str,
+    ) -> Result<Option<PathBuf>> {
+        let components = module_name.split('.').collect::<Vec<_>>();
+        if components
+            .iter()
+            .any(|component| component.is_empty() || *component == ".." || *component == ".")
+        {
+            return Err(anyhow::anyhow!(
+                "invalid local module name '{}'",
+                module_name
+            ));
+        }
+        let mut candidate = importing_file.parent().unwrap_or(root).to_path_buf();
+        for component in components {
+            candidate.push(component);
+        }
+        candidate.set_extension("py");
+        if !candidate.is_file() {
+            return Ok(None);
+        }
+        let canonical = candidate
+            .canonicalize()
+            .with_context(|| format!("failed to resolve local module {}", candidate.display()))?;
+        if !canonical.starts_with(root) {
+            return Err(anyhow::anyhow!(
+                "local module import escapes the project root: {}",
+                module_name
+            ));
+        }
+        Ok(Some(canonical))
+    }
+
     pub fn write_rust_output(output_path: &Path, rust_source: &str) -> Result<()> {
         fs::write(output_path, rust_source)
             .with_context(|| format!("failed to write {}", output_path.display()))?;
         Ok(())
+    }
+}
+
+fn rewrite_local_module_references(
+    value: serde_json::Value,
+    modules: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(mut object) => {
+            if object.get("type").and_then(serde_json::Value::as_str) == Some("method_call") {
+                let module_name = object
+                    .get("object")
+                    .and_then(|value| value.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|kind| *kind == "name")
+                    .and_then(|_| object.get("object"))
+                    .and_then(|value| value.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                let method = object
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                if let (Some(module_name), Some(method)) = (module_name, method) {
+                    if modules
+                        .get(&module_name)
+                        .is_some_and(|exports| exports.contains(&method))
+                    {
+                        let args = object
+                            .remove("args")
+                            .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+                        let keywords = object
+                            .remove("keywords")
+                            .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+                        return serde_json::json!({
+                            "type": "call",
+                            "function": {"type": "name", "id": method},
+                            "args": args,
+                            "keywords": keywords
+                        });
+                    }
+                }
+            }
+            if object.get("type").and_then(serde_json::Value::as_str) == Some("attribute") {
+                let module_name = object
+                    .get("value")
+                    .and_then(|value| value.get("id"))
+                    .and_then(serde_json::Value::as_str);
+                let attribute = object.get("attr").and_then(serde_json::Value::as_str);
+                if let (Some(module_name), Some(attribute)) = (module_name, attribute) {
+                    if modules
+                        .get(module_name)
+                        .is_some_and(|exports| exports.contains(attribute))
+                    {
+                        return serde_json::json!({"type": "name", "id": attribute});
+                    }
+                }
+            }
+            for child in object.values_mut() {
+                let replacement = rewrite_local_module_references(std::mem::take(child), modules);
+                *child = replacement;
+            }
+            serde_json::Value::Object(object)
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .into_iter()
+                .map(|value| rewrite_local_module_references(value, modules))
+                .collect(),
+        ),
+        other => other,
     }
 }
 

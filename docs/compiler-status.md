@@ -30,11 +30,27 @@ The current implementation is a Rust workspace with a Python AST exporter, a typ
 | loop variables | Yes | Yes | Yes | Yes | Partial | Yes | Yes | Implemented |
 | basic error handling | Partial | Partial | Partial | Partial | Partial | Partial | Partial | Limited |
 
+The native loop lowering is type-aware for `list`/array values, strings (each
+Python character is materialized as a one-character string), and dictionaries
+(Python key iteration). Integer literals larger than `i64` are transported
+without floating-point rounding; native `range()` rejects such bounds with an
+actionable fallback diagnostic because the current native loop ABI is `i64`.
+
 ## Current implementation notes
 
 - The Python front end is intentionally not a full CPython parser replacement. It uses a CPython AST export step via `python/ast_export.py` and then deserializes the exported JSON into the project's own AST types.
 - The IR is a compact typed representation that supports numerical and branch-heavy workloads.
 - Code generation is focused on Rust output for a static subset of Python and is not designed to cover arbitrary Python semantics.
+- Native locals preserve the inferred primitive/container/object type through
+  branch and loop pre-initialization. Reassigning a native variable to an
+  incompatible type is rejected with an actionable `--python-fallback`
+  diagnostic instead of emitting a guessed `i64` declaration.
+- Truly dynamic values still require the Python fallback; this is an explicit
+  compatibility boundary, not a claim of a complete dynamic Python runtime.
+- The CLI compatibility gate verifies native execution, actionable native
+  failures, and `tarvos run ... --python-fallback` through CPython. Runtime
+  arguments are forwarded to both execution paths; native programs only observe
+  them when their supported subset exposes an argument-reading API.
 - Performance benchmarking in this project should be treated as a comparison against explicitly supported subset workloads, not full-language execution.
 
 ## Audit status

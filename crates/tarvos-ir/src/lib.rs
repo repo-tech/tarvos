@@ -10,6 +10,10 @@ pub struct Module {
 /// IR Statement - simplified representation suitable for optimization
 #[derive(Debug, Clone)]
 pub enum Stmt {
+    StructDef {
+        name: String,
+        fields: Vec<(String, Type)>,
+    },
     /// Initial variable declaration: let x = value;
     Let {
         name: String,
@@ -19,6 +23,11 @@ pub enum Stmt {
     /// Reassignment to an existing variable: x = value;
     Assign {
         name: String,
+        value: Value,
+    },
+    FieldAssign {
+        object: Value,
+        field: String,
         value: Value,
     },
     /// Print statement (multi-argument supported)
@@ -44,6 +53,7 @@ pub enum Stmt {
     For {
         target: String,
         iter: Value,
+        iter_type: Type,
         body: Vec<Stmt>,
     },
     /// Function definition
@@ -103,6 +113,11 @@ pub enum Value {
 
     // Variable reference
     Name(String),
+    Field {
+        object: Box<Value>,
+        field: String,
+        ty: Type,
+    },
 
     // Unary operation
     Unary {
@@ -129,6 +144,13 @@ pub enum Value {
     // List construction
     List {
         elements: Vec<Value>,
+        element_type: Type,
+    },
+    ListComp {
+        target: String,
+        iter: Box<Value>,
+        element: Box<Value>,
+        condition: Option<Box<Value>>,
         element_type: Type,
     },
     Tuple {
@@ -167,7 +189,11 @@ pub enum Value {
 #[derive(Debug, Clone)]
 pub enum FormatPart {
     Literal(String),
-    Value(Box<Value>),
+    Value {
+        value: Box<Value>,
+        format_spec: Option<String>,
+        conversion: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

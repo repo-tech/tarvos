@@ -22,7 +22,7 @@ impl TypeInference {
 
     pub fn infer_expr(&self, expr: &tarvos_ast::Expr) -> Result<Type> {
         match expr {
-            tarvos_ast::Expr::Int { .. } => Ok(Type::Int),
+            tarvos_ast::Expr::Int { .. } | tarvos_ast::Expr::BigInt { .. } => Ok(Type::Int),
             tarvos_ast::Expr::Float { .. } => Ok(Type::Float),
             tarvos_ast::Expr::String { .. } => Ok(Type::String),
             tarvos_ast::Expr::Bool { .. } => Ok(Type::Bool),
@@ -109,13 +109,16 @@ impl TypeInference {
                 Ok(Type::Array(Box::new(elt_type)))
             }
             tarvos_ast::Expr::Set { elements } => {
-                let elem_type = elements.first().map(|e| self.infer_expr(e)).transpose()?.unwrap_or(Type::Unknown);
+                let elem_type = elements
+                    .first()
+                    .map(|e| self.infer_expr(e))
+                    .transpose()?
+                    .unwrap_or(Type::Unknown);
                 Ok(Type::Array(Box::new(elem_type)))
             }
             tarvos_ast::Expr::Starred { value } => self.infer_expr(value),
         }
     }
-
 
     fn infer_binary_op(&self, left: &Type, op: &str, right: &Type) -> Result<Type> {
         match (left, right) {

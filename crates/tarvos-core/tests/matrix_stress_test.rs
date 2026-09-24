@@ -1,4 +1,4 @@
-//! Tarvos v1.0.0 integration capability matrix.
+//! Tarvos v1.1.0-rc.1 integration capability matrix.
 //!
 //! This is intentionally a diagnostic test rather than a compatibility claim:
 //! Tarvos currently compiles a statically analyzable Python subset. Cases that

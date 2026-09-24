@@ -2,81 +2,81 @@
   {
     "test": "01_arithmetic",
     "status": "PASSED",
-    "py_ms": 61.74140004441142,
-    "compile_ms": 2893.300299998373,
-    "pure_run_ms": 13.761700130999088,
-    "speedup": "4.5x"
+    "py_ms": 41.918200033251196,
+    "compile_ms": 4790.792799962219,
+    "pure_run_ms": 11.578100034967065,
+    "speedup": "3.6x"
   },
   {
     "test": "02_loops",
     "status": "PASSED",
-    "py_ms": 64.78839996270835,
-    "compile_ms": 1565.4948998708278,
-    "pure_run_ms": 19.15890001691878,
-    "speedup": "3.4x"
+    "py_ms": 45.188100019004196,
+    "compile_ms": 3630.614899971988,
+    "pure_run_ms": 8.771799970418215,
+    "speedup": "5.2x"
   },
   {
     "test": "03_functions",
     "status": "PASSED",
-    "py_ms": 87.02020021155477,
-    "compile_ms": 2278.725399868563,
-    "pure_run_ms": 25.715600000694394,
-    "speedup": "3.4x"
+    "py_ms": 42.230899969581515,
+    "compile_ms": 3584.778299962636,
+    "pure_run_ms": 8.078099985141307,
+    "speedup": "5.2x"
   },
   {
     "test": "04_fibonacci",
     "status": "PASSED",
-    "py_ms": 123.58639994636178,
-    "compile_ms": 1796.2195000145584,
-    "pure_run_ms": 11.934200068935752,
-    "speedup": "10.4x"
+    "py_ms": 42.0715999789536,
+    "compile_ms": 3677.855800022371,
+    "pure_run_ms": 10.506500024348497,
+    "speedup": "4.0x"
   },
   {
     "test": "05_branching",
     "status": "PASSED",
-    "py_ms": 54.21070009469986,
-    "compile_ms": 1181.8194999359548,
-    "pure_run_ms": 16.176100121811032,
-    "speedup": "3.4x"
+    "py_ms": 41.965599986724555,
+    "compile_ms": 3581.0711000231095,
+    "pure_run_ms": 8.212599961552769,
+    "speedup": "5.1x"
   },
   {
     "test": "06_nested_loops",
     "status": "PASSED",
-    "py_ms": 66.15339987911284,
-    "compile_ms": 1582.9215000849217,
-    "pure_run_ms": 16.259799944236875,
-    "speedup": "4.1x"
+    "py_ms": 49.139599956106395,
+    "compile_ms": 3995.979300001636,
+    "pure_run_ms": 8.329799980856478,
+    "speedup": "5.9x"
   },
   {
     "test": "07_comparisons",
     "status": "PASSED",
-    "py_ms": 69.65900002978742,
-    "compile_ms": 1335.0390000268817,
-    "pure_run_ms": 12.362999841570854,
-    "speedup": "5.6x"
+    "py_ms": 45.57429999113083,
+    "compile_ms": 3885.808299994096,
+    "pure_run_ms": 8.262299990747124,
+    "speedup": "5.5x"
   },
   {
     "test": "08_types_and_strings",
     "status": "PASSED",
-    "py_ms": 52.56369989365339,
-    "compile_ms": 1466.09320002608,
-    "pure_run_ms": 14.550100080668926,
-    "speedup": "3.6x"
+    "py_ms": 42.21679997863248,
+    "compile_ms": 3629.303699999582,
+    "pure_run_ms": 8.270599995739758,
+    "speedup": "5.1x"
   },
   {
     "test": "09_recursion",
     "status": "PASSED",
-    "py_ms": 70.94789994880557,
-    "compile_ms": 2258.5324998945,
-    "pure_run_ms": 16.151299932971597,
-    "speedup": "4.4x"
+    "py_ms": 46.13219999009743,
+    "compile_ms": 5128.408499993384,
+    "pure_run_ms": 8.11910000629723,
+    "speedup": "5.7x"
   },
   {
     "test": "10_heavy_accumulate",
     "status": "PASSED",
-    "py_ms": 54.54990011639893,
-    "compile_ms": 1550.966699840501,
-    "pure_run_ms": 13.89589998871088,
-    "speedup": "3.9x"
+    "py_ms": 41.601200005970895,
+    "compile_ms": 3595.3607000410557,
+    "pure_run_ms": 9.204700007103384,
+    "speedup": "4.5x"
   }
 ]

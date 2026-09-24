@@ -29,7 +29,7 @@ use tarvos_parser::parse_python_ast;
 #[derive(Parser, Debug)]
 #[command(name = "tarvos", disable_version_flag = true)]
 #[command(author = "Himanshu & Repo-Tech Team")]
-#[command(version = "1.0.0")]
+#[command(version = "1.1.0-rc.1")]
 #[command(about = "Transpiles and compiles Python code to native high-performance Rust executables", long_about = None)]
 struct Cli {
     /// Print the Tarvos version.
@@ -190,7 +190,7 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.version {
-        println!("tarvos 1.0.0");
+        println!("tarvos 1.1.0-rc.1");
         return Ok(());
     }
 
@@ -503,7 +503,7 @@ fn package_project_mode(
     fs::write(
         output.join("Cargo.toml"),
         format!(
-            "[workspace]\n\n[package]\nname = \"{}\"\nversion = \"1.0.0\"\nedition = \"2021\"\n\n[profile.release]\nopt-level = \"z\"         # Optimize aggressively for strict minimum size\nlto = true              # Enable whole-program Link-Time Optimization\ncodegen-units = 1       # Reduce parallel blocks to maximize single-binary optimization\npanic = \"abort\"         # Completely terminate stack unwinding code tables\nstrip = true            # Guarantee complete binary stripping of metadata and symbols\n",
+            "[workspace]\n\n[package]\nname = \"{}\"\nversion = \"1.1.0-rc.1\"\nedition = \"2021\"\n\n[profile.release]\nopt-level = \"z\"         # Optimize aggressively for strict minimum size\nlto = true              # Enable whole-program Link-Time Optimization\ncodegen-units = 1       # Reduce parallel blocks to maximize single-binary optimization\npanic = \"abort\"         # Completely terminate stack unwinding code tables\nstrip = true            # Guarantee complete binary stripping of metadata and symbols\n",
             project_name
         ),
     )?;
@@ -980,15 +980,21 @@ pub(crate) fn doctor_mode(_args: &[String]) -> Result<()> {
 }
 
 fn transpile_python_to_rust(input_path: &Path) -> Result<String> {
-    let source = fs::read_to_string(input_path)
-        .with_context(|| format!("failed to read {}", input_path.display()))?;
     let cache_dir = tarvos_cache_dir()?;
     fs::create_dir_all(&cache_dir)
         .with_context(|| format!("failed to create cache directory {}", cache_dir.display()))?;
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    "tarvos-cache-v1.0-r4-wide-int-codegen-v12-main-wrapper".hash(&mut hasher);
-    source.hash(&mut hasher);
+    "tarvos-cache-v1.0-r9-len-i64-classes-fallback".hash(&mut hasher);
+    input_path
+        .canonicalize()
+        .unwrap_or_else(|_| input_path.to_path_buf())
+        .to_string_lossy()
+        .hash(&mut hasher);
+    hash_project_sources(
+        input_path.parent().unwrap_or_else(|| Path::new(".")),
+        &mut hasher,
+    )?;
     let cache_path = cache_dir.join(format!("{:016x}.rs", hasher.finish()));
 
     if cache_path.is_file() {
@@ -1029,7 +1035,48 @@ fn tarvos_cache_dir() -> Result<PathBuf> {
     Ok(home
         .join(".tarvos")
         .join("cache")
-        .join("tarvos-cache-v1.0-r4"))
+        .join("tarvos-cache-v1.0-r9"))
+}
+
+fn hash_project_sources(root: &Path, hasher: &mut impl Hasher) -> Result<()> {
+    let mut files = Vec::new();
+    collect_python_sources(root, &mut files)?;
+    files.sort();
+    for path in files {
+        path.to_string_lossy().hash(hasher);
+        let content = fs::read(&path)
+            .with_context(|| format!("failed to read project source {}", path.display()))?;
+        content.hash(hasher);
+    }
+    Ok(())
+}
+
+fn collect_python_sources(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)
+        .with_context(|| format!("failed to read project directory {}", root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        if path.is_dir()
+            && !matches!(
+                name,
+                ".git" | ".venv" | "target" | "__pycache__" | "node_modules"
+            )
+        {
+            collect_python_sources(&path, files)?;
+        } else if path.is_file() && path.extension().and_then(|value| value.to_str()) == Some("py")
+        {
+            files.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn write_rust_output(output_path: &Path, rust_source: &str) -> Result<()> {
@@ -1226,10 +1273,26 @@ pub(crate) fn clean_mode(_args: &[String]) -> Result<()> {
         }
     }
     let cache_dir = tarvos_cache_dir()?;
-    if cache_dir.exists() {
-        fs::remove_dir_all(&cache_dir)
-            .with_context(|| format!("failed to remove user cache {}", cache_dir.display()))?;
-        println!("Removed {}", cache_dir.display());
+    let cache_root = cache_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("could not determine Tarvos cache root"))?;
+    if cache_root.exists() {
+        for entry in fs::read_dir(cache_root)
+            .with_context(|| format!("failed to read user cache root {}", cache_root.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let is_tarvos_cache = path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("tarvos-cache-"));
+            if is_tarvos_cache {
+                fs::remove_dir_all(&path)
+                    .with_context(|| format!("failed to remove user cache {}", path.display()))?;
+                println!("Removed {}", path.display());
+            }
+        }
     }
     println!("Workspace cleaned.");
     Ok(())
@@ -1276,7 +1339,9 @@ pub(crate) fn export_mode(args: &[String]) -> Result<()> {
                     break;
                 }
             }
-            found.ok_or_else(|| anyhow::anyhow!("No Python files found in {}", input_path.display()))?
+            found.ok_or_else(|| {
+                anyhow::anyhow!("No Python files found in {}", input_path.display())
+            })?
         };
 
         // Transpile main entry
@@ -1286,7 +1351,10 @@ pub(crate) fn export_mode(args: &[String]) -> Result<()> {
         // Transpile all other .py files as modules or library files
         for entry in fs::read_dir(&input_path)? {
             let p = entry?.path();
-            if p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("py") && p != entrypoint {
+            if p.is_file()
+                && p.extension().and_then(|s| s.to_str()) == Some("py")
+                && p != entrypoint
+            {
                 let stem = p.file_stem().unwrap_or_default().to_string_lossy();
                 let mod_name = sanitize_package_name(&stem);
                 if let Ok(mod_rust) = transpile_python_to_rust(&p) {
@@ -1314,9 +1382,15 @@ pub(crate) fn export_mode(args: &[String]) -> Result<()> {
     )
     .with_context(|| format!("failed to write README in {}", output_path.display()))?;
 
-    println!("Exported complete Rust project to: {}", output_path.display());
+    println!(
+        "Exported complete Rust project to: {}",
+        output_path.display()
+    );
     println!("Cargo structure: Cargo.toml, src/main.rs, modules, README.md");
-    println!("Build with: cd {} && cargo build --release", output_path.display());
+    println!(
+        "Build with: cd {} && cargo build --release",
+        output_path.display()
+    );
     Ok(())
 }
 
@@ -1635,6 +1709,59 @@ mod tests {
             rust.contains("result = 0_i64;"),
             "missing else-branch assignment:\n{}",
             rust
+        );
+    }
+
+    #[test]
+    fn supported_python_snippet_transpiles_to_valid_rust() {
+        let snippet = "def add(a: int, b: int) -> int:\n    return a + b\n\nprint(add(2, 3))\n";
+        let ast_json = export_python_ast(snippet).expect("ast export should succeed");
+        let module = parse_python_ast(&ast_json).expect("ast parsing should succeed");
+        let ir = lower_module(&module).expect("lowering should succeed");
+        let ir = Optimizer::optimize(&ir).expect("optimizer should succeed");
+        let rust = RustCodegen::generate(&ir).expect("codegen should succeed");
+
+        assert!(rust.contains("fn add(a: i64, b: i64) -> i64"));
+        assert!(rust.contains("println!(\"{}\", add(2_i64, 3_i64));"));
+    }
+
+    #[test]
+    fn unsupported_import_produces_explicit_actionable_error() {
+        let snippet = "import unknown_dynamic_lib\nprint(1)\n";
+        let ast_json = export_python_ast(snippet).expect("ast export should succeed");
+        let module = parse_python_ast(&ast_json).expect("ast parsing should succeed");
+        let res = lower_module(&module);
+        assert!(
+            res.is_err(),
+            "unsupported import must produce an explicit diagnostic"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unsupported") || err_msg.contains("import"),
+            "expected diagnostic about unsupported imports, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn incompatible_type_reassignment_fails_fast_without_success_shape() {
+        let snippet = "x = 42\nx = 'now_a_string'\nprint(x)\n";
+        let ast_json = export_python_ast(snippet).expect("ast export should succeed");
+        let module = parse_python_ast(&ast_json).expect("ast parsing should succeed");
+        let ir = lower_module(&module).expect("lowering produces typed IR");
+        let ir = Optimizer::optimize(&ir).expect("optimizer succeeds");
+        let res = RustCodegen::generate(&ir);
+        assert!(
+            res.is_err(),
+            "incompatible reassignment must be rejected natively by codegen"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("fallback")
+                || err_msg.contains("incompatible")
+                || err_msg.contains("changes from"),
+            "expected actionable type error, got: {}",
+            err_msg
         );
     }
 }

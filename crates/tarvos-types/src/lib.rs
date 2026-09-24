@@ -15,6 +15,7 @@ pub enum Type {
     Array(Box<Type>),
     Tuple(Vec<Type>),
     Dict { key: Box<Type>, value: Box<Type> },
+    Object(String),
 
     // Special
     Unknown,
@@ -40,6 +41,7 @@ impl fmt::Display for Type {
                 write!(f, ")")
             }
             Type::Dict { key, value } => write!(f, "Dict[{}, {}]", key, value),
+            Type::Object(name) => write!(f, "{}", name),
             Type::Unknown => write!(f, "Unknown"),
         }
     }

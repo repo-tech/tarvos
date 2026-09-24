@@ -68,6 +68,207 @@ mod pipeline {
         assert_contains_all(&code, &["fn run_benchmark()", "run_benchmark();"]);
     }
 
+    #[test]
+    fn nested_loop_boolean_assignments_keep_boolean_storage() {
+        let ast = r#"{"type":"module","body":[
+          {"type":"try","body":[
+            {"type":"assign","target":{"type":"name","id":"primes"},"value":{"type":"list","elements":[]}},
+            {"type":"for","target":{"type":"name","id":"num"},
+             "iter":{"type":"call","function":{"type":"name","id":"range"},
+                     "args":[{"type":"int","value":2},{"type":"int","value":5}],"keywords":[]},
+             "body":[
+               {"type":"assign","target":{"type":"name","id":"is_prime"},"value":{"type":"bool","value":true}},
+               {"type":"for","target":{"type":"name","id":"i"},
+                "iter":{"type":"call","function":{"type":"name","id":"range"},
+                        "args":[{"type":"int","value":2},{"type":"int","value":3}],"keywords":[]},
+                "body":[
+                  {"type":"if","test":{"type":"compare","left":{"type":"name","id":"num"},
+                      "operators":["eq"],"comparators":[{"type":"name","id":"i"}]},
+                   "body":[{"type":"assign","target":{"type":"name","id":"is_prime"},
+                            "value":{"type":"bool","value":false}}],"orelse":[]}
+                ]}
+             ]}],
+            "handlers":[],"orelse":[],"finalbody":[]}
+        ]}"#;
+        let code = compile(ast).expect("nested boolean assignments should lower");
+        assert_contains_all(
+            &code,
+            &[
+                "let mut is_prime = false;",
+                "is_prime = true;",
+                "is_prime = false;",
+            ],
+        );
+        assert!(!code.contains("let mut is_prime = 0_i64;"));
+    }
+
+    #[test]
+    fn incompatible_native_reassignment_requests_python_fallback() {
+        let ast = r#"{"type":"module","body":[
+          {"type":"assign","target":{"type":"name","id":"value"},"value":{"type":"int","value":1}},
+          {"type":"assign","target":{"type":"name","id":"value"},"value":{"type":"string","value":"dynamic"}},
+          {"type":"expr","value":{"type":"call","function":{"type":"name","id":"print"},
+           "args":[{"type":"name","id":"value"}],"keywords":[]}}
+        ]}"#;
+        let error = compile(ast).expect_err("mixed native reassignment must be explicit");
+        assert!(error.contains("changes from int to str"));
+        assert!(error.contains("--python-fallback"));
+    }
+
+    #[test]
+    fn incompatible_branch_types_request_python_fallback() {
+        let ast = r#"{"type":"module","body":[
+          {"type":"if","test":{"type":"compare","left":{"type":"int","value":1},
+           "operators":["lt"],"comparators":[{"type":"name","id":"condition"}]},
+           "body":[{"type":"assign","target":{"type":"name","id":"value"},
+                    "value":{"type":"bool","value":true}}],
+           "orelse":[{"type":"assign","target":{"type":"name","id":"value"},
+                      "value":{"type":"int","value":1}}]},
+          {"type":"expr","value":{"type":"call","function":{"type":"name","id":"print"},
+           "args":[{"type":"name","id":"value"}],"keywords":[]}}
+        ]}"#;
+        let error = compile(ast).expect_err("incompatible branch types must be explicit");
+        assert!(error.contains("branch `value` changes from"));
+        assert!(error.contains("--python-fallback"));
+    }
+
+    #[test]
+    fn filtered_list_comprehension_lowers_to_collect() {
+        let ast = r#"{"type":"module","body":[
+          {"type":"assign","target":{"type":"name","id":"values"},"value":{
+            "type":"list_comp",
+            "elt":{"type":"binary","left":{"type":"name","id":"x"},"operator":"mul","right":{"type":"int","value":2}},
+            "target":"x",
+            "iter":{"type":"call","function":{"type":"name","id":"range"},"args":[{"type":"int","value":6}],"keywords":[]},
+            "condition":{"type":"compare","left":{"type":"name","id":"x"},"operators":["gt"],"comparators":[{"type":"int","value":2}]}
+          }},
+          {"type":"expr","value":{"type":"call","function":{"type":"name","id":"print"},"args":[
+            {"type":"call","function":{"type":"name","id":"len"},"args":[{"type":"name","id":"values"}],"keywords":[]}
+          ],"keywords":[]}}
+        ]}"#;
+        let code = compile(ast).expect("list comprehension should lower");
+        assert_contains_all(
+            &code,
+            &[
+                ".into_iter().filter_map",
+                ".collect::<Vec<_>>()",
+                "values.len()",
+            ],
+        );
+    }
+
+    #[test]
+    fn unsupported_imports_fail_explicitly() {
+        let ast = r#"{"type":"module","body":[
+          {"type":"import","names":[{"name":"numpy","asname":null}]}
+        ]}"#;
+        let error = compile(ast).expect_err("unsupported native imports must fail");
+        assert!(error.contains("not supported by the native backend"));
+    }
+
+    #[test]
+    fn os_path_imports_lower_to_native_filesystem_calls() {
+        let ast = r#"{"type":"module","body":[
+          {"type":"import","names":[{"name":"os.path","asname":null}]},
+          {"type":"expr","value":{"type":"call","function":{"type":"name","id":"print"},"args":[
+            {"type":"method_call","object":{"type":"attribute","value":{"type":"name","id":"os"},"attr":"path"},
+             "method":"join","args":[{"type":"string","value":"tmp"},{"type":"string","value":"file.txt"}]}
+          ],"keywords":[]}}
+        ]}"#;
+        let code = compile(ast).expect("os.path call should lower");
+        assert_contains_all(
+            &code,
+            &["PathBuf::from", ".join(", "to_string_lossy().into_owned()"],
+        );
+    }
+
+    #[test]
+    fn class_instances_store_fields_and_mutate_through_methods() {
+        let ast = r#"{"type":"module","body":[
+          {"type":"classdef","name":"Counter","bases":[],"body":[
+            {"type":"funcdef","name":"__init__","args":["self","start"],
+             "arg_annotations":[null,"int"],
+             "body":[
+               {"type":"assign","target":{"type":"attribute","value":{"type":"name","id":"self"},"attr":"value"},
+                "value":{"type":"name","id":"start"}}
+             ],"returns":null},
+            {"type":"funcdef","name":"next","args":["self"],"arg_annotations":[null],
+             "body":[
+               {"type":"assign","target":{"type":"attribute","value":{"type":"name","id":"self"},"attr":"value"},
+                "value":{"type":"binary","left":{"type":"attribute","value":{"type":"name","id":"self"},"attr":"value"},
+                 "operator":"add","right":{"type":"int","value":1}}},
+               {"type":"return","value":{"type":"attribute","value":{"type":"name","id":"self"},"attr":"value"}}
+             ],"returns":"int"}
+          ]},
+          {"type":"assign","target":{"type":"name","id":"counter"},
+           "value":{"type":"call","function":{"type":"name","id":"Counter"},
+            "args":[{"type":"int","value":4}],"keywords":[]}},
+          {"type":"expr","value":{"type":"call","function":{"type":"name","id":"print"},
+           "args":[{"type":"method_call","object":{"type":"name","id":"counter"},"method":"next","args":[]}],
+           "keywords":[]}}
+        ]}"#;
+        let code = compile(ast).expect("class instance fields should lower");
+        assert_contains_all(
+            &code,
+            &[
+                "struct Counter",
+                "value: i64",
+                "fn __tarvos_ctor_counter",
+                "self_obj.value",
+                "fn counter_next",
+                "&mut counter",
+            ],
+        );
+    }
+
+    #[test]
+    fn loops_over_strings_and_dictionary_keys_with_native_types() {
+        let ast = r#"{"type":"module","body":[
+          {"type":"assign","target":{"type":"name","id":"text"},
+           "value":{"type":"string","value":"abc"}},
+          {"type":"assign","target":{"type":"name","id":"seen"},
+           "value":{"type":"string","value":""}},
+          {"type":"for","target":{"type":"name","id":"ch"},
+           "iter":{"type":"name","id":"text"},
+           "body":[{"type":"assign","target":{"type":"name","id":"seen"},
+            "value":{"type":"binary","left":{"type":"name","id":"seen"},
+             "operator":"add","right":{"type":"name","id":"ch"}}}]},
+          {"type":"assign","target":{"type":"name","id":"scores"},
+           "value":{"type":"dict","keys":[{"type":"string","value":"a"}],
+            "values":[{"type":"int","value":7}]}},
+          {"type":"assign","target":{"type":"name","id":"count"},
+           "value":{"type":"int","value":0}},
+          {"type":"for","target":{"type":"name","id":"key"},
+           "iter":{"type":"name","id":"scores"},
+           "body":[{"type":"assign","target":{"type":"name","id":"count"},
+            "value":{"type":"binary","left":{"type":"name","id":"count"},
+             "operator":"add","right":{"type":"int","value":1}}}]},
+          {"type":"expr","value":{"type":"call","function":{"type":"name","id":"print"},
+           "args":[{"type":"name","id":"seen"},{"type":"name","id":"count"}],"keywords":[]}}
+        ]}"#;
+        let code = compile(ast).expect("string and dictionary loops should lower");
+        assert_contains_all(
+            &code,
+            &[
+                ".chars().map(|ch| ch.to_string())",
+                ".keys().cloned()",
+                "println!(\"{} {}\",",
+            ],
+        );
+    }
+
+    #[test]
+    fn huge_integer_range_fails_with_actionable_native_diagnostic() {
+        let ast = r#"{"type":"module","body":[
+          {"type":"for","target":{"type":"name","id":"i"},
+           "iter":{"type":"call","function":{"type":"name","id":"range"},
+            "args":[{"type":"big_int","value":"2000000000000000000000000"}],"keywords":[]},
+           "body":[]}
+        ]}"#;
+        let error = compile(ast).expect_err("huge native ranges must not compile blindly");
+        assert!(error.contains("range() bounds above i64"));
+    }
+
     /// Assert that `compiled` contains all expected substrings.
     fn assert_contains_all(compiled: &str, expected: &[&str]) {
         for s in expected {

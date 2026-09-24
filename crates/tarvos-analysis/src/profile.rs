@@ -273,13 +273,14 @@ fn analyze_expr(expr: &Expr, stats: &mut ProfileStats) {
         }
         Expr::FormatString { parts } => {
             for part in parts {
-                if let tarvos_ast::FormatPart::Value { value } = part {
+                if let tarvos_ast::FormatPart::Value { value, .. } = part {
                     analyze_expr(value, stats);
                 }
             }
         }
         Expr::Name { .. }
         | Expr::Int { .. }
+        | Expr::BigInt { .. }
         | Expr::Float { .. }
         | Expr::String { .. }
         | Expr::Bool { .. }

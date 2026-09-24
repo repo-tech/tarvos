@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tarvos_ir::{BinaryOp, Module, Stmt, Value};
 use tarvos_types::Type;
 
@@ -7,6 +7,10 @@ pub struct RustCodegen;
 
 impl RustCodegen {
     pub fn generate(module: &Module) -> Result<String> {
+        for stmt in &module.statements {
+            Self::validate_signature_types(stmt)?;
+        }
+        Self::validate_module_assignments(module)?;
         let mut out = String::new();
         out.push_str("#![allow(unused_mut, unused_variables, dead_code, unused_parens, unused_assignments)]\n\n");
         if module.statements.iter().any(Self::statement_uses_hash_map) {
@@ -14,14 +18,28 @@ impl RustCodegen {
         }
 
         let mut functions = Vec::new();
+        let mut structs = Vec::new();
         let mut main_stmts = Vec::new();
         let mut declared = HashSet::new();
 
         for stmt in &module.statements {
             if matches!(stmt, Stmt::Function { .. }) {
                 functions.push(stmt);
+            } else if matches!(stmt, Stmt::StructDef { .. }) {
+                structs.push(stmt);
             } else {
                 main_stmts.push(stmt);
+            }
+        }
+
+        for stmt in &structs {
+            if let Stmt::StructDef { name, fields } = stmt {
+                out.push_str("#[derive(Clone)]\n");
+                out.push_str(&format!("struct {} {{\n", name));
+                for (field, ty) in fields {
+                    out.push_str(&format!("    {}: {},\n", field, Self::type_to_rust(ty)));
+                }
+                out.push_str("}\n\n");
             }
         }
 
@@ -91,6 +109,7 @@ impl RustCodegen {
 
         for stmt in &module.statements {
             match stmt {
+                Stmt::StructDef { .. } => {}
                 Stmt::Let { name, ty, value } => {
                     if !matches!(ty, Type::Int) {
                         return Err(anyhow::anyhow!(
@@ -188,6 +207,9 @@ impl RustCodegen {
 
     fn statement_uses_hash_map(stmt: &Stmt) -> bool {
         match stmt {
+            Stmt::StructDef { fields, .. } => {
+                fields.iter().any(|(_, ty)| matches!(ty, Type::Dict { .. }))
+            }
             Stmt::Let { value, .. } | Stmt::Assign { value, .. } => {
                 Self::value_uses_hash_map(value)
             }
@@ -228,6 +250,9 @@ impl RustCodegen {
                     .any(|item| Self::value_uses_hash_map(&item.context_expr))
                     || body.iter().any(Self::statement_uses_hash_map)
             }
+            Stmt::FieldAssign { object, value, .. } => {
+                Self::value_uses_hash_map(object) || Self::value_uses_hash_map(value)
+            }
             Stmt::Break | Stmt::Continue | Stmt::Raise(_) => false,
         }
     }
@@ -256,7 +281,20 @@ impl RustCodegen {
             Value::Call { args, .. }
             | Value::List { elements: args, .. }
             | Value::Tuple { elements: args, .. } => args.iter().any(Self::value_uses_hash_map),
+            Value::ListComp {
+                iter,
+                element,
+                condition,
+                ..
+            } => {
+                Self::value_uses_hash_map(iter)
+                    || Self::value_uses_hash_map(element)
+                    || condition
+                        .as_ref()
+                        .is_some_and(|value| Self::value_uses_hash_map(value))
+            }
             Value::Unary { operand, .. } => Self::value_uses_hash_map(operand),
+            Value::Field { object, .. } => Self::value_uses_hash_map(object),
             Value::Index {
                 container, index, ..
             } => Self::value_uses_hash_map(container) || Self::value_uses_hash_map(index),
@@ -274,7 +312,7 @@ impl RustCodegen {
             }
             Value::FormatString { parts } => parts.iter().any(|part| match part {
                 tarvos_ir::FormatPart::Literal(_) => false,
-                tarvos_ir::FormatPart::Value(value) => Self::value_uses_hash_map(value),
+                tarvos_ir::FormatPart::Value { value, .. } => Self::value_uses_hash_map(value),
             }),
             Value::Int(_)
             | Value::Int128(_)
@@ -294,6 +332,7 @@ impl RustCodegen {
         let ind = "    ".repeat(indent);
 
         match stmt {
+            Stmt::StructDef { .. } => {}
             Stmt::Let { name, ty: _, value } => {
                 let value_str = Self::emit_value(value)?;
                 if declared.contains(name) {
@@ -311,6 +350,25 @@ impl RustCodegen {
                     out.push_str(&format!("{}let mut {} = {};\n", ind, name, init));
                 }
                 out.push_str(&format!("{}{} = {};\n", ind, name, value_str));
+            }
+            Stmt::FieldAssign {
+                object,
+                field,
+                value,
+            } => {
+                let object = Self::emit_value(object)?;
+                let object = if object == "self" {
+                    "self_obj".to_string()
+                } else {
+                    object
+                };
+                out.push_str(&format!(
+                    "{}{}.{} = {};\n",
+                    ind,
+                    object,
+                    field,
+                    Self::emit_value(value)?
+                ));
             }
             Stmt::IndexAssign {
                 target,
@@ -376,6 +434,12 @@ impl RustCodegen {
                 }
                 out.push_str(&format!("{}}} else {{\n", ind));
                 if let Some(handler) = handlers.first() {
+                    if let Some(name) = &handler.name {
+                        out.push_str(&format!(
+                            "{}    let {} = \"Tarvos exception\".to_string();\n",
+                            ind, name
+                        ));
+                    }
                     for nested in &handler.body {
                         Self::emit_stmt(out, nested, indent + 1, declared)?;
                     }
@@ -460,11 +524,20 @@ impl RustCodegen {
 
                 out.push_str(&format!("{}}}\n", ind));
             }
-            Stmt::For { target, iter, body } => {
+            Stmt::For {
+                target,
+                iter,
+                iter_type,
+                body,
+            } => {
                 let iter_str = Self::emit_value(iter)?;
-                let iter_str = match iter {
-                    Value::Name(_) => format!("{}.iter().cloned()", iter_str),
-                    _ => iter_str,
+                let iter_str = match iter_type {
+                    Type::String => format!("{}.chars().map(|ch| ch.to_string())", iter_str),
+                    Type::Dict { .. } => format!("{}.keys().cloned()", iter_str),
+                    _ => match iter {
+                        Value::Name(_) => format!("{}.iter().cloned()", iter_str),
+                        _ => iter_str,
+                    },
                 };
                 if Self::contains_assignment_to(body, target) {
                     let binding = format!("__tarvos_loop_{}", target);
@@ -495,6 +568,37 @@ impl RustCodegen {
                 return_type,
                 body,
             } => {
+                if name.starts_with("__tarvos_ctor_") {
+                    let class_name = match return_type {
+                        Type::Object(class_name) => class_name.as_str(),
+                        _ => name.trim_start_matches("__tarvos_ctor_"),
+                    };
+                    let params_str = params
+                        .iter()
+                        .map(|(pname, pty)| format!("{}: {}", pname, Self::type_to_rust(pty)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    out.push_str(&format!(
+                        "{}#[inline(always)]\n{}fn {}({}) -> {} {{\n",
+                        ind, ind, name, params_str, class_name
+                    ));
+                    let fields = Self::collect_field_initializers(body);
+                    let fields_str = fields
+                        .iter()
+                        .map(|(field, value)| format!("{}: {}", field, value))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    out.push_str(&format!(
+                        "{}    let mut __tarvos_obj = {} {{ {} }};\n",
+                        ind, class_name, fields_str
+                    ));
+                    out.push_str(&format!("{}    let self_obj = &mut __tarvos_obj;\n", ind));
+                    for nested in body {
+                        Self::emit_stmt(out, nested, indent + 1, declared)?;
+                    }
+                    out.push_str(&format!("{}    __tarvos_obj\n{}}}\n", ind, ind));
+                    return Ok(());
+                }
                 let emitted_name = if name == "main" {
                     "__tarvos_main"
                 } else {
@@ -503,7 +607,14 @@ impl RustCodegen {
                 let return_type_str = Self::type_to_rust(return_type);
                 let params_str = params
                     .iter()
-                    .map(|(pname, pty)| format!("{}: {}", pname, Self::type_to_rust(pty)))
+                    .map(|(pname, pty)| {
+                        if pname == "self" {
+                            if let Type::Object(class_name) = pty {
+                                return format!("self_obj: &mut {}", class_name);
+                            }
+                        }
+                        format!("{}: {}", pname, Self::type_to_rust(pty))
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
 
@@ -619,8 +730,24 @@ impl RustCodegen {
             }
             Value::Dict { .. } => "HashMap::new()".to_string(),
             Value::Name(name) => name.clone(),
+            Value::Field { .. } => "0_i64".to_string(),
             _ => "0_i64".to_string(),
         })
+    }
+
+    fn collect_field_initializers(body: &[Stmt]) -> Vec<(String, String)> {
+        let mut fields = Vec::new();
+        for stmt in body {
+            if let Stmt::FieldAssign { field, value, .. } = stmt {
+                if !fields.iter().any(|(name, _)| name == field) {
+                    fields.push((
+                        field.clone(),
+                        Self::zero_for_value(value).unwrap_or_else(|_| "0_i64".to_string()),
+                    ));
+                }
+            }
+        }
+        fields
     }
 
     fn zero_for_type_by_name(name: &str, body: &[Stmt], orelse: &[Stmt]) -> Result<String> {
@@ -632,6 +759,11 @@ impl RustCodegen {
                 } if target == name => return Self::zero_for_value(value),
                 Stmt::If { body, orelse, .. } => {
                     if let Ok(value) = Self::zero_for_type_by_name(name, body, orelse) {
+                        return Ok(value);
+                    }
+                }
+                Stmt::While { body, .. } | Stmt::For { body, .. } => {
+                    if let Ok(value) = Self::zero_for_type_by_name(name, body, &[]) {
                         return Ok(value);
                     }
                 }
@@ -708,6 +840,15 @@ impl RustCodegen {
             Value::Bool(v) => v.to_string(),
             Value::Name(name) if name == "__name__" => "\"__main__\".to_string()".to_string(),
             Value::Name(name) => name.clone(),
+            Value::Field { object, field, .. } => {
+                let object = Self::emit_value(object)?;
+                let object = if object == "self" {
+                    "self_obj".to_string()
+                } else {
+                    object
+                };
+                format!("{}.{}", object, field)
+            }
             Value::Unary { op, operand, .. } => {
                 let operand = Self::emit_value(operand)?;
                 match op {
@@ -776,6 +917,18 @@ impl RustCodegen {
                 let args_str = args_rendered.join(", ");
 
                 match function.as_str() {
+                    name if name.starts_with("__tarvos_ctor_") => {
+                        format!("{}({})", name, args_str)
+                    }
+                    name if name.starts_with("__tarvos_mut_call_") => {
+                        let function = name.trim_start_matches("__tarvos_mut_call_");
+                        let Some((receiver, rest)) = args_rendered.split_first() else {
+                            return Err(anyhow::anyhow!("method call missing receiver"));
+                        };
+                        let mut call_args = vec![format!("&mut {}", receiver)];
+                        call_args.extend(rest.iter().cloned());
+                        format!("{}({})", function, call_args.join(", "))
+                    }
                     // print() used as an expression: use Python display semantics
                     "print" => format!("println!(\"{{}}\", {})", args_str),
                     "range" => match args_rendered.as_slice() {
@@ -784,13 +937,139 @@ impl RustCodegen {
                         [start, stop, step] => format!("({}..{}).step_by({})", start, stop, step),
                         _ => return Err(anyhow::anyhow!("range() requires 1 to 3 arguments")),
                     },
-                    "len" => format!("{}.len()", args_str),
+                    "len" => format!("({}.len() as i64)", args_str),
                     "str" => format!("format!(\"{{}}\", {})", args_str),
                     "int" => format!("{} as i64", args_str),
                     "float" => format!("{} as f64", args_str),
                     "bool" => format!("({} != 0)", args_str),
                     "tarvos_perf_counter" => {
                         "std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect(\"system clock\").as_secs_f64()".to_string()
+                    }
+                    "tarvos_time" => {
+                        "std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect(\"system clock\").as_secs_f64()".to_string()
+                    }
+                    "tarvos_sleep" => match args_rendered.as_slice() {
+                        [seconds] => format!(
+                            "std::thread::sleep(std::time::Duration::from_secs_f64({} as f64))",
+                            seconds
+                        ),
+                        _ => return Err(anyhow::anyhow!("time.sleep() requires 1 argument")),
+                    },
+                    "tarvos_math_sqrt"
+                    | "tarvos_math_sin"
+                    | "tarvos_math_cos"
+                    | "tarvos_math_tan"
+                    | "tarvos_math_asin"
+                    | "tarvos_math_acos"
+                    | "tarvos_math_atan"
+                    | "tarvos_math_exp"
+                    | "tarvos_math_log"
+                    | "tarvos_math_log10"
+                    | "tarvos_math_fabs"
+                    | "tarvos_math_isfinite"
+                    | "tarvos_math_isnan"
+                    | "tarvos_math_isinf" => {
+                        let [value] = args_rendered.as_slice() else {
+                            return Err(anyhow::anyhow!(
+                                "{}() requires 1 argument",
+                                function
+                            ));
+                        };
+                        let method = match function.as_str() {
+                            "tarvos_math_sqrt" => "sqrt",
+                            "tarvos_math_sin" => "sin",
+                            "tarvos_math_cos" => "cos",
+                            "tarvos_math_tan" => "tan",
+                            "tarvos_math_asin" => "asin",
+                            "tarvos_math_acos" => "acos",
+                            "tarvos_math_atan" => "atan",
+                            "tarvos_math_exp" => "exp",
+                            "tarvos_math_log" => "ln",
+                            "tarvos_math_log10" => "log10",
+                            "tarvos_math_fabs" => "abs",
+                            "tarvos_math_isfinite" => "is_finite",
+                            "tarvos_math_isnan" => "is_nan",
+                            "tarvos_math_isinf" => "is_infinite",
+                            _ => unreachable!(),
+                        };
+                        format!("({} as f64).{}()", value, method)
+                    }
+                    "tarvos_math_floor" | "tarvos_math_ceil" => {
+                        let [value] = args_rendered.as_slice() else {
+                            return Err(anyhow::anyhow!(
+                                "{}() requires 1 argument",
+                                function
+                            ));
+                        };
+                        let method = if function == "tarvos_math_floor" {
+                            "floor"
+                        } else {
+                            "ceil"
+                        };
+                        format!("({} as f64).{}() as i64", value, method)
+                    }
+                    "tarvos_math_pow" => match args_rendered.as_slice() {
+                        [base, exponent] => {
+                            format!("({} as f64).powf({} as f64)", base, exponent)
+                        }
+                        _ => return Err(anyhow::anyhow!("math.pow() requires 2 arguments")),
+                    },
+                    "tarvos_math_hypot" => match args_rendered.as_slice() {
+                        [left, right] => {
+                            format!("({} as f64).hypot({} as f64)", left, right)
+                        }
+                        _ => return Err(anyhow::anyhow!("math.hypot() requires 2 arguments")),
+                    },
+                    "tarvos_math_atan2" => match args_rendered.as_slice() {
+                        [left, right] => {
+                            format!("({} as f64).atan2({} as f64)", left, right)
+                        }
+                        _ => return Err(anyhow::anyhow!("math.atan2() requires 2 arguments")),
+                    },
+                    "tarvos_os_path_join" => {
+                        if args_rendered.len() < 2 {
+                            return Err(anyhow::anyhow!(
+                                "os.path.join() requires at least 2 arguments"
+                            ));
+                        }
+                        let mut expression =
+                            format!("std::path::PathBuf::from({})", args_rendered[0]);
+                        for argument in &args_rendered[1..] {
+                            expression = format!("{}.join({})", expression, argument);
+                        }
+                        format!("{}.to_string_lossy().into_owned()", expression)
+                    }
+                    "tarvos_os_path_basename"
+                    | "tarvos_os_path_dirname"
+                    | "tarvos_os_path_exists"
+                    | "tarvos_os_path_isfile"
+                    | "tarvos_os_path_isdir" => {
+                        let [path] = args_rendered.as_slice() else {
+                            return Err(anyhow::anyhow!(
+                                "{}() requires 1 argument",
+                                function
+                            ));
+                        };
+                        match function.as_str() {
+                            "tarvos_os_path_basename" => format!(
+                                "std::path::Path::new(&{}).file_name().map(|v| v.to_string_lossy().into_owned()).unwrap_or_default()",
+                                path
+                            ),
+                            "tarvos_os_path_dirname" => format!(
+                                "std::path::Path::new(&{}).parent().map(|v| v.to_string_lossy().into_owned()).unwrap_or_default()",
+                                path
+                            ),
+                            "tarvos_os_path_exists" => {
+                                format!("std::path::Path::new(&{}).exists()", path)
+                            }
+                            "tarvos_os_path_isfile" => {
+                                format!("std::path::Path::new(&{}).is_file()", path)
+                            }
+                            "tarvos_os_path_isdir" => {
+                                format!("std::path::Path::new(&{}).is_dir()", path)
+                            }
+                            _ => unreachable!(),
+                        }
                     }
                     "abs" => format!("({}).abs()", args_str),
                     "min" => match args_rendered.as_slice() {
@@ -823,6 +1102,26 @@ impl RustCodegen {
                     .collect::<Result<Vec<_>>>()?
                     .join(", ");
                 format!("vec![{}]", elements_str)
+            }
+            Value::ListComp {
+                target,
+                iter,
+                element,
+                condition,
+                ..
+            } => {
+                let iter_str = Self::emit_value(iter)?;
+                let element_str = Self::emit_value(element)?;
+                let mapped = if let Some(condition) = condition {
+                    let condition_str = Self::emit_value(condition)?;
+                    format!(
+                        "{}.into_iter().filter_map(|{}| if {} {{ Some({}) }} else {{ None }})",
+                        iter_str, target, condition_str, element_str
+                    )
+                } else {
+                    format!("{}.into_iter().map(|{}| {})", iter_str, target, element_str)
+                };
+                format!("{}.collect::<Vec<_>>()", mapped)
             }
             Value::Tuple { elements, .. } => {
                 let elements_str = elements
@@ -903,9 +1202,23 @@ impl RustCodegen {
                         tarvos_ir::FormatPart::Literal(value) => {
                             format_string.push_str(&value.replace('{', "{{").replace('}', "}}"));
                         }
-                        tarvos_ir::FormatPart::Value(value) => {
-                            format_string.push_str("{}");
-                            args.push(Self::emit_value(value)?);
+                        tarvos_ir::FormatPart::Value {
+                            value,
+                            format_spec,
+                            conversion,
+                        } => {
+                            let rendered_spec = format_spec
+                                .as_deref()
+                                .map(Self::rust_format_spec)
+                                .unwrap_or_default();
+                            format_string.push('{');
+                            format_string.push_str(&rendered_spec);
+                            format_string.push('}');
+                            let rendered = Self::emit_value(value)?;
+                            args.push(match conversion.as_deref() {
+                                Some("r") | Some("a") => format!("{:?}", rendered),
+                                _ => rendered,
+                            });
                         }
                     }
                 }
@@ -916,6 +1229,20 @@ impl RustCodegen {
                 }
             }
         })
+    }
+
+    fn rust_format_spec(spec: &str) -> String {
+        if let Some(precision) = spec
+            .strip_prefix('.')
+            .and_then(|value| value.strip_suffix('f'))
+        {
+            return format!(":.{precision}");
+        }
+        if spec.starts_with(':') {
+            spec.to_owned()
+        } else {
+            format!(":{spec}")
+        }
     }
 
     fn type_to_rust(ty: &Type) -> String {
@@ -935,8 +1262,223 @@ impl RustCodegen {
                 Self::type_to_rust(key),
                 Self::type_to_rust(value)
             ),
-            Type::Unknown => "i64".to_string(), // Default to i64 for unknown
+            // Signature types are validated before emission. Keeping this arm
+            // makes the enum match exhaustive without silently choosing i64.
+            Type::Unknown => "()".to_string(),
+            Type::Object(name) => name.clone(),
         }
+    }
+
+    fn validate_signature_types(stmt: &Stmt) -> Result<()> {
+        match stmt {
+            Stmt::StructDef { name, fields } => {
+                for (field, ty) in fields {
+                    Self::validate_native_type(ty, &format!("field `{name}.{field}`"))?;
+                }
+            }
+            Stmt::Function {
+                name,
+                params,
+                return_type,
+                ..
+            } => {
+                for (param, ty) in params {
+                    Self::validate_native_type(ty, &format!("parameter `{name}({param})`"))?;
+                }
+                Self::validate_native_type(return_type, &format!("return type of `{name}`"))?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn validate_native_type(ty: &Type, context: &str) -> Result<()> {
+        match ty {
+            Type::Unknown => Err(anyhow::anyhow!(
+                "dynamic type in native {context} is not supported; use --python-fallback"
+            )),
+            Type::Array(inner) => Self::validate_native_type(inner, context),
+            Type::Tuple(types) => {
+                for element in types {
+                    Self::validate_native_type(element, context)?;
+                }
+                Ok(())
+            }
+            Type::Dict { key, value } => {
+                Self::validate_native_type(key, context)?;
+                Self::validate_native_type(value, context)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_module_assignments(module: &Module) -> Result<()> {
+        let mut module_variables = HashMap::new();
+        for stmt in &module.statements {
+            match stmt {
+                Stmt::Function {
+                    params, body, name, ..
+                } => {
+                    let mut variables = params.iter().cloned().collect::<HashMap<_, _>>();
+                    Self::validate_assignments(body, &mut variables).map_err(|error| {
+                        anyhow::anyhow!(
+                            "native function `{name}` has incompatible assignment: {error}"
+                        )
+                    })?;
+                }
+                Stmt::StructDef { .. } => {}
+                _ => Self::validate_assignments(std::slice::from_ref(stmt), &mut module_variables)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_assignments(stmts: &[Stmt], variables: &mut HashMap<String, Type>) -> Result<()> {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Let { name, ty, value } => {
+                    let inferred = Self::value_type(value, variables);
+                    let declared = if matches!(ty, Type::Unknown) {
+                        inferred
+                    } else {
+                        ty.clone()
+                    };
+                    variables.insert(name.clone(), declared);
+                }
+                Stmt::Assign { name, value } => {
+                    let actual = Self::value_type(value, variables);
+                    if let Some(expected) = variables.get(name) {
+                        if !Self::types_compatible(expected, &actual) {
+                            return Err(anyhow::anyhow!(
+                                "`{name}` changes from {expected} to {actual}; use --python-fallback"
+                            ));
+                        }
+                    } else if !matches!(actual, Type::Unknown) {
+                        variables.insert(name.clone(), actual);
+                    }
+                }
+                Stmt::If { body, orelse, .. } => {
+                    let mut then_variables = variables.clone();
+                    let mut else_variables = variables.clone();
+                    Self::validate_assignments(body, &mut then_variables)?;
+                    Self::validate_assignments(orelse, &mut else_variables)?;
+                    Self::merge_branch_variables(variables, &then_variables, &else_variables)?;
+                }
+                Stmt::While { body, .. } | Stmt::For { body, .. } => {
+                    let mut loop_variables = variables.clone();
+                    Self::validate_assignments(body, &mut loop_variables)?;
+                    Self::merge_variables(variables, &loop_variables)?;
+                }
+                Stmt::Try {
+                    body,
+                    handlers,
+                    orelse,
+                    finalbody,
+                } => {
+                    let mut try_variables = variables.clone();
+                    Self::validate_assignments(body, &mut try_variables)?;
+                    Self::validate_assignments(orelse, &mut try_variables)?;
+                    Self::validate_assignments(finalbody, &mut try_variables)?;
+                    for handler in handlers {
+                        let mut handler_variables = variables.clone();
+                        Self::validate_assignments(&handler.body, &mut handler_variables)?;
+                        let current_try_variables = try_variables.clone();
+                        Self::merge_branch_variables(
+                            &mut try_variables,
+                            &current_try_variables,
+                            &handler_variables,
+                        )?;
+                    }
+                    Self::merge_variables(variables, &try_variables)?;
+                }
+                Stmt::With { body, .. } => {
+                    let mut with_variables = variables.clone();
+                    Self::validate_assignments(body, &mut with_variables)?;
+                    Self::merge_variables(variables, &with_variables)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_branch_variables(
+        variables: &mut HashMap<String, Type>,
+        then_variables: &HashMap<String, Type>,
+        else_variables: &HashMap<String, Type>,
+    ) -> Result<()> {
+        let names = then_variables
+            .keys()
+            .chain(else_variables.keys())
+            .cloned()
+            .collect::<HashSet<_>>();
+        for name in names {
+            match (then_variables.get(&name), else_variables.get(&name)) {
+                (Some(then_type), Some(else_type)) => {
+                    if !Self::types_compatible(then_type, else_type) {
+                        return Err(anyhow::anyhow!(
+                            "branch `{name}` changes from {then_type} to {else_type}; use --python-fallback"
+                        ));
+                    }
+                    variables.insert(name, then_type.clone());
+                }
+                (Some(ty), None) | (None, Some(ty)) => {
+                    variables.insert(name, ty.clone());
+                }
+                (None, None) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_variables(
+        variables: &mut HashMap<String, Type>,
+        updated: &HashMap<String, Type>,
+    ) -> Result<()> {
+        for (name, ty) in updated {
+            if let Some(existing) = variables.get(name) {
+                if !Self::types_compatible(existing, ty) {
+                    return Err(anyhow::anyhow!(
+                        "`{name}` changes from {existing} to {ty}; use --python-fallback"
+                    ));
+                }
+            } else {
+                variables.insert(name.clone(), ty.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn value_type(value: &Value, variables: &HashMap<String, Type>) -> Type {
+        match value {
+            Value::Int(_) | Value::Int128(_) => Type::Int,
+            Value::Float(_) => Type::Float,
+            Value::String(_) | Value::FormatString { .. } => Type::String,
+            Value::Bool(_) => Type::Bool,
+            Value::Name(name) => variables.get(name).cloned().unwrap_or(Type::Unknown),
+            Value::Field { ty, .. } | Value::Unary { ty, .. } | Value::Binary { ty, .. } => {
+                ty.clone()
+            }
+            Value::Call { return_type, .. } => return_type.clone(),
+            Value::List { element_type, .. } | Value::ListComp { element_type, .. } => {
+                Type::Array(Box::new(element_type.clone()))
+            }
+            Value::Tuple { element_types, .. } => Type::Tuple(element_types.clone()),
+            Value::Dict {
+                key_type,
+                value_type,
+                ..
+            } => Type::Dict {
+                key: Box::new(key_type.clone()),
+                value: Box::new(value_type.clone()),
+            },
+            Value::Index { element_type, .. } => element_type.clone(),
+            Value::Slice { container_type, .. } => container_type.clone(),
+        }
+    }
+
+    fn types_compatible(expected: &Type, actual: &Type) -> bool {
+        expected == actual || matches!(expected, Type::Unknown) || matches!(actual, Type::Unknown)
     }
 }
 
@@ -1018,6 +1560,7 @@ mod tests {
                     args: vec![Value::Int(10)],
                     return_type: Type::Array(Box::new(Type::Int)),
                 },
+                iter_type: Type::Array(Box::new(Type::Int)),
                 body: vec![Stmt::Print(vec![Value::Name("i".to_string())])],
             }],
         };

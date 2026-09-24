@@ -70,7 +70,12 @@ class PythonAstExporter(ast.NodeVisitor):
     def visit_AnnAssign(self, node):
         target = self.visit(node.target)
         value = self.visit(node.value) if node.value is not None else None
-        return {"type": "assign", "target": target, "value": value}
+        return {
+            "type": "ann_assign",
+            "target": target,
+            "annotation": convert_annotation(node.annotation),
+            "value": value,
+        }
 
     def visit_AugAssign(self, node):
         operators = {ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul", ast.Div: "div", ast.Mod: "mod"}
@@ -86,18 +91,51 @@ class PythonAstExporter(ast.NodeVisitor):
             "value": {"type": "binary", "left": self.visit(node.target), "operator": operators[op_type], "right": self.visit(node.value)},
         }
 
+    def visit_Assert(self, node):
+        return {
+            "type": "assert",
+            "test": self.visit(node.test),
+            "msg": self.visit(node.msg) if node.msg is not None else None,
+        }
+
+    def visit_Delete(self, node):
+        return {"type": "delete", "targets": [self.visit(target) for target in node.targets]}
+
+    def visit_Global(self, node):
+        return {"type": "global", "names": list(node.names)}
+
+    def visit_Nonlocal(self, node):
+        return {"type": "nonlocal", "names": list(node.names)}
+
     def visit_Expr(self, node):
         return {"type": "expr", "value": self.visit(node.value)}
 
+    def visit_ClassDef(self, node):
+        return {
+            "type": "classdef",
+            "name": node.name,
+            "bases": [convert_annotation(base) for base in node.bases],
+            "body": [self.visit(statement) for statement in node.body],
+        }
+
     def visit_Name(self, node):
         return {"type": "name", "id": node.id}
+
+    def visit_Attribute(self, node):
+        return {
+            "type": "attribute",
+            "value": self.visit(node.value),
+            "attr": node.attr,
+        }
 
     def visit_Constant(self, node):
         value = node.value
         if isinstance(value, bool):
             return {"type": "bool", "value": value}
         if isinstance(value, int):
-            return {"type": "int", "value": value}
+            if -(2**63) <= value <= 2**63 - 1:
+                return {"type": "int", "value": value}
+            return {"type": "big_int", "value": str(value)}
         if isinstance(value, float):
             return {"type": "float", "value": value}
         if isinstance(value, str):
@@ -235,8 +273,62 @@ class PythonAstExporter(ast.NodeVisitor):
             "operand": self.visit(node.operand),
         }
 
+    def visit_BoolOp(self, node):
+        operator = "and" if isinstance(node.op, ast.And) else "or"
+        return {
+            "type": "bool_op",
+            "operator": operator,
+            "values": [self.visit(value) for value in node.values],
+        }
+
+    def visit_IfExp(self, node):
+        return {
+            "type": "if_exp",
+            "test": self.visit(node.test),
+            "body": self.visit(node.body),
+            "orelse": self.visit(node.orelse),
+        }
+
+    def visit_Lambda(self, node):
+        return {
+            "type": "lambda",
+            "args": [arg.arg for arg in node.args.args],
+            "body": self.visit(node.body),
+        }
+
     def visit_List(self, node):
         return {"type": "list", "elements": [self.visit(x) for x in node.elts]}
+
+    def visit_ListComp(self, node):
+        if len(node.generators) != 1 or node.generators[0].is_async:
+            raise ValueError(
+                "only one synchronous list-comprehension generator is supported"
+                f"{self.location(node)}"
+            )
+        generator = node.generators[0]
+        if not isinstance(generator.target, ast.Name):
+            raise ValueError(
+                "list-comprehension targets must be simple names"
+                f"{self.location(generator.target)}"
+            )
+        if len(generator.ifs) > 1:
+            raise ValueError(
+                "list comprehensions support at most one filter"
+                f"{self.location(node)}"
+            )
+        return {
+            "type": "list_comp",
+            "elt": self.visit(node.elt),
+            "target": generator.target.id,
+            "iter": self.visit(generator.iter),
+            "condition": self.visit(generator.ifs[0]) if generator.ifs else None,
+        }
+
+    def visit_Set(self, node):
+        return {"type": "set", "elements": [self.visit(x) for x in node.elts]}
+
+    def visit_Starred(self, node):
+        return {"type": "starred", "value": self.visit(node.value)}
 
     def visit_Tuple(self, node):
         return {"type": "tuple", "elements": [self.visit(x) for x in node.elts]}
@@ -262,22 +354,56 @@ class PythonAstExporter(ast.NodeVisitor):
             if isinstance(part, ast.Constant) and isinstance(part.value, str):
                 parts.append({"type": "literal", "value": part.value})
             elif isinstance(part, ast.FormattedValue):
-                if part.conversion != -1 or part.format_spec is not None:
+                if part.conversion not in (-1, 115, 114, 97):
                     raise ValueError(
-                        "f-string conversions and format specifications are not supported"
+                        f"unsupported f-string conversion: {part.conversion}"
                         f"{self.location(part)}"
                     )
-                parts.append({"type": "value", "value": self.visit(part.value)})
+                format_spec = None
+                if part.format_spec is not None:
+                    if not all(
+                        isinstance(spec_part, ast.Constant)
+                        and isinstance(spec_part.value, str)
+                        for spec_part in part.format_spec.values
+                    ):
+                        raise ValueError(
+                            "dynamic f-string format specifications are not supported"
+                            f"{self.location(part)}"
+                        )
+                    format_spec = "".join(
+                        spec_part.value for spec_part in part.format_spec.values
+                    )
+                parts.append(
+                    {
+                        "type": "value",
+                        "value": self.visit(part.value),
+                        "format_spec": format_spec,
+                        "conversion": (
+                            chr(part.conversion) if part.conversion != -1 else None
+                        ),
+                    }
+                )
             else:
                 raise ValueError(
                     f"unsupported f-string part: {type(part).__name__}{self.location(part)}"
                 )
         return {"type": "format_string", "parts": parts}
 
-    def generic_visit(self, node):
-        raise ValueError(
-            f"unsupported AST node: {type(node).__name__}{self.location(node)}"
-        )
+    def visit_AsyncFunctionDef(self, node):
+        return {
+            "type": "AsyncFunctionDef",
+            "name": node.name,
+            "args": self.visit(node.args),
+            "body": [self.visit(stmt) for stmt in node.body],
+            "decorator_list": [self.visit(dec) for dec in node.decorator_list]
+        }
+
+    def visit_Await(self, node):
+        return {
+            "type": "Await",
+            "value": self.visit(node.value)
+        }
+
 
 
 def export_python_ast(source):

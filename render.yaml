@@ -13,4 +13,4 @@ services:
       - key: TARVOS_FRONTEND_URL
         sync: false
       - key: TARVOS_SANDBOX_IMAGE
-        value: "tarvos/sandbox:1.0.0"
+        value: "tarvos/sandbox:1.1.0-rc.1"

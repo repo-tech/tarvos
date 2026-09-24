@@ -1,12 +1,21 @@
+use crate::{module_supported, native_constant, native_function};
 use anyhow::{bail, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tarvos_ir::{BinaryOp, Module, Stmt, TypeContext, Value};
 use tarvos_types::Type;
 
 pub struct Lowerer {
     type_context: TypeContext,
     function_signatures: HashMap<String, (Vec<String>, Vec<Type>, Type)>,
+    class_names: HashSet<String>,
+    class_methods: HashMap<(String, String), String>,
+    class_fields: HashMap<String, Vec<(String, Type)>>,
+    object_classes: HashMap<String, String>,
+    module_aliases: HashMap<String, String>,
+    imported_functions: HashMap<String, String>,
+    imported_constants: HashMap<String, Value>,
     loop_depth: usize,
+    current_class: Option<String>,
 }
 
 impl Lowerer {
@@ -14,12 +23,36 @@ impl Lowerer {
         Self {
             type_context: TypeContext::new(),
             function_signatures: HashMap::new(),
+            class_names: HashSet::new(),
+            class_methods: HashMap::new(),
+            class_fields: HashMap::new(),
+            object_classes: HashMap::new(),
+            module_aliases: HashMap::new(),
+            imported_functions: HashMap::new(),
+            imported_constants: HashMap::new(),
             loop_depth: 0,
+            current_class: None,
         }
     }
 
     pub fn lower_module(&mut self, module: &tarvos_ast::Module) -> Result<Module> {
         let mut statements = Vec::new();
+
+        for stmt in &module.body {
+            if let tarvos_ast::Stmt::ClassDef { name, body, .. } = stmt {
+                self.class_names.insert(name.clone());
+                for member in body {
+                    if let tarvos_ast::Stmt::FunctionDef { name: method, .. } = member {
+                        self.class_methods.insert(
+                            (name.clone(), method.clone()),
+                            format!("{}_{}", rust_identifier(name), rust_identifier(method)),
+                        );
+                    }
+                }
+                self.class_fields
+                    .insert(name.clone(), collect_class_fields(body));
+            }
+        }
 
         for stmt in &module.body {
             if let tarvos_ast::Stmt::FunctionDef {
@@ -51,11 +84,8 @@ impl Lowerer {
         }
 
         for stmt in &module.body {
-            if matches!(
-                stmt,
-                tarvos_ast::Stmt::Import { names }
-                    if names.iter().all(|name| name.name == "numpy" || name.name == "pandas")
-            ) {
+            if let tarvos_ast::Stmt::ClassDef { name, body, .. } = stmt {
+                statements.extend(self.lower_class(name, body)?);
                 continue;
             }
             statements.push(self.lower_stmt(stmt)?);
@@ -65,51 +95,65 @@ impl Lowerer {
     }
 
     fn lower_stmt(&mut self, stmt: &tarvos_ast::Stmt) -> Result<Stmt> {
-        // Known safe stdlib modules we can silently ignore at the IR level
-        // (their calls are handled individually in lower_expr / infer_call_return_type)
-        const STDLIB_MODULES: &[&str] = &[
-            "math", "os", "sys", "time", "random", "re", "json", "csv", "io",
-            "pathlib", "typing", "collections", "functools", "itertools",
-            "datetime", "hashlib", "copy", "abc", "enum", "dataclasses",
-            "contextlib", "string", "struct", "decimal", "fractions",
-            "heapq", "bisect", "array", "queue", "threading", "subprocess",
-            "platform", "shutil", "tempfile", "textwrap", "unittest",
-            "__future__",
-        ];
-
         match stmt {
             tarvos_ast::Stmt::Import { names } => {
-                // Allow stdlib imports silently; only warn about unknown ones
                 for name in names {
-                    let base = name.name.split('.').next().unwrap_or(&name.name);
-                    if !STDLIB_MODULES.contains(&base) {
-                        // Register as an unknown module name so references don't crash lowering
-                        if let Some(alias) = &name.asname {
-                            self.type_context.declare(alias.clone(), tarvos_types::Type::Unknown);
-                        } else {
-                            self.type_context.declare(name.name.clone(), tarvos_types::Type::Unknown);
-                        }
+                    if !module_supported(&name.name) {
+                        bail!(
+                            "import '{}' is not supported by the native backend yet; \
+                             supported native modules: math, time, os.path",
+                            name.name
+                        );
+                    }
+                    let binding = name
+                        .asname
+                        .as_deref()
+                        .unwrap_or_else(|| name.name.split('.').next().unwrap_or(&name.name));
+                    self.module_aliases
+                        .insert(binding.to_string(), name.name.clone());
+                    if name.asname.is_none() && name.name.contains('.') {
+                        self.module_aliases
+                            .insert(name.name.clone(), name.name.clone());
                     }
                 }
-                // Emit as a no-op (the actual stdlib is mapped in codegen)
                 Ok(Stmt::Expr(Value::Bool(true)))
             }
             tarvos_ast::Stmt::ImportFrom { module, names } => {
-                let base = module.split('.').next().unwrap_or(module);
-                if STDLIB_MODULES.contains(&base) {
-                    // Register imported names in scope with Unknown type
-                    for name in names {
-                        let alias = name.asname.as_ref().unwrap_or(&name.name);
-                        self.type_context.declare(alias.clone(), tarvos_types::Type::Unknown);
-                    }
-                    return Ok(Stmt::Expr(Value::Bool(true)));
+                if !module_supported(module) {
+                    bail!(
+                        "from '{}' import ... is not supported by the native backend yet; \
+                         supported native modules: math, time, os.path",
+                        module
+                    );
                 }
-                bail!("from {} import ... is not yet supported for non-stdlib modules", module)
+                for name in names {
+                    let alias = name.asname.as_ref().unwrap_or(&name.name);
+                    if let Some(function) = native_function(module, &name.name) {
+                        self.imported_functions
+                            .insert(alias.clone(), function.rust_name.to_string());
+                        self.type_context
+                            .declare(alias.clone(), function.return_type);
+                    } else if let Some(value) = native_constant(module, &name.name) {
+                        self.imported_constants
+                            .insert(alias.clone(), Value::Float(value));
+                        self.type_context.declare(alias.clone(), Type::Float);
+                    } else {
+                        bail!(
+                            "from '{}' import '{}' is not supported by the native backend yet",
+                            module,
+                            name.name
+                        );
+                    }
+                }
+                Ok(Stmt::Expr(Value::Bool(true)))
             }
             tarvos_ast::Stmt::Assign { target, value } => match target {
                 tarvos_ast::Expr::Name { id } => {
                     let value_ir = self.lower_expr(value)?;
                     let ty = self.value_type(&value_ir)?;
+                    if let Some(class_name) = self.constructor_class(&value_ir) {
+                        self.object_classes.insert(id.clone(), class_name);
+                    }
 
                     if self.type_context.lookup(id).is_some() {
                         Ok(Stmt::Assign {
@@ -141,20 +185,22 @@ impl Lowerer {
                     })
                 }
                 tarvos_ast::Expr::Attribute { value: obj, attr } => {
-                    // obj.attr = value — lower as an expression statement (side-effect only)
                     let obj_ir = self.lower_expr(obj)?;
                     let val_ir = self.lower_expr(value)?;
-                    // Encode as a method call set stub — codegen will handle it
-                    Ok(Stmt::Expr(Value::Call {
-                        function: format!("__set_attr_{}", attr),
-                        args: vec![obj_ir, val_ir],
-                        return_type: tarvos_types::Type::None,
-                    }))
+                    Ok(Stmt::FieldAssign {
+                        object: obj_ir,
+                        field: attr.clone(),
+                        value: val_ir,
+                    })
                 }
                 _ => bail!("assignment target must be a variable name or subscript"),
             },
 
-            tarvos_ast::Stmt::AugAssign { target, operator, value } => {
+            tarvos_ast::Stmt::AugAssign {
+                target,
+                operator,
+                value,
+            } => {
                 let tarvos_ast::Expr::Name { id } = target else {
                     bail!("augmented assignment target must be a variable name");
                 };
@@ -172,15 +218,25 @@ impl Lowerer {
                 })
             }
 
-            tarvos_ast::Stmt::AnnAssign { target, annotation, value } => {
+            tarvos_ast::Stmt::AnnAssign {
+                target,
+                annotation,
+                value,
+            } => {
                 let tarvos_ast::Expr::Name { id } = target else {
                     bail!("annotated assignment target must be a variable name");
                 };
-                let ty = self.parse_type_annotation(annotation).unwrap_or(tarvos_types::Type::Unknown);
+                let ty = self
+                    .parse_type_annotation(annotation)
+                    .unwrap_or(tarvos_types::Type::Unknown);
                 if let Some(val) = value {
                     let value_ir = self.lower_expr(val)?;
                     self.type_context.declare(id.clone(), ty.clone());
-                    Ok(Stmt::Let { name: id.clone(), ty, value: value_ir })
+                    Ok(Stmt::Let {
+                        name: id.clone(),
+                        ty,
+                        value: value_ir,
+                    })
                 } else {
                     // Just a declaration hint — register the type, emit nothing meaningful
                     self.type_context.declare(id.clone(), ty.clone());
@@ -200,7 +256,8 @@ impl Lowerer {
 
             tarvos_ast::Stmt::Assert { test, msg } => {
                 let test_ir = self.lower_expr(test)?;
-                let msg_ir = msg.as_ref()
+                let msg_ir = msg
+                    .as_ref()
                     .map(|m| self.lower_expr(m))
                     .transpose()?
                     .unwrap_or(Value::String("assertion failed".to_string()));
@@ -216,98 +273,82 @@ impl Lowerer {
                 })
             }
 
-            tarvos_ast::Stmt::ClassDef { name, bases: _, body } => {
-                // Lower class as a struct-like scope: collect methods as top-level functions
-                // prefixed with ClassName__method for now
-                let mut stmts = Vec::new();
-                for stmt in body {
-                    match stmt {
-                        tarvos_ast::Stmt::FunctionDef { name: method_name, args, arg_annotations, body: method_body, returns } => {
-                            // Strip 'self' from args
-                            let real_args: Vec<String> = args.iter().skip(1).cloned().collect();
-                            let real_annotations: Vec<Option<String>> = arg_annotations.iter().skip(1).cloned().collect();
-                            let qualified_name = format!("{}__{}", name, method_name);
-                            let synthetic = tarvos_ast::Stmt::FunctionDef {
-                                name: qualified_name,
-                                args: real_args,
-                                arg_annotations: real_annotations,
-                                body: method_body.clone(),
-                                returns: returns.clone(),
-                            };
-                            stmts.push(self.lower_stmt(&synthetic)?);
-                        }
-                        _ => {
-                            // Class-level assignments (e.g., class variables) — try to lower, skip on error
-                            if let Ok(s) = self.lower_stmt(stmt) {
-                                stmts.push(s);
-                            }
-                        }
-                    }
-                }
-                // Wrap in a fake function so codegen can emit it at top level
-                Ok(Stmt::Function {
-                    name: format!("__class_{}", name),
-                    params: vec![],
-                    return_type: tarvos_types::Type::None,
-                    body: stmts,
-                })
+            tarvos_ast::Stmt::ClassDef { .. } => {
+                bail!("class definitions are lowered at module scope")
             }
 
-            tarvos_ast::Stmt::Expr { value } => match value {
-                tarvos_ast::Expr::Call {
-                    function,
-                    args,
-                    keywords,
-                } => {
-                    if let tarvos_ast::Expr::Name { id } = function.as_ref() {
-                        if id == "print" {
-                            if !keywords.is_empty() {
-                                // Allow sep/end kwargs but ignore them
+            tarvos_ast::Stmt::Expr { value } => {
+                match value {
+                    tarvos_ast::Expr::Call {
+                        function,
+                        args,
+                        keywords,
+                    } => {
+                        if let tarvos_ast::Expr::Name { id } = function.as_ref() {
+                            if id == "print" {
+                                if !keywords.is_empty() {
+                                    // Allow sep/end kwargs but ignore them
+                                    let values_ir: Result<Vec<_>> =
+                                        args.iter().map(|a| self.lower_expr(a)).collect();
+                                    return Ok(Stmt::Print(values_ir?));
+                                }
                                 let values_ir: Result<Vec<_>> =
                                     args.iter().map(|a| self.lower_expr(a)).collect();
                                 return Ok(Stmt::Print(values_ir?));
                             }
-                            let values_ir: Result<Vec<_>> =
-                                args.iter().map(|a| self.lower_expr(a)).collect();
-                            return Ok(Stmt::Print(values_ir?));
                         }
-                    }
 
-                    let function_name = match function.as_ref() {
-                        tarvos_ast::Expr::Name { id } => id.clone(),
-                        tarvos_ast::Expr::Attribute { value: obj, attr } => {
-                            // obj.method(...) call as statement
-                            if let tarvos_ast::Expr::Name { id } = obj.as_ref() {
-                                return self.lower_method_call_stmt(id, attr, args);
+                        let function_name = match function.as_ref() {
+                            tarvos_ast::Expr::Name { id } => id.clone(),
+                            tarvos_ast::Expr::Attribute { value: obj, attr } => {
+                                // obj.method(...) call as statement
+                                if let tarvos_ast::Expr::Name { id } = obj.as_ref() {
+                                    return self.lower_method_call_stmt(id, attr, args);
+                                }
+                                bail!("method call on complex expression not yet supported as statement");
                             }
-                            bail!("method call on complex expression not yet supported as statement");
-                        }
-                        _ => bail!("only direct function calls are supported"),
-                    };
-                    let args_ir = self.lower_call_args(&function_name, args, keywords)?;
-                    let return_type = self.infer_call_return_type(&function_name, &args_ir)?;
-                    Ok(Stmt::Expr(Value::Call {
-                        function: function_name,
-                        args: args_ir,
-                        return_type,
-                    }))
-                }
-                tarvos_ast::Expr::MethodCall {
-                    object,
-                    method,
-                    args,
-                } => {
-                    if let tarvos_ast::Expr::Name { id } = object.as_ref() {
-                        return self.lower_method_call_stmt(id, method, args);
+                            _ => bail!("only direct function calls are supported"),
+                        };
+                        let args_ir = self.lower_call_args(&function_name, args, keywords)?;
+                        let return_type = self.infer_call_return_type(&function_name, &args_ir)?;
+                        Ok(Stmt::Expr(Value::Call {
+                            function: function_name,
+                            args: args_ir,
+                            return_type,
+                        }))
                     }
-                    bail!("method call on complex expression not yet supported as statement");
-                }
+                    tarvos_ast::Expr::MethodCall {
+                        object,
+                        method,
+                        args,
+                    } => {
+                        if let Some(module_name) = module_reference(object) {
+                            if let Some(module) = self.module_aliases.get(&module_name) {
+                                if let Some(function) = native_function(module, method) {
+                                    let args_ir = args
+                                        .iter()
+                                        .map(|arg| self.lower_expr(arg))
+                                        .collect::<Result<Vec<_>>>()?;
+                                    return Ok(Stmt::Expr(Value::Call {
+                                        function: function.rust_name.to_string(),
+                                        args: args_ir,
+                                        return_type: function.return_type,
+                                    }));
+                                }
+                            }
+                        }
+                        if let tarvos_ast::Expr::Name { id } = object.as_ref() {
+                            return self.lower_method_call_stmt(id, method, args);
+                        }
+                        bail!("method call on complex expression not yet supported as statement");
+                    }
 
-                _ => {
-                    let val = self.lower_expr(value)?;
-                    Ok(Stmt::Expr(val))
+                    _ => {
+                        let val = self.lower_expr(value)?;
+                        Ok(Stmt::Expr(val))
+                    }
                 }
-            },
+            }
 
             tarvos_ast::Stmt::If { test, body, orelse } => {
                 let test_ir = self.lower_expr(test)?;
@@ -339,19 +380,29 @@ impl Lowerer {
                 };
 
                 let iter_ir = self.lower_expr(iter)?;
+                let iter_type = self.value_type(&iter_ir)?;
 
-                let element_type = match &iter_ir {
-                    Value::Call {
-                        function,
-                        return_type: tarvos_types::Type::Array(elem_type),
-                        ..
-                    } if function == "range" => (**elem_type).clone(),
-                    Value::List { element_type, .. } => element_type.clone(),
-                    Value::Name(name) => match self.type_context.lookup(name).cloned() {
-                        Some(tarvos_types::Type::Array(inner)) => *inner,
+                let element_type = match &iter_type {
+                    tarvos_types::Type::Array(elem_type) => (**elem_type).clone(),
+                    tarvos_types::Type::Dict { key, .. } => (**key).clone(),
+                    tarvos_types::Type::String => tarvos_types::Type::String,
+                    tarvos_types::Type::Tuple(types) => types
+                        .first()
+                        .cloned()
+                        .unwrap_or(tarvos_types::Type::Unknown),
+                    _ => match &iter_ir {
+                        Value::Call {
+                            function,
+                            return_type: tarvos_types::Type::Array(elem_type),
+                            ..
+                        } if function == "range" => (**elem_type).clone(),
+                        Value::List { element_type, .. } => element_type.clone(),
+                        Value::Name(name) => match self.type_context.lookup(name).cloned() {
+                            Some(tarvos_types::Type::Array(inner)) => *inner,
+                            _ => tarvos_types::Type::Unknown,
+                        },
                         _ => tarvos_types::Type::Unknown,
                     },
-                    _ => tarvos_types::Type::Unknown,
                 };
                 self.type_context.declare(id.clone(), element_type.clone());
 
@@ -362,6 +413,7 @@ impl Lowerer {
                 Ok(Stmt::For {
                     target: id.clone(),
                     iter: iter_ir,
+                    iter_type,
                     body: body_ir?,
                 })
             }
@@ -398,7 +450,8 @@ impl Lowerer {
                 self.type_context = parent_context;
                 self.loop_depth = parent_loop_depth;
 
-                let param_types: Vec<tarvos_types::Type> = params.iter().map(|(_, ty)| ty.clone()).collect();
+                let param_types: Vec<tarvos_types::Type> =
+                    params.iter().map(|(_, ty)| ty.clone()).collect();
                 self.function_signatures.insert(
                     name.clone(),
                     (args.clone(), param_types.clone(), return_type.clone()),
@@ -454,7 +507,8 @@ impl Lowerer {
                     });
                     let saved_ctx = self.type_context.clone();
                     if let Some(ref var_name) = h.name {
-                        self.type_context.declare(var_name.clone(), tarvos_types::Type::String);
+                        self.type_context
+                            .declare(var_name.clone(), tarvos_types::Type::String);
                     }
                     let handler_body = h
                         .body
@@ -493,7 +547,8 @@ impl Lowerer {
                         _ => None,
                     });
                     if let Some(ref name) = target_name {
-                        self.type_context.declare(name.clone(), tarvos_types::Type::String);
+                        self.type_context
+                            .declare(name.clone(), tarvos_types::Type::String);
                     }
                     items_ir.push(tarvos_ir::WithItem {
                         context_expr: ctx_val,
@@ -514,16 +569,50 @@ impl Lowerer {
     }
 
     /// Lower a method call as a statement (handles common list/dict/string methods)
-    fn lower_method_call_stmt(&mut self, obj_name: &str, method: &str, args: &[tarvos_ast::Expr]) -> Result<Stmt> {
+    fn lower_method_call_stmt(
+        &mut self,
+        obj_name: &str,
+        method: &str,
+        args: &[tarvos_ast::Expr],
+    ) -> Result<Stmt> {
+        if let Some(class_name) = self.object_classes.get(obj_name) {
+            if let Some(function_name) = self
+                .class_methods
+                .get(&(class_name.clone(), method.to_string()))
+                .cloned()
+            {
+                let args_ir = args
+                    .iter()
+                    .map(|arg| self.lower_expr(arg))
+                    .collect::<Result<Vec<_>>>()?;
+                let return_type = self.infer_call_return_type(&function_name, &args_ir)?;
+                return Ok(Stmt::Expr(Value::Call {
+                    function: format!("__tarvos_mut_call_{}", function_name),
+                    args: {
+                        let mut receiver = vec![Value::Name(obj_name.to_string())];
+                        receiver.extend(args_ir);
+                        receiver
+                    },
+                    return_type,
+                }));
+            }
+        }
         match method {
             "append" => {
                 if args.len() != 1 {
                     bail!("list.append() takes exactly 1 argument");
                 }
                 let value_ir = self.lower_expr(&args[0])?;
-                let obj_type = self.type_context.lookup(obj_name).cloned().unwrap_or(tarvos_types::Type::Unknown);
+                let obj_type = self
+                    .type_context
+                    .lookup(obj_name)
+                    .cloned()
+                    .unwrap_or(tarvos_types::Type::Unknown);
                 if let tarvos_types::Type::Array(_) = obj_type {
-                    return Ok(Stmt::ListAppend { target: obj_name.to_string(), value: value_ir });
+                    return Ok(Stmt::ListAppend {
+                        target: obj_name.to_string(),
+                        value: value_ir,
+                    });
                 }
                 // Fallback: generic append call
                 Ok(Stmt::Expr(Value::Call {
@@ -563,14 +652,118 @@ impl Lowerer {
         }
     }
 
+    fn lower_class(&mut self, class_name: &str, body: &[tarvos_ast::Stmt]) -> Result<Vec<Stmt>> {
+        let mut lowered = Vec::new();
+        let previous_class = self.current_class.replace(class_name.to_string());
+        for stmt in body {
+            let tarvos_ast::Stmt::FunctionDef {
+                name: method_name,
+                args,
+                arg_annotations,
+                body: method_body,
+                returns,
+            } = stmt
+            else {
+                continue;
+            };
+
+            if method_name == "__init__" {
+                let synthetic = tarvos_ast::Stmt::FunctionDef {
+                    name: format!("__tarvos_ctor_{}", rust_identifier(class_name)),
+                    args: args.iter().skip(1).cloned().collect(),
+                    arg_annotations: arg_annotations.iter().skip(1).cloned().collect(),
+                    body: method_body.clone(),
+                    returns: Some(class_name.to_string()),
+                };
+                lowered.push(self.lower_stmt(&synthetic)?);
+                continue;
+            }
+
+            let synthetic = tarvos_ast::Stmt::FunctionDef {
+                name: format!(
+                    "{}_{}",
+                    rust_identifier(class_name),
+                    rust_identifier(method_name)
+                ),
+                args: args.clone(),
+                arg_annotations: {
+                    let mut annotations = arg_annotations.clone();
+                    if annotations.is_empty() {
+                        annotations.push(Some(class_name.to_string()));
+                    } else {
+                        annotations[0] = Some(class_name.to_string());
+                    }
+                    annotations
+                },
+                body: method_body.clone(),
+                returns: returns.clone(),
+            };
+            lowered.push(self.lower_stmt(&synthetic)?);
+        }
+        lowered.insert(
+            0,
+            Stmt::StructDef {
+                name: class_name.to_string(),
+                fields: self
+                    .class_fields
+                    .get(class_name)
+                    .cloned()
+                    .unwrap_or_default(),
+            },
+        );
+        self.current_class = previous_class;
+        Ok(lowered)
+    }
+
+    fn constructor_class(&self, value: &Value) -> Option<String> {
+        let Value::Call {
+            function,
+            return_type,
+            ..
+        } = value
+        else {
+            return None;
+        };
+        if let Type::Object(class_name) = return_type {
+            return Some(class_name.clone());
+        }
+        function
+            .strip_prefix("__tarvos_ctor_")
+            .map(ToOwned::to_owned)
+    }
+
+    fn object_class_for_value(&self, value: &Value) -> Option<String> {
+        match value {
+            Value::Name(name) if name == "self" => self.current_class.clone(),
+            Value::Name(name) => self.object_classes.get(name).cloned(),
+            Value::Call {
+                return_type: Type::Object(name),
+                ..
+            } => Some(name.clone()),
+            _ => None,
+        }
+    }
 
     fn lower_expr(&mut self, expr: &tarvos_ast::Expr) -> Result<Value> {
         match expr {
             tarvos_ast::Expr::Int { value } => Ok(Value::Int(*value)),
+            tarvos_ast::Expr::BigInt { value } => {
+                let value = value.parse::<u128>().map_err(|_| {
+                    anyhow::anyhow!(
+                        "integer literal `{value}` exceeds Tarvos native integer support; \
+                         use --python-fallback for arbitrary-precision Python integers"
+                    )
+                })?;
+                Ok(Value::Int128(value))
+            }
             tarvos_ast::Expr::Float { value } => Ok(Value::Float(*value)),
             tarvos_ast::Expr::String { value } => Ok(Value::String(value.clone())),
             tarvos_ast::Expr::Bool { value } => Ok(Value::Bool(*value)),
-            tarvos_ast::Expr::Name { id } => Ok(Value::Name(id.clone())),
+            tarvos_ast::Expr::Name { id } => Ok(self
+                .imported_constants
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| Value::Name(id.clone()))),
             tarvos_ast::Expr::Binary {
                 left,
                 operator,
@@ -619,17 +812,38 @@ impl Lowerer {
                 keywords,
             } => {
                 if let tarvos_ast::Expr::Name { id } = function.as_ref() {
+                    if self.class_names.contains(id) {
+                        let args_ir = self.lower_call_args(id, args, keywords)?;
+                        return Ok(Value::Call {
+                            function: format!("__tarvos_ctor_{}", rust_identifier(id)),
+                            args: args_ir,
+                            return_type: Type::Object(id.clone()),
+                        });
+                    }
                     if id == "__import__"
                         && args.len() == 1
                         && matches!(&args[0], tarvos_ast::Expr::String { value } if value == "time")
                     {
                         return Ok(Value::String("time".into()));
                     }
-                    let args_ir = self.lower_call_args(id, args, keywords)?;
-                    let return_type = self.infer_call_return_type(id, &args_ir)?;
+                    let function_name = self
+                        .imported_functions
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| id.clone());
+                    let args_ir = self.lower_call_args(&function_name, args, keywords)?;
+                    if function_name == "range"
+                        && args_ir.iter().any(|arg| matches!(arg, Value::Int128(_)))
+                    {
+                        bail!(
+                            "range() bounds above i64 are not executable as a native loop; \
+                             use --python-fallback or reduce the workload before compiling"
+                        );
+                    }
+                    let return_type = self.infer_call_return_type(&function_name, &args_ir)?;
 
                     Ok(Value::Call {
-                        function: id.clone(),
+                        function: function_name,
                         args: args_ir,
                         return_type,
                     })
@@ -641,18 +855,70 @@ impl Lowerer {
                 object,
                 method,
                 args,
-            } if matches!(object.as_ref(), tarvos_ast::Expr::Name { id } if id == "time_mod" || id == "time")
-                && method == "perf_counter"
-                && args.is_empty() =>
-            {
+            } => {
+                if let Some(module_name) = module_reference(object) {
+                    if let Some(module) = self.module_aliases.get(&module_name) {
+                        if let Some(function) = native_function(module, method) {
+                            let args_ir = args
+                                .iter()
+                                .map(|arg| self.lower_expr(arg))
+                                .collect::<Result<Vec<_>>>()?;
+                            return Ok(Value::Call {
+                                function: function.rust_name.to_string(),
+                                args: args_ir,
+                                return_type: function.return_type,
+                            });
+                        }
+                    }
+                }
+                if let tarvos_ast::Expr::Name { id } = object.as_ref() {
+                    if let Some(module) = self.module_aliases.get(id) {
+                        if let Some(function) = native_function(module, method) {
+                            let args_ir = args
+                                .iter()
+                                .map(|arg| self.lower_expr(arg))
+                                .collect::<Result<Vec<_>>>()?;
+                            return Ok(Value::Call {
+                                function: function.rust_name.to_string(),
+                                args: args_ir,
+                                return_type: function.return_type,
+                            });
+                        }
+                        bail!(
+                            "module '{}.{}' is not supported by the native backend yet",
+                            module,
+                            method
+                        );
+                    }
+                }
+                let object_name = match object.as_ref() {
+                    tarvos_ast::Expr::Name { id } => id,
+                    _ => bail!("method calls on complex expressions are not supported"),
+                };
+                let class_name =
+                    self.object_classes
+                        .get(object_name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("unknown object `{object_name}` for method `{method}`")
+                        })?;
+                let function_name = self
+                    .class_methods
+                    .get(&(class_name, method.clone()))
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("unknown method `{method}`"))?;
+                let mut args_ir = vec![Value::Name(object_name.clone())];
+                args_ir.extend(
+                    args.iter()
+                        .map(|arg| self.lower_expr(arg))
+                        .collect::<Result<Vec<_>>>()?,
+                );
+                let return_type = self.infer_call_return_type(&function_name, &args_ir)?;
                 Ok(Value::Call {
-                    function: "tarvos_perf_counter".into(),
-                    args: Vec::new(),
-                    return_type: Type::Float,
+                    function: format!("__tarvos_mut_call_{}", function_name),
+                    args: args_ir,
+                    return_type,
                 })
-            }
-            tarvos_ast::Expr::MethodCall { .. } => {
-                bail!("method calls are only supported as list.append(value) statements; dictionary methods (including clear()) are unsupported")
             }
             tarvos_ast::Expr::List { elements } => {
                 let elements_ir: Result<Vec<_>> =
@@ -691,9 +957,15 @@ impl Lowerer {
                         tarvos_ast::FormatPart::Literal { value } => {
                             Ok(tarvos_ir::FormatPart::Literal(value.clone()))
                         }
-                        tarvos_ast::FormatPart::Value { value } => Ok(
-                            tarvos_ir::FormatPart::Value(Box::new(self.lower_expr(value)?)),
-                        ),
+                        tarvos_ast::FormatPart::Value {
+                            value,
+                            format_spec,
+                            conversion,
+                        } => Ok(tarvos_ir::FormatPart::Value {
+                            value: Box::new(self.lower_expr(value)?),
+                            format_spec: format_spec.clone(),
+                            conversion: conversion.clone(),
+                        }),
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Value::FormatString { parts })
@@ -832,8 +1104,32 @@ impl Lowerer {
                 )
             }
             tarvos_ast::Expr::Attribute { value, attr } => {
+                if let tarvos_ast::Expr::Name { id } = value.as_ref() {
+                    if let Some(module) = self.module_aliases.get(id) {
+                        if let Some(constant) = native_constant(module, attr) {
+                            return Ok(Value::Float(constant));
+                        }
+                        bail!(
+                            "module '{}.{}' is not supported by the native backend yet",
+                            module,
+                            attr
+                        );
+                    }
+                }
                 let inner = self.lower_expr(value)?;
-                // Attribute access lowered to pseudo-call or name access
+                if let Some(class_name) = self.object_class_for_value(&inner) {
+                    let field_type = self
+                        .class_fields
+                        .get(&class_name)
+                        .and_then(|fields| fields.iter().find(|(name, _)| name == attr))
+                        .map(|(_, ty)| ty.clone())
+                        .unwrap_or(Type::Unknown);
+                    return Ok(Value::Field {
+                        object: Box::new(inner),
+                        field: attr.clone(),
+                        ty: field_type,
+                    });
+                }
                 match &inner {
                     Value::Name(id) => Ok(Value::Name(format!("{}_{}", id, attr))),
                     _ => Ok(Value::Call {
@@ -878,13 +1174,25 @@ impl Lowerer {
             tarvos_ast::Expr::Lambda { .. } => {
                 bail!("unsupported feature: lambda expressions are not yet supported in native compiler")
             }
-            tarvos_ast::Expr::ListComp { elt, target, iter, condition: _ } => {
-                let _iter_ir = self.lower_expr(iter)?;
+            tarvos_ast::Expr::ListComp {
+                elt,
+                target,
+                iter,
+                condition,
+            } => {
+                let iter_ir = self.lower_expr(iter)?;
                 self.type_context.declare(target.clone(), Type::Int);
                 let elt_ir = self.lower_expr(elt)?;
+                let condition_ir = condition
+                    .as_ref()
+                    .map(|condition| self.lower_expr(condition))
+                    .transpose()?;
                 let elt_type = self.value_type(&elt_ir)?;
-                Ok(Value::List {
-                    elements: vec![elt_ir],
+                Ok(Value::ListComp {
+                    target: target.clone(),
+                    iter: Box::new(iter_ir),
+                    element: Box::new(elt_ir),
+                    condition: condition_ir.map(Box::new),
                     element_type: elt_type,
                 })
             }
@@ -906,7 +1214,6 @@ impl Lowerer {
             tarvos_ast::Expr::Starred { value } => self.lower_expr(value),
         }
     }
-
 
     fn lower_call_args(
         &mut self,
@@ -986,10 +1293,12 @@ impl Lowerer {
                 .lookup(id)
                 .cloned()
                 .unwrap_or(Type::Unknown)),
+            Value::Field { ty, .. } => Ok(ty.clone()),
             Value::Unary { ty, .. } => Ok(ty.clone()),
             Value::Binary { ty, .. } => Ok(ty.clone()),
             Value::Call { return_type, .. } => Ok(return_type.clone()),
             Value::List { element_type, .. } => Ok(Type::Array(Box::new(element_type.clone()))),
+            Value::ListComp { element_type, .. } => Ok(Type::Array(Box::new(element_type.clone()))),
             Value::Tuple { element_types, .. } => Ok(Type::Tuple(element_types.clone())),
             Value::Dict {
                 key_type,
@@ -1069,10 +1378,22 @@ impl Lowerer {
                 value: Box::new(Type::Unknown),
             },
             "tarvos_perf_counter" => Type::Float,
+            "tarvos_time" | "tarvos_math_sqrt" | "tarvos_math_sin" | "tarvos_math_cos"
+            | "tarvos_math_tan" | "tarvos_math_asin" | "tarvos_math_acos" | "tarvos_math_atan"
+            | "tarvos_math_exp" | "tarvos_math_log" | "tarvos_math_log10" | "tarvos_math_fabs"
+            | "tarvos_math_pow" | "tarvos_math_hypot" | "tarvos_math_atan2" => Type::Float,
+            "tarvos_math_floor" | "tarvos_math_ceil" => Type::Int,
+            "tarvos_math_isfinite" | "tarvos_math_isnan" | "tarvos_math_isinf" => Type::Bool,
+            "tarvos_sleep" => Type::None,
+            "tarvos_os_path_join" | "tarvos_os_path_basename" | "tarvos_os_path_dirname" => {
+                Type::String
+            }
+            "tarvos_os_path_exists" | "tarvos_os_path_isfile" | "tarvos_os_path_isdir" => {
+                Type::Bool
+            }
             _ => Type::Unknown,
         })
     }
-
 
     fn infer_return_type_from_body(&mut self, body: &[tarvos_ast::Stmt]) -> Option<Type> {
         let mut inferred: Option<Type> = None;
@@ -1178,6 +1499,9 @@ impl Lowerer {
 
     fn parse_type_annotation(&self, annotation: &str) -> Option<Type> {
         let annotation = annotation.trim();
+        if self.class_names.contains(annotation) {
+            return Some(Type::Object(annotation.to_string()));
+        }
         match annotation {
             "int" | "Integer" => Some(Type::Int),
             "float" | "Float" => Some(Type::Float),
@@ -1186,6 +1510,153 @@ impl Lowerer {
             "None" | "none" => Some(Type::None),
             _ => None,
         }
+    }
+}
+
+fn module_reference(expr: &tarvos_ast::Expr) -> Option<String> {
+    match expr {
+        tarvos_ast::Expr::Name { id } => Some(id.clone()),
+        tarvos_ast::Expr::Attribute { value, attr } => {
+            Some(format!("{}.{}", module_reference(value)?, attr))
+        }
+        _ => None,
+    }
+}
+
+fn collect_class_fields(body: &[tarvos_ast::Stmt]) -> Vec<(String, Type)> {
+    let mut fields = Vec::new();
+    for statement in body {
+        let tarvos_ast::Stmt::FunctionDef {
+            name: method_name,
+            args,
+            arg_annotations,
+            body: method_body,
+            ..
+        } = statement
+        else {
+            continue;
+        };
+        if method_name != "__init__" {
+            continue;
+        }
+        let parameter_types = args
+            .iter()
+            .zip(arg_annotations.iter())
+            .filter_map(|(name, annotation)| {
+                annotation
+                    .as_deref()
+                    .map(|annotation| (name.clone(), annotation_type(annotation)))
+            })
+            .collect::<HashMap<_, _>>();
+        collect_fields_from_statements(method_body, &mut fields, &parameter_types);
+    }
+    fields
+}
+
+fn collect_fields_from_statements(
+    statements: &[tarvos_ast::Stmt],
+    fields: &mut Vec<(String, Type)>,
+    parameter_types: &HashMap<String, Type>,
+) {
+    for statement in statements {
+        match statement {
+            tarvos_ast::Stmt::Assign {
+                target: tarvos_ast::Expr::Attribute { value, attr },
+                value: assigned,
+            }
+            | tarvos_ast::Stmt::AnnAssign {
+                target: tarvos_ast::Expr::Attribute { value, attr },
+                value: Some(assigned),
+                ..
+            } if matches!(value.as_ref(), tarvos_ast::Expr::Name { id } if id == "self") => {
+                let ty = expression_type_with_names(assigned, parameter_types);
+                if !fields.iter().any(|(name, _)| name == attr) {
+                    fields.push((attr.clone(), ty));
+                }
+            }
+            tarvos_ast::Stmt::If { body, orelse, .. } => {
+                collect_fields_from_statements(body, fields, parameter_types);
+                collect_fields_from_statements(orelse, fields, parameter_types);
+            }
+            tarvos_ast::Stmt::While { body, .. }
+            | tarvos_ast::Stmt::For { body, .. }
+            | tarvos_ast::Stmt::With { body, .. } => {
+                collect_fields_from_statements(body, fields, parameter_types);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn annotation_type(annotation: &str) -> Type {
+    match annotation {
+        "int" => Type::Int,
+        "float" => Type::Float,
+        "bool" => Type::Bool,
+        "str" | "string" => Type::String,
+        _ => Type::Unknown,
+    }
+}
+
+fn expression_type_with_names(expr: &tarvos_ast::Expr, names: &HashMap<String, Type>) -> Type {
+    match expr {
+        tarvos_ast::Expr::Name { id } => names.get(id).cloned().unwrap_or(Type::Unknown),
+        tarvos_ast::Expr::Binary { left, right, .. } => {
+            let left_type = expression_type_with_names(left, names);
+            let right_type = expression_type_with_names(right, names);
+            if left_type == Type::Float || right_type == Type::Float {
+                Type::Float
+            } else {
+                left_type
+            }
+        }
+        _ => expression_type(expr),
+    }
+}
+
+fn expression_type(expr: &tarvos_ast::Expr) -> Type {
+    match expr {
+        tarvos_ast::Expr::Int { .. } => Type::Int,
+        tarvos_ast::Expr::Float { .. } => Type::Float,
+        tarvos_ast::Expr::Bool { .. } => Type::Bool,
+        tarvos_ast::Expr::String { .. } | tarvos_ast::Expr::FormatString { .. } => Type::String,
+        tarvos_ast::Expr::List { elements } => Type::Array(Box::new(
+            elements
+                .first()
+                .map(expression_type)
+                .unwrap_or(Type::Unknown),
+        )),
+        tarvos_ast::Expr::Binary { left, right, .. } => {
+            let left_type = expression_type(left);
+            let right_type = expression_type(right);
+            if left_type == Type::Float || right_type == Type::Float {
+                Type::Float
+            } else {
+                left_type
+            }
+        }
+        _ => Type::Unknown,
+    }
+}
+
+fn rust_identifier(name: &str) -> String {
+    let mut identifier = String::with_capacity(name.len());
+    for (index, character) in name.chars().enumerate() {
+        if character.is_ascii_uppercase() {
+            if index > 0 {
+                identifier.push('_');
+            }
+            identifier.push(character.to_ascii_lowercase());
+        } else if character.is_ascii_alphanumeric() || character == '_' {
+            identifier.push(character);
+        } else {
+            identifier.push('_');
+        }
+    }
+    if identifier.is_empty() {
+        "_".to_string()
+    } else {
+        identifier
     }
 }
 

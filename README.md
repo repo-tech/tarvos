@@ -1,7 +1,7 @@
 # Tarvos ⚡
 
 [![Production CI Pipeline](https://github.com/repo-tech/Tarvos/actions/workflows/ci.yml/badge.svg)](https://github.com/repo-tech/Tarvos/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/repo-tech/Tarvos/releases)
+[![Release](https://img.shields.io/badge/version-1.1.0--rc.1-blue.svg)](https://github.com/repo-tech/Tarvos/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
 
@@ -31,7 +31,7 @@ tarvos analyze .\app.py --hot-functions
 ```
 
 ```powershell
-# Install the v1.0.0 public release without administrator rights.
+# Install the v1.1.0-rc.1 release candidate without administrator rights.
 .\install.ps1
 ```
 
@@ -137,10 +137,21 @@ toolchain/runner metadata. See [the benchmark methodology](docs/BENCHMARKING.md)
 
 - **Data Types**: `int` (i64), `float` (f64), `bool`, `str` (String), `list` (`Vec<T>`), tuples.
 - **Arithmetic & Logic**: `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `and`, `or`.
-- **Control Flow**: `if`, `elif`, `else`, `while`, `for i in range(...)` (with start, stop, step), `break`, `continue`, `return`.
+- **Control Flow**: `if`, `elif`, `else`, `while`, `for` over native lists, strings, dictionaries, and `range(...)` (with start, stop, step), `break`, `continue`, `return`.
 - **Functions**: Function definitions with optional or inferred type annotations (`def add(x: int, y: int) -> int:`).
 - **Built-in Functions**: `print(...)`, `len(...)`, `range(...)`, `str(...)`, `int(...)`, `float(...)`, `bool(...)`, `abs(...)`, `min(...)`, `max(...)`.
 - **List Operations**: List literals (`[1, 2, 3]`), subscript reading (`arr[i]`), subscript mutation (`arr[i] = val`).
+- **Comprehensions**: One-generator list comprehensions with an optional filter, such as `[x * 2 for x in range(10) if x > 2]`.
+- **Native Standard Library**: `math` functions/constants, `time.time()`, `time.perf_counter()`, `time.monotonic()`, `time.sleep()`, and `os.path` path predicates/manipulation are mapped to Rust's standard library.
+- **Local Modules**: `from sibling_module import function` and `import sibling_module` resolve `.py` modules beneath the entry file's project root. Imported source files participate in the native compilation cache key.
+
+Imports that do not have a native mapping are rejected with an explicit compiler diagnostic; they are not silently treated as successful no-ops.
+
+Python integers outside the native `i64` range are preserved through AST export
+and receive an explicit diagnostic when used as native `range()` bounds rather
+than being rounded through floating point or executed as an impractical loop.
+Use `tarvos run program.py --python-fallback` for arbitrary-precision Python
+integer semantics.
 
 ---
 

@@ -57,7 +57,6 @@ pub enum Stmt {
     #[serde(rename = "expr")]
     Expr { value: Expr },
 
-
     #[serde(rename = "if")]
     If {
         test: Expr,
@@ -141,6 +140,9 @@ pub enum Expr {
 
     #[serde(rename = "int")]
     Int { value: i64 },
+
+    #[serde(rename = "big_int")]
+    BigInt { value: String },
 
     #[serde(rename = "float")]
     Float { value: f64 },
@@ -229,10 +231,7 @@ pub enum Expr {
 
     /// Lambda expression: lambda args: body
     #[serde(rename = "lambda")]
-    Lambda {
-        args: Vec<String>,
-        body: Box<Expr>,
-    },
+    Lambda { args: Vec<String>, body: Box<Expr> },
 
     /// List comprehension: [expr for var in iter if cond]
     #[serde(rename = "list_comp")]
@@ -259,7 +258,13 @@ pub enum FormatPart {
     #[serde(rename = "literal")]
     Literal { value: String },
     #[serde(rename = "value")]
-    Value { value: Expr },
+    Value {
+        value: Expr,
+        #[serde(default)]
+        format_spec: Option<String>,
+        #[serde(default)]
+        conversion: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -274,6 +279,7 @@ impl Expr {
         match self {
             Expr::Name { .. } => "name",
             Expr::Int { .. } => "int",
+            Expr::BigInt { .. } => "big integer",
             Expr::Float { .. } => "float",
             Expr::String { .. } => "string",
             Expr::Bool { .. } => "bool",

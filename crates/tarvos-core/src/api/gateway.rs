@@ -26,8 +26,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json,
-    Router,
+    Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use rand::{distributions::Alphanumeric, Rng};
@@ -95,7 +94,7 @@ async fn health() -> impl IntoResponse {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
-        r#"{"status":"operational","version":"1.0.0"}"#,
+        r#"{"status":"operational","version":"1.1.0-rc.1"}"#,
     )
 }
 
@@ -503,7 +502,9 @@ async fn terminal_session(socket: WebSocket, config: GatewayConfig, query: Termi
     let cleanup_task = tokio::task::spawn_blocking(move || {
         let _ = child.kill();
         let _ = child.wait();
-        let _ = StdCommand::new(&docker_bin).args(["rm", "-f", &cname]).output();
+        let _ = StdCommand::new(&docker_bin)
+            .args(["rm", "-f", &cname])
+            .output();
     });
     let _ = tokio::time::timeout(Duration::from_secs(5), cleanup_task).await;
     if cleanup {
@@ -588,7 +589,9 @@ fn resolve_safe_path(workspace: &Path, user_path: Option<&str>) -> Result<PathBu
     for component in relative.components() {
         match component {
             std::path::Component::ParentDir => {
-                return Err(GatewayError::bad_request("path traversal using '..' is forbidden"));
+                return Err(GatewayError::bad_request(
+                    "path traversal using '..' is forbidden",
+                ));
             }
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {
                 return Err(GatewayError::bad_request("absolute paths are forbidden"));
@@ -640,7 +643,11 @@ async fn get_files(
             .await
             .map_err(GatewayError::internal)?;
         let mut entries = Vec::new();
-        while let Some(entry) = read_dir.next_entry().await.map_err(GatewayError::internal)? {
+        while let Some(entry) = read_dir
+            .next_entry()
+            .await
+            .map_err(GatewayError::internal)?
+        {
             let entry_path = entry.path();
             let rel = entry_path
                 .strip_prefix(&workspace)
@@ -738,12 +745,17 @@ async fn get_raw_file(
     if !target.exists() {
         return Err(GatewayError::new(StatusCode::NOT_FOUND, "path not found"));
     }
-    let metadata = fs::metadata(&target).await.map_err(GatewayError::internal)?;
+    let metadata = fs::metadata(&target)
+        .await
+        .map_err(GatewayError::internal)?;
     if metadata.is_dir() {
         return Err(GatewayError::bad_request("path is a directory"));
     }
     if metadata.len() > 100 * 1024 * 1024 {
-        return Err(GatewayError::new(StatusCode::PAYLOAD_TOO_LARGE, "file too large to serve"));
+        return Err(GatewayError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file too large to serve",
+        ));
     }
 
     let bytes = fs::read(&target).await.map_err(GatewayError::internal)?;
@@ -907,7 +919,6 @@ async fn mkdir(
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
-
 #[derive(Debug, Deserialize)]
 struct RenameQuery {
     from: String,
@@ -931,9 +942,13 @@ async fn rename_file(
         return Err(GatewayError::bad_request("destination path already exists"));
     }
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).await.map_err(GatewayError::internal)?;
+        fs::create_dir_all(parent)
+            .await
+            .map_err(GatewayError::internal)?;
     }
-    fs::rename(&src, &dst).await.map_err(GatewayError::internal)?;
+    fs::rename(&src, &dst)
+        .await
+        .map_err(GatewayError::internal)?;
     Ok((StatusCode::OK, Json(serde_json::json!({ "renamed": true }))))
 }
 
@@ -973,7 +988,7 @@ fn cache_root() -> PathBuf {
         .or_else(|| env::var_os("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir);
-    home.join(".tarvos").join("cache").join("v1.0.0")
+    home.join(".tarvos").join("cache").join("v1.1.0-rc.1")
 }
 
 fn workspace_root() -> PathBuf {
@@ -981,7 +996,7 @@ fn workspace_root() -> PathBuf {
         .or_else(|| env::var_os("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir);
-    home.join(".tarvos").join("workspaces").join("v1.0.0")
+    home.join(".tarvos").join("workspaces").join("v1.1.0-rc.1")
 }
 
 #[derive(Debug)]

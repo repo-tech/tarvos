@@ -42,7 +42,13 @@ impl Optimizer {
         let mut result = Vec::new();
         for stmt in stmts {
             match stmt {
-                Stmt::For { target, iter, body } => {
+                Stmt::StructDef { .. } => result.push(stmt.clone()),
+                Stmt::For {
+                    target,
+                    iter,
+                    iter_type,
+                    body,
+                } => {
                     if let Some((start_val, end_val)) = Self::extract_range_bounds(iter) {
                         if body.len() == 1 {
                             if let Stmt::Assign {
@@ -110,6 +116,7 @@ impl Optimizer {
                     result.push(Stmt::For {
                         target: target.clone(),
                         iter: iter.clone(),
+                        iter_type: iter_type.clone(),
                         body: Self::optimize_loop_block(body),
                     });
                 }
@@ -200,6 +207,7 @@ impl Optimizer {
 
         for stmt in stmts {
             match stmt {
+                Stmt::StructDef { .. } => result.push(stmt.clone()),
                 Stmt::Let { name, ty, value } => {
                     let new_val = Self::substitute_value(value, &env);
                     if Self::is_constant_value(&new_val) {
@@ -223,6 +231,17 @@ impl Optimizer {
                     result.push(Stmt::Assign {
                         name: name.clone(),
                         value: new_val,
+                    });
+                }
+                Stmt::FieldAssign {
+                    object,
+                    field,
+                    value,
+                } => {
+                    result.push(Stmt::FieldAssign {
+                        object: Self::substitute_value(object, &env),
+                        field: field.clone(),
+                        value: Self::substitute_value(value, &env),
                     });
                 }
                 Stmt::IndexAssign {
@@ -348,7 +367,12 @@ impl Optimizer {
                         body: new_body,
                     });
                 }
-                Stmt::For { target, iter, body } => {
+                Stmt::For {
+                    target,
+                    iter,
+                    iter_type,
+                    body,
+                } => {
                     env.remove(target);
                     for modified in Self::mutated_in_block(body) {
                         env.remove(&modified);
@@ -358,6 +382,7 @@ impl Optimizer {
                     result.push(Stmt::For {
                         target: target.clone(),
                         iter: new_iter,
+                        iter_type: iter_type.clone(),
                         body: new_body,
                     });
                 }
@@ -394,6 +419,11 @@ impl Optimizer {
                     value.clone()
                 }
             }
+            Value::Field { object, field, ty } => Value::Field {
+                object: Box::new(Self::substitute_value(object, env)),
+                field: field.clone(),
+                ty: ty.clone(),
+            },
             Value::Unary { op, operand, ty } => Value::Unary {
                 op: *op,
                 operand: Box::new(Self::substitute_value(operand, env)),
@@ -432,6 +462,21 @@ impl Optimizer {
                     .collect(),
                 element_type: element_type.clone(),
             },
+            Value::ListComp {
+                target,
+                iter,
+                element,
+                condition,
+                element_type,
+            } => Value::ListComp {
+                target: target.clone(),
+                iter: Box::new(Self::substitute_value(iter, env)),
+                element: Box::new(Self::substitute_value(element, env)),
+                condition: condition
+                    .as_ref()
+                    .map(|value| Box::new(Self::substitute_value(value, env))),
+                element_type: element_type.clone(),
+            },
             Value::Index {
                 container,
                 index,
@@ -461,6 +506,25 @@ impl Optimizer {
                     .as_ref()
                     .map(|s| Box::new(Self::substitute_value(s, env))),
                 container_type: container_type.clone(),
+            },
+            Value::FormatString { parts } => Value::FormatString {
+                parts: parts
+                    .iter()
+                    .map(|part| match part {
+                        tarvos_ir::FormatPart::Literal(value) => {
+                            tarvos_ir::FormatPart::Literal(value.clone())
+                        }
+                        tarvos_ir::FormatPart::Value {
+                            value,
+                            format_spec,
+                            conversion,
+                        } => tarvos_ir::FormatPart::Value {
+                            value: Box::new(Self::substitute_value(value, env)),
+                            format_spec: format_spec.clone(),
+                            conversion: conversion.clone(),
+                        },
+                    })
+                    .collect(),
             },
             other => other.clone(),
         }
@@ -533,6 +597,7 @@ impl Optimizer {
 
     fn fold_stmt(stmt: &Stmt) -> Result<Stmt> {
         match stmt {
+            Stmt::StructDef { .. } => Ok(stmt.clone()),
             Stmt::Let { name, ty, value } => {
                 let folded_value = Self::fold_value(value)?;
                 Ok(Stmt::Let {
@@ -548,6 +613,15 @@ impl Optimizer {
                     value: folded_value,
                 })
             }
+            Stmt::FieldAssign {
+                object,
+                field,
+                value,
+            } => Ok(Stmt::FieldAssign {
+                object: Self::fold_value(object)?,
+                field: field.clone(),
+                value: Self::fold_value(value)?,
+            }),
             Stmt::IndexAssign {
                 target,
                 index,
@@ -650,7 +724,12 @@ impl Optimizer {
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Stmt::While { test, body })
             }
-            Stmt::For { target, iter, body } => {
+            Stmt::For {
+                target,
+                iter,
+                iter_type,
+                body,
+            } => {
                 let iter = Self::fold_value(iter)?;
                 let body = body
                     .iter()
@@ -659,6 +738,7 @@ impl Optimizer {
                 Ok(Stmt::For {
                     target: target.clone(),
                     iter,
+                    iter_type: iter_type.clone(),
                     body,
                 })
             }
@@ -817,6 +897,25 @@ impl Optimizer {
                     container_type: container_type.clone(),
                 })
             }
+            Value::FormatString { parts } => Ok(Value::FormatString {
+                parts: parts
+                    .iter()
+                    .map(|part| match part {
+                        tarvos_ir::FormatPart::Literal(value) => {
+                            Ok(tarvos_ir::FormatPart::Literal(value.clone()))
+                        }
+                        tarvos_ir::FormatPart::Value {
+                            value,
+                            format_spec,
+                            conversion,
+                        } => Ok(tarvos_ir::FormatPart::Value {
+                            value: Box::new(Self::fold_value(value)?),
+                            format_spec: format_spec.clone(),
+                            conversion: conversion.clone(),
+                        }),
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            }),
             _ => Ok(value.clone()),
         }
     }
@@ -934,10 +1033,16 @@ impl Optimizer {
                         body: Self::preserve_branch_bindings(body),
                     });
                 }
-                Stmt::For { target, iter, body } => {
+                Stmt::For {
+                    target,
+                    iter,
+                    iter_type,
+                    body,
+                } => {
                     simplified.push(Stmt::For {
                         target: target.clone(),
                         iter: Self::eliminate_value(iter),
+                        iter_type: iter_type.clone(),
                         body: Self::preserve_branch_bindings(body),
                     });
                 }
@@ -976,6 +1081,7 @@ impl Optimizer {
 
     fn eliminate_stmt(stmt: &Stmt) -> Stmt {
         match stmt {
+            Stmt::StructDef { .. } => stmt.clone(),
             Stmt::Let { name, ty, value } => Stmt::Let {
                 name: name.clone(),
                 ty: ty.clone(),
@@ -983,6 +1089,15 @@ impl Optimizer {
             },
             Stmt::Assign { name, value } => Stmt::Assign {
                 name: name.clone(),
+                value: Self::eliminate_value(value),
+            },
+            Stmt::FieldAssign {
+                object,
+                field,
+                value,
+            } => Stmt::FieldAssign {
+                object: Self::eliminate_value(object),
+                field: field.clone(),
                 value: Self::eliminate_value(value),
             },
             Stmt::IndexAssign {
@@ -1046,9 +1161,15 @@ impl Optimizer {
                 test: Self::eliminate_value(test),
                 body: Self::preserve_branch_bindings(body),
             },
-            Stmt::For { target, iter, body } => Stmt::For {
+            Stmt::For {
+                target,
+                iter,
+                iter_type,
+                body,
+            } => Stmt::For {
                 target: target.clone(),
                 iter: Self::eliminate_value(iter),
+                iter_type: iter_type.clone(),
                 body: Self::preserve_branch_bindings(body),
             },
             Stmt::Function {
@@ -1124,6 +1245,25 @@ impl Optimizer {
                 step: step.as_ref().map(|s| Box::new(Self::eliminate_value(s))),
                 container_type: container_type.clone(),
             },
+            Value::FormatString { parts } => Value::FormatString {
+                parts: parts
+                    .iter()
+                    .map(|part| match part {
+                        tarvos_ir::FormatPart::Literal(value) => {
+                            tarvos_ir::FormatPart::Literal(value.clone())
+                        }
+                        tarvos_ir::FormatPart::Value {
+                            value,
+                            format_spec,
+                            conversion,
+                        } => tarvos_ir::FormatPart::Value {
+                            value: Box::new(Self::eliminate_value(value)),
+                            format_spec: format_spec.clone(),
+                            conversion: conversion.clone(),
+                        },
+                    })
+                    .collect(),
+            },
             other => other.clone(),
         }
     }
@@ -1159,10 +1299,16 @@ impl Optimizer {
 
     fn stmt_reads(stmt: &Stmt) -> HashSet<String> {
         match stmt {
+            Stmt::StructDef { .. } => HashSet::new(),
             Stmt::Let { value, .. } => Self::value_names(value),
             Stmt::Assign { name, value } => {
                 let mut names = Self::value_names(value);
                 names.insert(name.clone());
+                names
+            }
+            Stmt::FieldAssign { object, value, .. } => {
+                let mut names = Self::value_names(object);
+                names.extend(Self::value_names(value));
                 names
             }
             Stmt::IndexAssign {
@@ -1249,6 +1395,9 @@ impl Optimizer {
             Value::Name(name) => {
                 names.insert(name.clone());
             }
+            Value::Field { object, .. } => {
+                names.extend(Self::value_names(object));
+            }
             Value::Unary { operand, .. } => {
                 names.extend(Self::value_names(operand));
             }
@@ -1264,6 +1413,23 @@ impl Optimizer {
             Value::List { elements, .. } => {
                 for element in elements {
                     names.extend(Self::value_names(element));
+                }
+            }
+            Value::ListComp {
+                target,
+                iter,
+                element,
+                condition,
+                ..
+            } => {
+                names.extend(Self::value_names(iter));
+                let mut element_names = Self::value_names(element);
+                element_names.remove(target);
+                names.extend(element_names);
+                if let Some(condition) = condition {
+                    let mut condition_names = Self::value_names(condition);
+                    condition_names.remove(target);
+                    names.extend(condition_names);
                 }
             }
             Value::Index {
@@ -1290,6 +1456,13 @@ impl Optimizer {
                     names.extend(Self::value_names(s));
                 }
             }
+            Value::FormatString { parts } => {
+                for part in parts {
+                    if let tarvos_ir::FormatPart::Value { value, .. } = part {
+                        names.extend(Self::value_names(value));
+                    }
+                }
+            }
             _ => {}
         }
         names
@@ -1303,11 +1476,24 @@ impl Optimizer {
             | Value::String(_)
             | Value::Bool(_) => true,
             Value::Name(_) => true,
+            Value::Field { object, .. } => Self::is_pure_value(object),
             Value::Unary { operand, .. } => Self::is_pure_value(operand),
             Value::Binary { left, right, .. } => {
                 Self::is_pure_value(left) && Self::is_pure_value(right)
             }
             Value::List { elements, .. } => elements.iter().all(Self::is_pure_value),
+            Value::ListComp {
+                iter,
+                element,
+                condition,
+                ..
+            } => {
+                Self::is_pure_value(iter)
+                    && Self::is_pure_value(element)
+                    && condition
+                        .as_ref()
+                        .map_or(true, |value| Self::is_pure_value(value))
+            }
             Value::Tuple { elements, .. } => elements.iter().all(Self::is_pure_value),
             Value::Dict { keys, values, .. } => {
                 keys.iter().all(Self::is_pure_value) && values.iter().all(Self::is_pure_value)
@@ -1329,7 +1515,7 @@ impl Optimizer {
             }
             Value::FormatString { parts } => parts.iter().all(|part| match part {
                 tarvos_ir::FormatPart::Literal(_) => true,
-                tarvos_ir::FormatPart::Value(value) => Self::is_pure_value(value),
+                tarvos_ir::FormatPart::Value { value, .. } => Self::is_pure_value(value),
             }),
             Value::Call { .. } => false,
         }
@@ -1464,6 +1650,7 @@ mod tests {
                         args: vec![Value::Int(10)],
                         return_type: Type::Array(Box::new(Type::Int)),
                     },
+                    iter_type: Type::Array(Box::new(Type::Int)),
                     body: vec![Stmt::Assign {
                         name: "total".into(),
                         value: Value::Binary {
@@ -1502,6 +1689,7 @@ mod tests {
                         args: vec![Value::Int(350_000_000_000)],
                         return_type: Type::Array(Box::new(Type::Int)),
                     },
+                    iter_type: Type::Array(Box::new(Type::Int)),
                     body: vec![Stmt::Assign {
                         name: "total".into(),
                         value: Value::Binary {
