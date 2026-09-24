@@ -1,4 +1,8 @@
-# Tarvos 1.1.0-rc.1
+# Tarvos 1.1.0-rc.2
+
+This release candidate fixes cross-target CI by separating native-host test
+execution from cross-target artifact builds. It also synchronizes the public
+Tarvos Engine distribution milestone.
 
 This release candidate hardens the native compatibility boundary after the
 1.0.0 baseline.

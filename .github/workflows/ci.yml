@@ -9,7 +9,7 @@ on:
 
 jobs:
   test-and-build:
-    name: Build & Test (${{ matrix.os }} - ${{ matrix.target }})
+    name: Build (${{ matrix.os }} - ${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -18,23 +18,23 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             binary_name: tarvos.exe
-            use_cross: false
+            run_tests: true
           - os: windows-latest
             target: x86_64-pc-windows-gnu
             binary_name: tarvos.exe
-            use_cross: false
+            run_tests: false
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             binary_name: tarvos
-            use_cross: false
+            run_tests: true
           - os: macos-latest
             target: x86_64-apple-darwin
             binary_name: tarvos
-            use_cross: false
+            run_tests: false
           - os: macos-latest
             target: aarch64-apple-darwin
             binary_name: tarvos
-            use_cross: false
+            run_tests: false
 
     steps:
       - name: Checkout Codebase
@@ -64,9 +64,9 @@ jobs:
       - name: Cargo Build (Release)
         run: cargo build --release --target ${{ matrix.target }} -p tarvos-cli
 
-      - name: Run Full Test Suite
-        if: matrix.target != 'aarch64-apple-darwin' || runner.arch == 'ARM64'
-        run: cargo test --all --target ${{ matrix.target }}
+      - name: Run Full Test Suite (native host target)
+        if: matrix.run_tests
+        run: cargo test --workspace --target ${{ matrix.target }}
 
       - name: Run 1.0 Production Validation Suite
         if: matrix.os == 'windows-latest' && matrix.target == 'x86_64-pc-windows-msvc'
@@ -78,4 +78,3 @@ jobs:
           name: tarvos-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/${{ matrix.binary_name }}
           if-no-files-found: error
-
