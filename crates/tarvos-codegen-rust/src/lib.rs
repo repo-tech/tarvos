@@ -1,7 +1,317 @@
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
-use tarvos_ir::{BinaryOp, Module, Stmt, Value};
+use tarvos_ir::{BinaryOp, FormatPart, Module, Stmt, Value};
 use tarvos_types::Type;
+
+/// Python-faithful `print` / `str` / `repr` for the native value types.
+///
+/// `print` uses `str` at the top level but `repr` for anything nested, which is
+/// why `print("ab")` prints `ab` while `print(["ab"])` prints `['ab']`. Rust's
+/// `Debug` cannot express that split, so repr is spelled out here.
+const DISPLAY_RUNTIME: &str = r##"
+#[allow(dead_code)]
+fn __tarvos_str_repr(value: &str) -> String {
+    // Python prefers single quotes and only switches when the value contains one
+    // but no double quote.
+    let quote = if value.contains('\'') && !value.contains('"') { '"' } else { '\'' };
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push(quote);
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c == quote => { out.push('\\'); out.push(c); }
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
+}
+
+#[allow(dead_code)]
+trait __TarvosRepr { fn __tarvos_repr(&self) -> String; }
+
+impl __TarvosRepr for i64 { fn __tarvos_repr(&self) -> String { self.to_string() } }
+impl __TarvosRepr for f64 { fn __tarvos_repr(&self) -> String { format!("{:?}", self) } }
+impl __TarvosRepr for bool { fn __tarvos_repr(&self) -> String { if *self { "True" } else { "False" }.to_string() } }
+impl __TarvosRepr for String { fn __tarvos_repr(&self) -> String { __tarvos_str_repr(self) } }
+impl<T: __TarvosRepr> __TarvosRepr for Vec<T> {
+    fn __tarvos_repr(&self) -> String {
+        let items = self.iter().map(|item| item.__tarvos_repr()).collect::<Vec<String>>();
+        format!("[{}]", items.join(", "))
+    }
+}
+impl<K: __TarvosRepr, V: __TarvosRepr> __TarvosRepr for std::collections::HashMap<K, V> {
+    fn __tarvos_repr(&self) -> String {
+        // Python's repr sorts dict keys; sorting the rendered pairs keeps the
+        // output stable without requiring the key type to be `Ord`.
+        let mut entries = self
+            .iter()
+            .map(|(key, value)| format!("{}: {}", key.__tarvos_repr(), value.__tarvos_repr()))
+            .collect::<Vec<String>>();
+        entries.sort();
+        format!("{{{}}}", entries.join(", "))
+    }
+}
+
+#[allow(dead_code)]
+trait __TarvosDisplay { fn __tarvos_display(&self) -> String; }
+
+impl __TarvosDisplay for i64 { fn __tarvos_display(&self) -> String { self.to_string() } }
+impl __TarvosDisplay for f64 { fn __tarvos_display(&self) -> String { format!("{:?}", self) } }
+impl __TarvosDisplay for bool { fn __tarvos_display(&self) -> String { if *self { "True" } else { "False" }.to_string() } }
+impl __TarvosDisplay for String { fn __tarvos_display(&self) -> String { self.clone() } }
+impl<T: __TarvosRepr> __TarvosDisplay for Vec<T> { fn __tarvos_display(&self) -> String { self.__tarvos_repr() } }
+impl<K: __TarvosRepr, V: __TarvosRepr> __TarvosDisplay for std::collections::HashMap<K, V> { fn __tarvos_display(&self) -> String { self.__tarvos_repr() } }
+"##;
+
+/// Runtime backing `range()` calls whose step is not a statically positive literal.
+///
+/// Python's three-argument `range` counts down for a negative step and rejects a
+/// zero step; Rust's `Range` can do neither. `step_by` covers the common positive
+/// case without allocating, so this helper is the correct fallback for the rest.
+/// Arithmetic is checked because Python integers do not overflow: when the next
+/// value would leave `i64`, the next value necessarily exceeds `stop`, so ending
+/// the loop there matches Python rather than wrapping.
+const RANGE_RUNTIME: &str = r##"
+#[allow(dead_code)]
+#[inline]
+fn tarvos_range(start: i64, stop: i64, step: i64) -> Vec<i64> {
+    if step == 0 { panic!("ValueError: range() arg 3 must not be zero"); }
+    let mut values = Vec::new();
+    let mut current = start;
+    if step > 0 {
+        while current < stop {
+            values.push(current);
+            match current.checked_add(step) { Some(next) => current = next, None => break }
+        }
+    } else {
+        while current > stop {
+            values.push(current);
+            match current.checked_add(step) { Some(next) => current = next, None => break }
+        }
+    }
+    values
+}
+"##;
+
+/// Runtime that backs the native `str` builtin methods.
+///
+/// Kept as one literal so the generated program stays dependency-free: every
+/// helper is a free function over `std` types, and the `#[allow(dead_code)]`
+/// header means only the helpers a program actually calls cost anything.
+const STR_RUNTIME: &str = r##"
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_lower(value: &str) -> String { value.to_lowercase() }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_upper(value: &str) -> String { value.to_uppercase() }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_strip(value: &str) -> String { value.trim().to_string() }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_lstrip(value: &str) -> String { value.trim_start().to_string() }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_rstrip(value: &str) -> String { value.trim_end().to_string() }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_replace(value: &str, from: &str, to: &str) -> String { value.replace(from, to) }
+// Python's width arguments are `int`, but Rust's inline padding takes `usize`,
+// so the width is bound to a `usize` local for the format specifier to capture.
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_ljust(value: &str, width: i64) -> String { let width = width.max(0) as usize; format!("{value:<width$}") }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_rjust(value: &str, width: i64) -> String { let width = width.max(0) as usize; format!("{value:>width$}") }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_zfill(value: &str, width: i64) -> String { let width = width.max(0) as usize; format!("{value:0>width$}") }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_center(value: &str, width: i64) -> String { let width = width.max(0) as usize; format!("{value:^width$}") }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_startswith(value: &str, prefix: &str) -> bool { value.starts_with(prefix) }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_endswith(value: &str, suffix: &str) -> bool { value.ends_with(suffix) }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_isdigit(value: &str) -> bool { !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit()) }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_isalpha(value: &str) -> bool { !value.is_empty() && value.chars().all(|ch| ch.is_alphabetic()) }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_isalnum(value: &str) -> bool { !value.is_empty() && value.chars().all(|ch| ch.is_alphanumeric()) }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_isspace(value: &str) -> bool { !value.is_empty() && value.chars().all(|ch| ch.is_whitespace()) }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_isupper(value: &str) -> bool { value.chars().any(|ch| ch.is_uppercase()) && !value.chars().any(|ch| ch.is_lowercase()) }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_islower(value: &str) -> bool { value.chars().any(|ch| ch.is_lowercase()) && !value.chars().any(|ch| ch.is_uppercase()) }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_count(value: &str, needle: &str) -> i64 {
+    if needle.is_empty() { return value.chars().count() as i64 + 1; }
+    value.matches(needle).count() as i64
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_find(value: &str, needle: &str) -> i64 {
+    value.find(needle).map(|index| value[..index].chars().count() as i64).unwrap_or(-1)
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_rfind(value: &str, needle: &str) -> i64 {
+    value.rfind(needle).map(|index| value[..index].chars().count() as i64).unwrap_or(-1)
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_index(value: &str, needle: &str) -> i64 {
+    let found = tarvos_str_find(value, needle);
+    if found < 0 { panic!("substring not found"); }
+    found
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_split(value: &str, separator: Option<&str>) -> Vec<String> {
+    match separator {
+        Some(sep) if !sep.is_empty() => value.split(sep).map(|part| part.to_string()).collect(),
+        // Python's whitespace split also drops empty fields, unlike `split(" ")`.
+        _ => value.split_whitespace().map(|part| part.to_string()).collect(),
+    }
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_splitlines(value: &str) -> Vec<String> {
+    value.lines().map(|line| line.to_string()).collect()
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_join<S: AsRef<str>>(separator: &str, items: &[S]) -> String {
+    items.iter().map(|item| item.as_ref()).collect::<Vec<&str>>().join(separator)
+}
+"##;
+
+/// Runtime that backs the native `str` case-mapping helpers.
+///
+/// `title`, `capitalize` and `swapcase` have no direct `str` method, so they
+/// are spelled out here rather than approximated at the call site.
+const STR_CASE_RUNTIME: &str = r##"
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_title(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut start_of_word = true;
+    for ch in value.chars() {
+        if ch.is_alphanumeric() {
+            if start_of_word { out.extend(ch.to_uppercase()); }
+            else { out.extend(ch.to_lowercase()); }
+            start_of_word = false;
+        } else {
+            out.push(ch);
+            start_of_word = true;
+        }
+    }
+    out
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_capitalize(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_str_swapcase(value: &str) -> String {
+    value.chars().map(|ch| {
+        if ch.is_uppercase() { ch.to_lowercase().next().unwrap_or(ch) }
+        else { ch.to_uppercase().next().unwrap_or(ch) }
+    }).collect()
+}
+"##;
+
+/// Helpers that live in [`STR_CASE_RUNTIME`] rather than [`STR_RUNTIME`].
+///
+/// They are tracked by name so the two preludes can be emitted independently:
+/// a program that only calls `lower()` never pays for the case-mapping helpers.
+const STR_CASE_HELPERS: [&str; 3] = [
+    "tarvos_str_title",
+    "tarvos_str_capitalize",
+    "tarvos_str_swapcase",
+];
+
+/// Runtime that backs the native `list` builtin methods.
+///
+/// Generic over the element type so one set of helpers serves `list[int]`,
+/// `list[float]` and `list[str]` without the lowering stage emitting per-type code.
+const LIST_RUNTIME: &str = r##"
+#[allow(dead_code)]
+#[inline]
+fn tarvos_list_extend<T: Clone>(target: &mut Vec<T>, items: &[T]) { target.extend_from_slice(items); }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_list_insert<T>(target: &mut Vec<T>, index: i64, value: T) {
+    // Python clamps rather than panicking, and a negative index counts from the end.
+    let length = target.len() as i64;
+    let bounded = if index < 0 { (length + index + 1).max(0) } else { index.min(length) };
+    target.insert(bounded as usize, value);
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_list_remove<T: PartialEq>(target: &mut Vec<T>, value: T) {
+    if let Some(index) = target.iter().position(|item| *item == value) { target.remove(index); }
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_list_pop<T: Default>(target: &mut Vec<T>) -> T { target.pop().unwrap_or_default() }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_list_clear<T>(target: &mut Vec<T>) { target.clear(); }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_list_reverse<T>(target: &mut Vec<T>) { target.reverse(); }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_list_index<T: PartialEq>(target: &[T], value: T) -> i64 {
+    match target.iter().position(|item| *item == value) {
+        Some(index) => index as i64,
+        None => panic!("value is not in list"),
+    }
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_list_count<T: PartialEq>(target: &[T], value: T) -> i64 {
+    target.iter().filter(|item| **item == value).count() as i64
+}
+// `sort()` needs a total order; floats use `total_cmp` so NaN still sorts
+// deterministically instead of tripping the `Ord` contract.
+#[allow(dead_code)]
+#[inline]
+fn tarvos_list_sort_i64(target: &mut Vec<i64>) { target.sort(); }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_list_sort_f64(target: &mut Vec<f64>) { target.sort_by(|left, right| left.total_cmp(right)); }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_list_sort_string(target: &mut Vec<String>) { target.sort(); }
+#[allow(dead_code)]
+#[inline]
+fn tarvos_list_sort_bool(target: &mut Vec<bool>) { target.sort(); }
+"##;
 
 pub struct RustCodegen;
 
@@ -12,7 +322,66 @@ impl RustCodegen {
         }
         Self::validate_module_assignments(module)?;
         let mut out = String::new();
-        out.push_str("#![allow(unused_mut, unused_variables, dead_code, unused_parens, unused_assignments)]\n\n");
+        out.push_str("#![allow(unused_mut, unused_variables, dead_code, unused_parens, unused_assignments, non_snake_case, non_camel_case_types)]\n\n");
+        // Python's numeric grouping (`f"{value:,}"`) has no `format!` equivalent, so the
+        // generated program carries a tiny helper that inserts the separator itself.
+        out.push_str(
+            r#"#[inline]
+fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> String {
+    let text = value.to_string();
+    let (sign, digits) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text.as_str()),
+    };
+    let (integer, fraction) = match digits.split_once('.') {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (digits, None),
+    };
+    let mut grouped = String::with_capacity(integer.len() + integer.len() / 3 + 1);
+    for (index, ch) in integer.chars().enumerate() {
+        if index > 0 && (integer.len() - index) % 3 == 0 {
+            grouped.push(separator);
+        }
+        grouped.push(ch);
+    }
+    match fraction {
+        Some(tail) => format!("{sign}{grouped}.{tail}"),
+        None => format!("{sign}{grouped}"),
+    }
+}
+
+"#,
+        );
+        // One traversal collects every runtime helper the program calls, so the
+        // preludes below only cost anything when they are actually reachable.
+        let runtime_calls = Self::collect_runtime_calls(module);
+        let needs = |name: &str| runtime_calls.contains(name);
+        if runtime_calls
+            .iter()
+            .any(|name| name.starts_with("tarvos_str_"))
+            && !STR_CASE_HELPERS.iter().all(|name| needs(name))
+        {
+            out.push_str(STR_RUNTIME);
+        }
+        if STR_CASE_HELPERS.iter().any(|name| needs(name)) {
+            out.push_str(STR_CASE_RUNTIME);
+        }
+        if runtime_calls
+            .iter()
+            .any(|name| name.starts_with("tarvos_list_"))
+        {
+            out.push_str(LIST_RUNTIME);
+        }
+        if needs("tarvos_range") {
+            out.push_str(RANGE_RUNTIME);
+        }
+        if module
+            .statements
+            .iter()
+            .any(Self::statement_needs_display_helper)
+        {
+            out.push_str(DISPLAY_RUNTIME);
+        }
         if module.statements.iter().any(Self::statement_uses_hash_map) {
             out.push_str("use std::collections::HashMap;\n\n");
         }
@@ -43,9 +412,15 @@ impl RustCodegen {
             }
         }
 
-        // Emit top-level functions
+        // Emit top-level functions.
+        //
+        // Each function body is its own Rust lexical scope, so `declared` must be
+        // reset per function. Sharing one set let a local declared in an earlier
+        // function suppress the `let` binding of the same name in a later one,
+        // producing a reference to a name that is not in scope.
         for f in &functions {
-            Self::emit_stmt(&mut out, f, 0, &mut declared)?;
+            let mut function_scope = HashSet::new();
+            Self::emit_stmt(&mut out, f, 0, &mut function_scope)?;
             out.push('\n');
         }
 
@@ -164,6 +539,7 @@ impl RustCodegen {
                 Ok(match op {
                     tarvos_ir::UnaryOp::Neg => format!("-({operand})"),
                     tarvos_ir::UnaryOp::Not => format!("(({operand}) == 0) as i64"),
+                    tarvos_ir::UnaryOp::Invert => format!("!({operand})"),
                 })
             }
             Value::Binary {
@@ -177,6 +553,14 @@ impl RustCodegen {
                     BinaryOp::Mul => "*",
                     BinaryOp::Div => "/",
                     BinaryOp::Mod => "%",
+                    BinaryOp::BitAnd => "&",
+                    BinaryOp::BitOr => "|",
+                    BinaryOp::BitXor => "^",
+                    // Embedded mode is an i64 arithmetic fast path: shift and floor
+                    // division follow Rust `i64` semantics here.
+                    BinaryOp::LShift => "<<",
+                    BinaryOp::RShift => ">>",
+                    BinaryOp::FloorDiv => "/",
                     BinaryOp::Eq => "==",
                     BinaryOp::NotEq => "!=",
                     BinaryOp::Lt => "<",
@@ -213,9 +597,10 @@ impl RustCodegen {
             Stmt::Let { value, .. } | Stmt::Assign { value, .. } => {
                 Self::value_uses_hash_map(value)
             }
+            Stmt::Destructure { value, .. } => Self::value_uses_hash_map(value),
             Stmt::Print(values) => values.iter().any(Self::value_uses_hash_map),
-            Stmt::IndexAssign { index, value, .. } => {
-                Self::value_uses_hash_map(index) || Self::value_uses_hash_map(value)
+            Stmt::IndexAssign { indices, value, .. } => {
+                indices.iter().any(Self::value_uses_hash_map) || Self::value_uses_hash_map(value)
             }
             Stmt::If { test, body, orelse } => {
                 Self::value_uses_hash_map(test)
@@ -254,6 +639,158 @@ impl RustCodegen {
                 Self::value_uses_hash_map(object) || Self::value_uses_hash_map(value)
             }
             Stmt::Break | Stmt::Continue | Stmt::Raise(_) => false,
+        }
+    }
+
+    /// Collect every runtime helper name the module calls.
+    ///
+    /// A single traversal feeds all prelude decisions, so registering a new
+    /// helper means adding its name to the prelude constant and nothing else.
+    fn collect_runtime_calls(module: &Module) -> HashSet<String> {
+        let mut names = HashSet::new();
+        for stmt in &module.statements {
+            Self::collect_stmt_calls(stmt, &mut names);
+        }
+        names
+    }
+
+    fn collect_stmt_calls(stmt: &Stmt, names: &mut HashSet<String>) {
+        let mut values = |value: &Value| Self::collect_value_calls(value, names);
+        match stmt {
+            Stmt::StructDef { .. } | Stmt::Break | Stmt::Continue => {}
+            Stmt::Let { value, .. }
+            | Stmt::Assign { value, .. }
+            | Stmt::Destructure { value, .. }
+            | Stmt::ListAppend { value, .. }
+            | Stmt::Expr(value) => values(value),
+            Stmt::Print(items) => items.iter().for_each(&mut values),
+            Stmt::IndexAssign { indices, value, .. } => {
+                indices.iter().for_each(&mut values);
+                values(value);
+            }
+            Stmt::FieldAssign { object, value, .. } => {
+                values(object);
+                values(value);
+            }
+            Stmt::If { test, body, orelse } => {
+                values(test);
+                body.iter().for_each(|s| Self::collect_stmt_calls(s, names));
+                orelse
+                    .iter()
+                    .for_each(|s| Self::collect_stmt_calls(s, names));
+            }
+            Stmt::While { test, body } => {
+                values(test);
+                body.iter().for_each(|s| Self::collect_stmt_calls(s, names));
+            }
+            Stmt::For { iter, body, .. } => {
+                values(iter);
+                body.iter().for_each(|s| Self::collect_stmt_calls(s, names));
+            }
+            Stmt::Function { body, .. } => {
+                body.iter().for_each(|s| Self::collect_stmt_calls(s, names))
+            }
+            Stmt::Return(value) | Stmt::Raise(value) => {
+                if let Some(value) = value {
+                    values(value);
+                }
+            }
+            Stmt::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                body.iter().for_each(|s| Self::collect_stmt_calls(s, names));
+                handlers
+                    .iter()
+                    .flat_map(|handler| handler.body.iter())
+                    .for_each(|s| Self::collect_stmt_calls(s, names));
+                orelse
+                    .iter()
+                    .for_each(|s| Self::collect_stmt_calls(s, names));
+                finalbody
+                    .iter()
+                    .for_each(|s| Self::collect_stmt_calls(s, names));
+            }
+            Stmt::With { items, body } => {
+                items.iter().for_each(|item| values(&item.context_expr));
+                body.iter().for_each(|s| Self::collect_stmt_calls(s, names));
+            }
+        }
+    }
+
+    fn collect_value_calls(value: &Value, names: &mut HashSet<String>) {
+        match value {
+            Value::Call { function, args, .. } => {
+                names.insert(function.clone());
+                // A three-argument `range` is emitted as `tarvos_range` unless its
+                // step is a statically positive literal, and the prelude decision
+                // runs before emission. Recording the helper here — using the same
+                // predicate as the emitter — keeps the two in agreement.
+                if function == "range"
+                    && args.len() == 3
+                    && !Self::range_step_is_positive_literal(args.get(2))
+                {
+                    names.insert("tarvos_range".to_string());
+                }
+                args.iter()
+                    .for_each(|arg| Self::collect_value_calls(arg, names));
+            }
+            Value::Binary { left, right, .. } => {
+                Self::collect_value_calls(left, names);
+                Self::collect_value_calls(right, names);
+            }
+            Value::Unary { operand, .. }
+            | Value::Field {
+                object: operand, ..
+            } => Self::collect_value_calls(operand, names),
+            Value::List { elements, .. } | Value::Tuple { elements, .. } => elements
+                .iter()
+                .for_each(|element| Self::collect_value_calls(element, names)),
+            Value::Dict { keys, values, .. } => {
+                keys.iter()
+                    .chain(values.iter())
+                    .for_each(|entry| Self::collect_value_calls(entry, names));
+            }
+            Value::Index {
+                container, index, ..
+            } => {
+                Self::collect_value_calls(container, names);
+                Self::collect_value_calls(index, names);
+            }
+            Value::Slice {
+                container,
+                lower,
+                upper,
+                step,
+                ..
+            } => {
+                Self::collect_value_calls(container, names);
+                for bound in [lower, upper, step].into_iter().flatten() {
+                    Self::collect_value_calls(bound, names);
+                }
+            }
+            Value::ListComp {
+                iter,
+                element,
+                condition,
+                ..
+            } => {
+                Self::collect_value_calls(iter, names);
+                Self::collect_value_calls(element, names);
+                if let Some(condition) = condition {
+                    Self::collect_value_calls(condition, names);
+                }
+            }
+            Value::FormatString { parts } => {
+                for part in parts {
+                    if let FormatPart::Value { value, .. } = part {
+                        Self::collect_value_calls(value, names);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -351,6 +888,40 @@ impl RustCodegen {
                 }
                 out.push_str(&format!("{}{} = {};\n", ind, name, value_str));
             }
+            Stmt::Destructure { targets, value } => {
+                if targets.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "tuple assignment requires at least one target"
+                    ));
+                }
+                let value_str = Self::emit_value(value)?;
+                let temporary = format!("__tarvos_unpack_{}", targets.join("_"));
+                if targets.iter().all(|name| !declared.contains(name)) {
+                    let bindings = targets
+                        .iter()
+                        .map(|name| format!("mut {}", name))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    out.push_str(&format!("{}let ({}) = {};\n", ind, bindings, value_str));
+                    declared.extend(targets.iter().cloned());
+                } else {
+                    if declared.contains(&temporary) {
+                        out.push_str(&format!("{}{} = {};\n", ind, temporary, value_str));
+                    } else {
+                        out.push_str(&format!("{}let mut {} = {};\n", ind, temporary, value_str));
+                        declared.insert(temporary.clone());
+                    }
+                    for (index, name) in targets.iter().enumerate() {
+                        let component = format!("{}.{}", temporary, index);
+                        if declared.contains(name) {
+                            out.push_str(&format!("{}{} = {};\n", ind, name, component));
+                        } else {
+                            out.push_str(&format!("{}let mut {} = {};\n", ind, name, component));
+                            declared.insert(name.clone());
+                        }
+                    }
+                }
+            }
             Stmt::FieldAssign {
                 object,
                 field,
@@ -372,21 +943,27 @@ impl RustCodegen {
             }
             Stmt::IndexAssign {
                 target,
-                index,
+                indices,
                 value,
             } => {
-                let index_str = Self::emit_value(index)?;
                 let value_str = Self::emit_value(value)?;
-                if matches!(index, Value::String(_)) {
+                if indices.len() == 1 && matches!(indices[0], Value::String(_)) {
+                    let index_str = Self::emit_value(&indices[0])?;
                     out.push_str(&format!(
                         "{}{}.insert({}, {});\n",
                         ind, target, index_str, value_str
                     ));
                 } else {
-                    out.push_str(&format!(
-                        "{}{}[({} as usize)] = {};\n",
-                        ind, target, index_str, value_str
-                    ));
+                    let mut chain = target.clone();
+                    for index in indices {
+                        let index_str = Self::emit_value(index)?;
+                        if matches!(index, Value::String(_)) {
+                            chain = format!("{}[{}]", chain, index_str);
+                        } else {
+                            chain = format!("{}[({} as usize)]", chain, index_str);
+                        }
+                    }
+                    out.push_str(&format!("{}{} = {};\n", ind, chain, value_str));
                 }
             }
             Stmt::ListAppend { target, value } => {
@@ -813,13 +1390,123 @@ impl RustCodegen {
                     format!("if {} {{ \"True\" }} else {{ \"False\" }}", expr),
                 ))
             }
+            Value::Call {
+                return_type: Type::Bool,
+                ..
+            } => {
+                let expr = Self::emit_value(value)?;
+                Ok((
+                    "{}".into(),
+                    format!("if {} {{ \"True\" }} else {{ \"False\" }}", expr),
+                ))
+            }
+            Value::Call {
+                return_type: Type::Int | Type::Float | Type::String,
+                ..
+            }
+            | Value::Binary {
+                ty: Type::Int | Type::Float | Type::String,
+                ..
+            } => Ok(("{}".into(), Self::emit_value(value)?)),
+            Value::Int(_) | Value::Int128(_) | Value::Float(_) | Value::String(_) => {
+                Ok(("{}".into(), Self::emit_value(value)?))
+            }
             // For a Name that might be a bool — we can't know the runtime value at codegen time
             // without tracking types through all let-bindings. For now emit {} and note this as a
             // known limitation for bool variables (Phase C: track variable types in codegen context).
             other => {
                 let expr = Self::emit_value(other)?;
-                Ok(("{}".into(), expr))
+                Ok(("{}".into(), format!("(&({})).__tarvos_display()", expr)))
             }
+        }
+    }
+
+    fn is_sequence_value(value: &Value) -> bool {
+        match value {
+            Value::String(_) | Value::List { .. } | Value::ListComp { .. } => true,
+            Value::Call { return_type, .. } => {
+                matches!(return_type, Type::Array(_) | Type::String)
+            }
+            Value::Slice { container_type, .. } => {
+                matches!(container_type, Type::Array(_) | Type::String)
+            }
+            _ => false,
+        }
+    }
+
+    fn statement_needs_display_helper(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Print(values) => values.iter().any(Self::value_needs_display_helper),
+            Stmt::If { test, body, orelse } => {
+                Self::value_needs_display_helper(test)
+                    || body.iter().any(Self::statement_needs_display_helper)
+                    || orelse.iter().any(Self::statement_needs_display_helper)
+            }
+            Stmt::While { test, body } => {
+                Self::value_needs_display_helper(test)
+                    || body.iter().any(Self::statement_needs_display_helper)
+            }
+            Stmt::For { iter, body, .. } => {
+                Self::value_needs_display_helper(iter)
+                    || body.iter().any(Self::statement_needs_display_helper)
+            }
+            Stmt::Function { body, .. } => body.iter().any(Self::statement_needs_display_helper),
+            Stmt::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                body.iter().any(Self::statement_needs_display_helper)
+                    || handlers.iter().any(|handler| {
+                        handler
+                            .body
+                            .iter()
+                            .any(Self::statement_needs_display_helper)
+                    })
+                    || orelse.iter().any(Self::statement_needs_display_helper)
+                    || finalbody.iter().any(Self::statement_needs_display_helper)
+            }
+            Stmt::Let { value, .. }
+            | Stmt::Assign { value, .. }
+            | Stmt::Destructure { value, .. }
+            | Stmt::Expr(value) => Self::value_needs_display_helper(value),
+            Stmt::FieldAssign { object, value, .. } => {
+                Self::value_needs_display_helper(object) || Self::value_needs_display_helper(value)
+            }
+            Stmt::IndexAssign { indices, value, .. } => {
+                indices.iter().any(Self::value_needs_display_helper)
+                    || Self::value_needs_display_helper(value)
+            }
+            Stmt::ListAppend { value, .. } | Stmt::Raise(Some(value)) => {
+                Self::value_needs_display_helper(value)
+            }
+            Stmt::With { body, .. } => body.iter().any(Self::statement_needs_display_helper),
+            Stmt::StructDef { .. }
+            | Stmt::Break
+            | Stmt::Continue
+            | Stmt::Raise(None)
+            | Stmt::Return(None) => false,
+            Stmt::Return(Some(value)) => Self::value_needs_display_helper(value),
+        }
+    }
+
+    fn value_needs_display_helper(value: &Value) -> bool {
+        match value {
+            Value::Bool(_)
+            | Value::Int(_)
+            | Value::Int128(_)
+            | Value::Float(_)
+            | Value::String(_) => false,
+            Value::Call {
+                return_type: Type::Bool | Type::Int | Type::Float | Type::String,
+                ..
+            }
+            | Value::Binary {
+                ty: Type::Bool | Type::Int | Type::Float | Type::String,
+                ..
+            } => false,
+            _ => true,
         }
     }
 
@@ -854,6 +1541,7 @@ impl RustCodegen {
                 match op {
                     tarvos_ir::UnaryOp::Neg => format!("-({})", operand),
                     tarvos_ir::UnaryOp::Not => format!("!({})", operand),
+                    tarvos_ir::UnaryOp::Invert => format!("!({})", operand),
                 }
             }
             Value::Binary {
@@ -874,6 +1562,14 @@ impl RustCodegen {
                         _ => return Err(anyhow::anyhow!("power requires numeric operands")),
                     });
                 }
+                if *op == BinaryOp::Mul && matches!(ty, Type::Array(_) | Type::String) {
+                    let (sequence, count) = if Self::is_sequence_value(left) {
+                        (left_str, right_str)
+                    } else {
+                        (right_str, left_str)
+                    };
+                    return Ok(format!("({}).repeat(({} as usize))", sequence, count));
+                }
                 if *op == BinaryOp::Div && *ty == Type::Int {
                     return Ok(format!(
                         "{}.checked_div({}).expect(\"ZeroDivisionError\")",
@@ -888,6 +1584,43 @@ impl RustCodegen {
                     return Ok(format!(
                         "if {} == 0_i64 {{ panic!(\"ZeroDivisionError\") }} else {{ ({} as f64) / ({} as f64) }}",
                         right_str, left_str, right_str
+                    ));
+                }
+                if *op == BinaryOp::FloorDiv && *ty == Type::Int {
+                    // Python `//` floors toward negative infinity; Rust `/` truncates.
+                    return Ok(format!(
+                        "{{ let __tarvos_dividend = {left_str}; let __tarvos_divisor = {right_str}; if __tarvos_divisor == 0_i64 {{ panic!(\"ZeroDivisionError: integer division or modulo by zero\") }} let __tarvos_quotient = __tarvos_dividend.checked_div(__tarvos_divisor).expect(\"integer division overflow\"); let __tarvos_remainder = __tarvos_dividend.checked_rem(__tarvos_divisor).expect(\"integer division overflow\"); if __tarvos_remainder != 0_i64 && ((__tarvos_remainder < 0_i64) != (__tarvos_divisor < 0_i64)) {{ __tarvos_quotient - 1_i64 }} else {{ __tarvos_quotient }} }}"
+                    ));
+                }
+                if *op == BinaryOp::FloorDiv && *ty == Type::Float {
+                    let left_str = if matches!(left.as_ref(), Value::Int(_)) {
+                        format!("({} as f64)", left_str)
+                    } else {
+                        left_str
+                    };
+                    let right_str = if matches!(right.as_ref(), Value::Int(_)) {
+                        format!("({} as f64)", right_str)
+                    } else {
+                        right_str
+                    };
+                    return Ok(format!("({} / {}).floor()", left_str, right_str));
+                }
+                if *op == BinaryOp::LShift || *op == BinaryOp::RShift {
+                    // Python shifts by a negative count raise ValueError. Counts larger
+                    // than the native i64 width saturate: `>>` yields 0 or -1 (the sign
+                    // extension), while `<<` can no longer be represented and panics.
+                    let fallback = if *op == BinaryOp::LShift {
+                        "unwrap_or_else(|| if __tarvos_shift_value == 0_i64 { 0_i64 } else { panic!(\"integer shift overflow: left shift exceeds the native i64 range\") })"
+                    } else {
+                        "unwrap_or_else(|| if __tarvos_shift_value < 0_i64 { -1_i64 } else { 0_i64 })"
+                    };
+                    let checked = if *op == BinaryOp::LShift {
+                        "checked_shl"
+                    } else {
+                        "checked_shr"
+                    };
+                    return Ok(format!(
+                        "{{ let __tarvos_shift_amount = {right_str}; if __tarvos_shift_amount < 0_i64 {{ panic!(\"ValueError: negative shift count\") }} let __tarvos_shift_value = {left_str}; __tarvos_shift_value.{checked}(__tarvos_shift_amount as u32).{fallback} }}"
                     ));
                 }
                 let op_str = op.symbol();
@@ -909,7 +1642,11 @@ impl RustCodegen {
                     format!("({} {} {})", left_str, op_str, right_str)
                 }
             }
-            Value::Call { function, args, .. } => {
+            Value::Call {
+                function,
+                args,
+                return_type,
+            } => {
                 let args_rendered = args
                     .iter()
                     .map(Self::emit_value)
@@ -932,9 +1669,16 @@ impl RustCodegen {
                     // print() used as an expression: use Python display semantics
                     "print" => format!("println!(\"{{}}\", {})", args_str),
                     "range" => match args_rendered.as_slice() {
-                        [stop] => format!("(0..{})", stop),
-                        [start, stop] => format!("({}..{})", start, stop),
-                        [start, stop, step] => format!("({}..{}).step_by({})", start, stop, step),
+                        [stop] => format!("(0..{stop})"),
+                        [start, stop] => format!("({start}..{stop})"),
+                        [start, stop, step] => Self::emit_range_step(
+                            start,
+                            stop,
+                            step,
+                            // `args` and `args_rendered` are parallel, so the same
+                            // index selects the step's static value.
+                            args.get(2),
+                        ),
                         _ => return Err(anyhow::anyhow!("range() requires 1 to 3 arguments")),
                     },
                     "len" => format!("({}.len() as i64)", args_str),
@@ -954,6 +1698,54 @@ impl RustCodegen {
                             seconds
                         ),
                         _ => return Err(anyhow::anyhow!("time.sleep() requires 1 argument")),
+                    },
+                    // `str` builtins: the receiver arrives first, so a borrow keeps
+                    // the call from moving out of the binding it came from.
+                    name if name.starts_with("tarvos_str_") => {
+                        Self::emit_str_builtin(name, &args_rendered)?
+                    }
+                    name if name.starts_with("tarvos_list_") => {
+                        Self::emit_list_builtin(name, &args_rendered)?
+                    }
+                    "tarvos_os_getcwd" => {
+                        if !args_rendered.is_empty() {
+                            return Err(anyhow::anyhow!("os.getcwd() takes no arguments"));
+                        }
+                        "std::env::current_dir().expect(\"os.getcwd() failed\").to_string_lossy().into_owned()"
+                            .to_string()
+                    }
+                    "tarvos_os_listdir" => match args_rendered.as_slice() {
+                        [] => "std::fs::read_dir(\".\").expect(\"os.listdir() failed\").filter_map(|entry| entry.ok()).filter_map(|entry| entry.file_name().into_string().ok()).collect::<Vec<String>>()".to_string(),
+                        [path] => format!(
+                            "std::fs::read_dir({}).expect(\"os.listdir() failed\").filter_map(|entry| entry.ok()).filter_map(|entry| entry.file_name().into_string().ok()).collect::<Vec<String>>()",
+                            path
+                        ),
+                        _ => return Err(anyhow::anyhow!("os.listdir() takes at most 1 argument")),
+                    },
+                    "tarvos_os_mkdir" => match args_rendered.as_slice() {
+                        [path] => format!(
+                            "std::fs::create_dir({}).expect(\"os.mkdir() failed\")",
+                            path
+                        ),
+                        _ => return Err(anyhow::anyhow!("os.mkdir() requires 1 argument")),
+                    },
+                    "tarvos_os_makedirs" => match args_rendered.as_slice() {
+                        [path] => format!(
+                            "std::fs::create_dir_all({}).expect(\"os.makedirs() failed\")",
+                            path
+                        ),
+                        [path, exist_ok] => format!(
+                            "if {} {{ std::fs::create_dir_all({}).expect(\"os.makedirs() failed\") }} else {{ std::fs::create_dir({}).expect(\"os.makedirs() failed\") }}",
+                            exist_ok, path, path
+                        ),
+                        _ => return Err(anyhow::anyhow!("os.makedirs() requires 1 or 2 arguments")),
+                    },
+                    "tarvos_os_chdir" => match args_rendered.as_slice() {
+                        [path] => format!(
+                            "std::env::set_current_dir({}).expect(\"os.chdir() failed\")",
+                            path
+                        ),
+                        _ => return Err(anyhow::anyhow!("os.chdir() requires 1 argument")),
                     },
                     "tarvos_math_sqrt"
                     | "tarvos_math_sin"
@@ -1081,6 +1873,12 @@ impl RustCodegen {
                         _ => format!("std::cmp::max({})", args_str),
                     },
                     "sum" => format!("{}.iter().sum::<i64>()", args_str),
+                    name
+                        if name.starts_with("__tarvos_list_from_")
+                            | name.starts_with("__tarvos_sorted_from_") =>
+                    {
+                        Self::emit_list_or_sorted_call(name, args, &args_rendered, return_type)?
+                    },
                     "__ternary" => match args_rendered.as_slice() {
                         [test, body, orelse] => format!("(if {} {{ {} }} else {{ {} }})", test, body, orelse),
                         _ => return Err(anyhow::anyhow!("__ternary requires 3 arguments")),
@@ -1095,7 +1893,16 @@ impl RustCodegen {
                     }
                 }
             }
-            Value::List { elements, .. } => {
+            Value::List {
+                elements,
+                element_type,
+            } => {
+                if elements.is_empty() && *element_type == Type::Unknown {
+                    // `list()` with no evidence keeps `Unknown` so validation can
+                    // still reject it as dynamic; emission annotates the vec so
+                    // the display helper resolves without guessing the element.
+                    return Ok("Vec::<i64>::new()".to_string());
+                }
                 let elements_str = elements
                     .iter()
                     .map(Self::emit_value)
@@ -1112,16 +1919,30 @@ impl RustCodegen {
             } => {
                 let iter_str = Self::emit_value(iter)?;
                 let element_str = Self::emit_value(element)?;
+                // Python iterates a `str` by character and a `dict` by key, which
+                // is not what Rust's `into_iter` does for those types.
+                let sequence = match iter.as_ref() {
+                    Value::String(_) | Value::FormatString { .. } => {
+                        format!("{iter_str}.chars().map(|__tarvos_ch| __tarvos_ch.to_string())")
+                    }
+                    Value::Call {
+                        return_type: Type::String,
+                        ..
+                    } => {
+                        format!("{iter_str}.chars().map(|__tarvos_ch| __tarvos_ch.to_string())")
+                    }
+                    Value::Dict { .. } => format!("{iter_str}.keys().cloned()"),
+                    _ => iter_str,
+                };
                 let mapped = if let Some(condition) = condition {
                     let condition_str = Self::emit_value(condition)?;
                     format!(
-                        "{}.into_iter().filter_map(|{}| if {} {{ Some({}) }} else {{ None }})",
-                        iter_str, target, condition_str, element_str
+                        "{sequence}.into_iter().filter_map(|{target}| if {condition_str} {{ Some({element_str}) }} else {{ None }})"
                     )
                 } else {
-                    format!("{}.into_iter().map(|{}| {})", iter_str, target, element_str)
+                    format!("{sequence}.into_iter().map(|{target}| {element_str})")
                 };
-                format!("{}.collect::<Vec<_>>()", mapped)
+                format!("{mapped}.collect::<Vec<_>>()")
             }
             Value::Tuple { elements, .. } => {
                 let elements_str = elements
@@ -1153,18 +1974,28 @@ impl RustCodegen {
                 container,
                 index,
                 container_type,
-                ..
+                element_type,
             } => {
                 let container_str = Self::emit_value(container)?;
                 let index_str = Self::emit_value(index)?;
                 if matches!(container_type, Type::Dict { .. }) {
-                    format!("{}[&{}]", container_str, index_str)
-                } else if let (Type::Tuple(_), Value::Int(index)) = (container_type, index.as_ref())
-                {
-                    format!("{}.{}", container_str, index)
-                } else {
-                    format!("{}[({} as usize)]", container_str, index_str)
+                    // A `HashMap` lookup already yields a reference, so reading a
+                    // non-`Copy` value out of it still needs an owned copy.
+                    return Ok(Self::clone_if_owned(
+                        format!("{}[&{index_str}]", container_str),
+                        element_type,
+                    ));
                 }
+                if let (Type::Tuple(_), Value::Int(index)) = (container_type, index.as_ref()) {
+                    return Ok(Self::clone_if_owned(
+                        format!("{container_str}.{index}"),
+                        element_type,
+                    ));
+                }
+                Self::clone_if_owned(
+                    format!("{container_str}[({index_str} as usize)]"),
+                    element_type,
+                )
             }
             Value::Slice {
                 container,
@@ -1207,14 +2038,25 @@ impl RustCodegen {
                             format_spec,
                             conversion,
                         } => {
-                            let rendered_spec = format_spec
+                            let grouped = format_spec
                                 .as_deref()
-                                .map(Self::rust_format_spec)
-                                .unwrap_or_default();
+                                .map(Self::python_grouping_separator)
+                                .transpose()?
+                                .flatten();
+                            let rendered_spec = match (grouped, format_spec.as_deref()) {
+                                (Some(_), _) | (None, None) => String::new(),
+                                (None, Some(spec)) => Self::rust_format_spec(spec),
+                            };
                             format_string.push('{');
                             format_string.push_str(&rendered_spec);
                             format_string.push('}');
-                            let rendered = Self::emit_value(value)?;
+                            let mut rendered = Self::emit_value(value)?;
+                            if let Some(separator) = grouped {
+                                rendered = format!(
+                                    "__tarvos_group_numeric({}, '{}')",
+                                    rendered, separator
+                                );
+                            }
                             args.push(match conversion.as_deref() {
                                 Some("r") | Some("a") => format!("{:?}", rendered),
                                 _ => rendered,
@@ -1229,6 +2071,237 @@ impl RustCodegen {
                 }
             }
         })
+    }
+
+    /// Clone an indexed read when its element type is not `Copy`.
+    ///
+    /// Rust cannot move a `String` out of a `Vec` or a `HashMap` by index, so
+    /// the read has to produce an owned value. Copy-like element types are left
+    /// alone so numeric loops keep their zero-copy access.
+    fn clone_if_owned(expression: String, element_type: &Type) -> String {
+        match element_type {
+            Type::Int | Type::Float | Type::Bool | Type::None | Type::Unknown => expression,
+            Type::String
+            | Type::Array(_)
+            | Type::Dict { .. }
+            | Type::Tuple(_)
+            | Type::Object(_) => {
+                format!("{expression}.clone()")
+            }
+        }
+    }
+
+    /// Whether a three-argument `range` step can use the allocation-free
+    /// `step_by` form.
+    ///
+    /// Both the prelude decision and the emitted expression consult this, so a
+    /// step can never be classified one way when choosing the helper and another
+    /// way when choosing the call — that mismatch emits a program referencing an
+    /// undefined function.
+    fn range_step_is_positive_literal(step: Option<&Value>) -> bool {
+        match step {
+            // The literal must also fit in `usize` on the target: on a 32-bit host
+            // a larger positive step would wrap, and `step_by` would then skip a
+            // different number of elements than Python does.
+            Some(Value::Int(size)) if *size > 0 => usize::try_from(*size).is_ok(),
+            _ => false,
+        }
+    }
+
+    /// Emit a three-argument `range(start, stop, step)`.
+    ///
+    /// Rust's `Range` only counts up and `step_by` only accepts a `usize`, so the
+    /// step is the whole difficulty here. Python's `range` counts *down* for a
+    /// negative step and rejects a zero step; casting the step to `usize` would
+    /// silently turn `range(10, 0, -2)` into an empty range rather than an error.
+    ///
+    /// A statically positive literal step is the one case where `step_by` is
+    /// provably equivalent, and it is the shape that keeps the loop
+    /// allocation-free, so it is emitted directly. Every other step goes through
+    /// [`RANGE_RUNTIME`], which implements Python's semantics exactly.
+    fn emit_range_step(start: &str, stop: &str, step: &str, step_value: Option<&Value>) -> String {
+        if Self::range_step_is_positive_literal(step_value) {
+            return format!("({start}..{stop}).step_by({step} as usize)");
+        }
+        format!("tarvos_range({start}, {stop}, {step})")
+    }
+
+    /// Emit a call to one of the `str` runtime helpers.
+    ///
+    /// `args_rendered[0]` is always the receiver. It is passed by reference so a
+    /// call never moves out of the binding it was read from, which matters for
+    /// `name = name.strip()`-style rebinds.
+    fn emit_str_builtin(name: &str, args_rendered: &[String]) -> Result<String> {
+        let [receiver, rest @ ..] = args_rendered else {
+            return Err(anyhow::anyhow!("{name}() is missing its receiver"));
+        };
+        let borrowed = format!("(&{receiver})");
+        Ok(match (name, rest) {
+            ("tarvos_str_split", []) => format!("tarvos_str_split({borrowed}, None)"),
+            ("tarvos_str_split", [separator]) => {
+                format!("tarvos_str_split({borrowed}, Some(&{separator}))")
+            }
+            // `join` takes the separator as its receiver, matching `sep.join(items)`.
+            ("tarvos_str_join", [items]) => {
+                format!("tarvos_str_join(&{receiver}, &{items})")
+            }
+            ("tarvos_str_replace", [from, to]) => {
+                format!("tarvos_str_replace({borrowed}, &{from}, &{to})")
+            }
+            // The padding helpers take a width, not a substring.
+            (
+                "tarvos_str_ljust" | "tarvos_str_rjust" | "tarvos_str_zfill" | "tarvos_str_center",
+                [width],
+            ) => format!("{name}({borrowed}, ({width}) as i64)"),
+            (
+                "tarvos_str_startswith"
+                | "tarvos_str_endswith"
+                | "tarvos_str_count"
+                | "tarvos_str_find"
+                | "tarvos_str_rfind"
+                | "tarvos_str_index",
+                [argument],
+            ) => {
+                format!("{name}({borrowed}, &{argument})")
+            }
+            (_, []) => format!("{name}({borrowed})"),
+            (_, arguments) => {
+                return Err(anyhow::anyhow!(
+                    "{name}() takes {} argument(s) but {} were given",
+                    arguments.len(),
+                    arguments.len()
+                ))
+            }
+        })
+    }
+
+    /// Emit a call to one of the `list` runtime helpers.
+    ///
+    /// Mutating methods take `&mut`, so the receiver is reborrowed in place and
+    /// the call keeps its `Vec`'s existing binding.
+    fn emit_list_builtin(name: &str, args_rendered: &[String]) -> Result<String> {
+        let [receiver, rest @ ..] = args_rendered else {
+            return Err(anyhow::anyhow!("{name}() is missing its receiver"));
+        };
+        let borrowed = format!("(&mut {receiver})");
+        Ok(match (name, rest) {
+            ("tarvos_list_extend", [items]) => {
+                format!("tarvos_list_extend({borrowed}, &{items})")
+            }
+            ("tarvos_list_insert", [index, value]) => {
+                format!("tarvos_list_insert({borrowed}, ({index}) as i64, {value})")
+            }
+            ("tarvos_list_remove", [value])
+            | ("tarvos_list_index", [value])
+            | ("tarvos_list_count", [value]) => {
+                let view = format!("(&{receiver}[..])");
+                format!("{name}({view}, {value})")
+            }
+            ("tarvos_list_pop", []) => format!("tarvos_list_pop({borrowed})"),
+            (_, []) => format!("{name}({borrowed})"),
+            (_, arguments) => {
+                return Err(anyhow::anyhow!(
+                    "{name}() does not accept {} argument(s) natively",
+                    arguments.len()
+                ))
+            }
+        })
+    }
+
+    /// Emit `list(arg)` / `sorted(arg)` from a kind-tagged lowering call.
+    ///
+    /// The lowering stage already proved the argument is a supported iterable
+    /// and stored the element type in the call's own return type, so codegen
+    /// dispatches on the `__tarvos_list_from_<kind>` /
+    /// `__tarvos_sorted_from_<kind>` name instead of re-deriving the type from
+    /// a bare `Name`. `range()` is collected, `str` splits into one-character
+    /// strings, `dict` yields its keys, and an existing `Vec` is cloned.
+    /// `sorted()` then sorts in place; `f64` uses `total_cmp` because it is not
+    /// `Ord`. The block keeps the value an expression so `y = sorted(xs)` is
+    /// still one binding.
+    fn emit_list_or_sorted_call(
+        name: &str,
+        args: &[Value],
+        args_rendered: &[String],
+        return_type: &Type,
+    ) -> Result<String> {
+        let (is_sorted, kind) = name
+            .strip_prefix("__tarvos_list_from_")
+            .map(|kind| (false, kind))
+            .or_else(|| {
+                name.strip_prefix("__tarvos_sorted_from_")
+                    .map(|kind| (true, kind))
+            })
+            .ok_or_else(|| anyhow::anyhow!("{name}() is not a supported native list conversion"))?;
+        if args.len() != 1 || args_rendered.len() != 1 {
+            let builtin = if is_sorted { "sorted()" } else { "list()" };
+            return Err(anyhow::anyhow!(
+                "{builtin} takes at most 1 argument ({} given)",
+                args_rendered.len()
+            ));
+        }
+        let rendered = &args_rendered[0];
+        let element = match return_type {
+            Type::Array(element) => (**element).clone(),
+            other => {
+                let builtin = if is_sorted { "sorted()" } else { "list()" };
+                return Err(anyhow::anyhow!(
+                    "{builtin} argument of type {other} is not a supported native iterable; use --python-fallback"
+                ));
+            }
+        };
+        // `list(d)` over a dict is insertion-ordered in Python but HashMap
+        // iteration is not; only the sorted form is deterministic natively.
+        if !is_sorted && kind == "dict" {
+            return Err(anyhow::anyhow!(
+                "list() over a dict is not supported natively because HashMap iteration order differs from Python insertion order; use sorted() for a deterministic order or --python-fallback"
+            ));
+        }
+        let materialized = match kind {
+            "range" => format!("({rendered}).into_iter().collect::<Vec<_>>()"),
+            "str" => format!(
+                "({rendered}).chars().map(|__tarvos_ch| __tarvos_ch.to_string()).collect::<Vec<_>>()"
+            ),
+            "dict" => format!("({rendered}).keys().cloned().collect::<Vec<_>>()"),
+            "vec" => format!("({rendered}).clone()"),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "{name}() is not a supported native list conversion"
+                ));
+            }
+        };
+        if !is_sorted {
+            return Ok(materialized);
+        }
+        Ok(match element {
+            Type::Float => format!(
+                "{{ let mut __tarvos_sorted = {materialized}; __tarvos_sorted.sort_by(|__tarvos_l, __tarvos_r| __tarvos_l.total_cmp(__tarvos_r)); __tarvos_sorted }}"
+            ),
+            Type::Unknown => {
+                return Err(anyhow::anyhow!(
+                    "sorted() argument has an unknown element type; bind it to a typed list first or use --python-fallback"
+                ));
+            }
+            _ => format!(
+                "{{ let mut __tarvos_sorted = {materialized}; __tarvos_sorted.sort(); __tarvos_sorted }}"
+            ),
+        })
+    }
+
+    /// Python's numeric grouping flag (`f"{value:,}"` / `f"{value:_}"`) has no Rust
+    /// `format!` equivalent. Return the separator when the specification is exactly a
+    /// grouping flag, and an explicit diagnostic for richer grouped specifications.
+    fn python_grouping_separator(spec: &str) -> Result<Option<char>> {
+        if !spec.contains(',') && !spec.contains('_') {
+            return Ok(None);
+        }
+        match spec {
+            "," => Ok(Some(',')),
+            "_" => Ok(Some('_')),
+            _ => Err(anyhow::anyhow!(
+                "unsupported feature: f-string grouping is only supported for the plain `,` and `_` format specifications"
+            )),
+        }
     }
 
     fn rust_format_spec(spec: &str) -> String {
@@ -1517,6 +2590,71 @@ mod tests {
         let code = RustCodegen::generate(&module).unwrap();
         assert!(code.contains("\"True\""), "True not found in:\n{}", code);
         assert!(code.contains("\"False\""), "False not found in:\n{}", code);
+    }
+
+    #[test]
+    fn range_step_selects_step_by_only_for_positive_literals() {
+        // `step_by` needs a `usize`, but a negative or unknown step has to take
+        // the exact path: casting it would silently produce an empty range.
+        let range_loop = |step: Value| Module {
+            statements: vec![Stmt::For {
+                target: "i".to_string(),
+                iter: Value::Call {
+                    function: "range".to_string(),
+                    args: vec![Value::Int(0), Value::Int(20), step],
+                    return_type: Type::Array(Box::new(Type::Int)),
+                },
+                iter_type: Type::Array(Box::new(Type::Int)),
+                body: vec![Stmt::Break],
+            }],
+        };
+
+        let positive = RustCodegen::generate(&range_loop(Value::Int(7))).unwrap();
+        assert!(
+            positive.contains("(0_i64..20_i64).step_by(7_i64 as usize)"),
+            "positive literal step should use step_by:\n{positive}"
+        );
+        assert!(
+            !positive.contains("fn tarvos_range"),
+            "the exact fallback should not be emitted when unused:\n{positive}"
+        );
+
+        for negative_or_unknown in [Value::Int(-7), Value::Name("stride".to_string())] {
+            let code = RustCodegen::generate(&range_loop(negative_or_unknown)).unwrap();
+            assert!(
+                code.contains("tarvos_range(0_i64, 20_i64,"),
+                "non-positive step should use the exact helper:\n{code}"
+            );
+            assert!(
+                code.contains("fn tarvos_range"),
+                "the exact helper must be present in the prelude:\n{code}"
+            );
+            assert!(
+                !code.contains("step_by"),
+                "step_by must not be used for a non-positive step:\n{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn range_step_helper_is_not_emitted_without_a_stepped_range() {
+        let module = Module {
+            statements: vec![Stmt::For {
+                target: "i".to_string(),
+                iter: Value::Call {
+                    function: "range".to_string(),
+                    args: vec![Value::Int(5)],
+                    return_type: Type::Array(Box::new(Type::Int)),
+                },
+                iter_type: Type::Array(Box::new(Type::Int)),
+                body: vec![Stmt::Break],
+            }],
+        };
+        let code = RustCodegen::generate(&module).unwrap();
+        assert!(
+            !code.contains("tarvos_range"),
+            "a one-argument range must not pull in the helper:\n{code}"
+        );
     }
 
     #[test]

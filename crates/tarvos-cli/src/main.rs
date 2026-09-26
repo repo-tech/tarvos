@@ -8,6 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+mod ai_probe;
 mod commands;
 use commands::{
     analyze_command, benchmark_command, clean_command, doctor_command, export_command,
@@ -15,10 +16,7 @@ use commands::{
 };
 use tarvos_analysis::analyze_module;
 use tarvos_analysis::native_detector::{ModuleReport, NativePlan, NativeSubsetDetector};
-use tarvos_analysis::native_specialization::{
-    specialize_module, wire_specialization_runtime, SpecializedLoop,
-};
-use tarvos_analysis::vectorize::{detect_vector_plans, emit_runtime_helpers};
+use tarvos_analysis::native_specialization::{specialize_module, SpecializedLoop};
 use tarvos_core::{
     export_python_ast as core_export_python_ast, find_python_command as core_find_python_command,
     CompilePipeline,
@@ -94,8 +92,8 @@ enum Commands {
         #[arg(value_name = "FILE.py")]
         input: PathBuf,
 
-        /// Fall back to the CPython runtime if native compilation is unsupported
-        #[arg(long)]
+        /// Force the compatibility runtime instead of attempting native compilation first.
+        #[arg(long = "python-fallback", alias = "compat-runtime")]
         python_fallback: bool,
 
         /// Arguments to pass to the executed binary
@@ -116,6 +114,17 @@ enum Commands {
 
     /// Run environment diagnostics and check toolchain dependencies (Python, Rust, Cargo, Linker)
     Doctor,
+
+    /// Report the optional local AI capability (Ollama).
+    ///
+    /// Read-only: never starts, stops, downloads, or reconfigures anything, and
+    /// only ever contacts a loopback endpoint. Records ownership so a later
+    /// repair or uninstall step knows what Tarvos is allowed to touch.
+    AiStatus {
+        /// Emit machine-readable JSON instead of the human-readable report
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Static analysis and complexity profiling of a Python module
     Analyze {
@@ -243,9 +252,9 @@ fn main() -> Result<()> {
             let mut args = vec![input.to_string_lossy().to_string()];
             args.extend(extra);
             if python_fallback {
-                hybrid_run_mode(&args)
+                python_mode(&args)
             } else {
-                run_mode(&args)
+                hybrid_run_mode(&args)
             }
         }
         Some(Commands::Python { input, args: extra }) => {
@@ -254,6 +263,7 @@ fn main() -> Result<()> {
             python_mode(&args)
         }
         Some(Commands::Doctor) => doctor_command(&[]),
+        Some(Commands::AiStatus { json }) => ai_status_mode(json),
         Some(Commands::Analyze {
             input,
             hot_functions,
@@ -339,9 +349,19 @@ pub(crate) fn compile_mode(args: &[String]) -> Result<()> {
     let working_dir = env::current_dir()?;
     let input_path = secure_input_path(input_file, &working_dir)?;
     let output_path = secure_output_path(&output_file, &working_dir)?;
-    let rust_source = match target.as_str() {
-        "native" => transpile_python_to_rust(&input_path)?,
-        "embedded" => CompilePipeline::transpile_file_embedded(&input_path)?,
+    let (rust_source, compatibility_launcher) = match target.as_str() {
+        "native" => match transpile_python_to_rust(&input_path) {
+            Ok(source) => (source, false),
+            Err(error) if is_dynamic_native_error(&error) => {
+                warn_native_fallback(&error);
+                (compatibility_launcher_source(&input_path)?, true)
+            }
+            Err(error) => return Err(error),
+        },
+        "embedded" => (
+            CompilePipeline::transpile_file_embedded(&input_path)?,
+            false,
+        ),
         other => {
             return Err(anyhow::anyhow!(
                 "unsupported target `{other}`; choose `native` or `embedded`"
@@ -363,7 +383,11 @@ pub(crate) fn compile_mode(args: &[String]) -> Result<()> {
 
     println!("\n=== Compilation Successful ===\n");
     println!("Output: {}", output_path.display());
-    println!("Mode: source-only pipeline (Rust toolchain not required)");
+    if compatibility_launcher {
+        println!("Mode: compatibility launcher (requires Python at execution time)");
+    } else {
+        println!("Mode: native Rust pipeline (Python runtime not required)");
+    }
 
     if !source_only
         && (format == "exe" || output_path.extension().and_then(|s| s.to_str()) == Some("exe"))
@@ -402,7 +426,14 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
     let working_dir = env::current_dir()?;
     let input_path = secure_input_path(input_file, &working_dir)?;
     let output_path = secure_output_path(&output_file, &working_dir)?;
-    let rust_source = transpile_python_to_rust(&input_path)?;
+    let (rust_source, compatibility_launcher) = match transpile_python_to_rust(&input_path) {
+        Ok(source) => (source, false),
+        Err(error) if is_dynamic_native_error(&error) => {
+            warn_native_fallback(&error);
+            (compatibility_launcher_source(&input_path)?, true)
+        }
+        Err(error) => return Err(error),
+    };
     let rust_output = output_path.with_extension("rs");
 
     if source_only {
@@ -414,7 +445,14 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
 
     match compile_rust_binary(&output_path, &rust_source) {
         Ok(()) => {
-            println!("Build complete: {}", output_path.display());
+            if compatibility_launcher {
+                println!(
+                    "Compatibility launcher built: {} (requires Python at execution time)",
+                    output_path.display()
+                );
+            } else {
+                println!("Build complete: {}", output_path.display());
+            }
             Ok(())
         }
         Err(err) => {
@@ -592,11 +630,6 @@ fn copy_project_assets(root: &Path, destination: &Path, entry: &Path) -> Result<
     }
     fs::create_dir_all(destination)?;
     visit(root, root, destination, entry)
-}
-
-pub(crate) fn run_mode(args: &[String]) -> Result<()> {
-    let (exe_path, runtime_args) = prepare_native_run(args)?;
-    execute_native_run(&exe_path, &runtime_args)
 }
 
 fn prepare_native_run(args: &[String]) -> Result<(PathBuf, Vec<String>)> {
@@ -861,12 +894,76 @@ pub(crate) fn hybrid_run_mode(args: &[String]) -> Result<()> {
     let (exe_path, runtime_args) = match prepare_native_run(args) {
         Ok(result) => result,
         Err(native_error) => {
-            eprintln!("Native subset compilation unavailable: {}", native_error);
-            eprintln!("Falling back to CPython compatibility runtime (--python-fallback).");
-            return python_mode(args);
+            eprintln!(
+                "Running with the local Python runtime ({})",
+                summarize_native_error(&native_error)
+            );
+            let result = prepare_compatibility_run(args)?;
+            return execute_native_run(&result.0, &result.1);
         }
     };
     execute_native_run(&exe_path, &runtime_args)
+}
+
+fn prepare_compatibility_run(args: &[String]) -> Result<(PathBuf, Vec<String>)> {
+    let input_file = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("usage: tarvos run <file.py> [args...]"))?;
+    let working_dir = env::current_dir()?;
+    let input_path = secure_input_path(input_file, &working_dir)?;
+    let source = fs::read(&input_path)
+        .with_context(|| format!("failed to read {}", input_path.display()))?;
+    let cache_dir = tarvos_cache_dir()?.join("runs");
+    fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("failed to create {}", cache_dir.display()))?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    "tarvos-compat-run-v1".hash(&mut hasher);
+    input_path
+        .canonicalize()
+        .unwrap_or_else(|_| input_path.clone())
+        .to_string_lossy()
+        .hash(&mut hasher);
+    source.hash(&mut hasher);
+    let exe_path = cache_dir.join(format!(
+        "{}-compat-{:016x}{}",
+        input_path.file_stem().unwrap_or_default().to_string_lossy(),
+        hasher.finish(),
+        if cfg!(windows) { ".exe" } else { "" }
+    ));
+    if exe_path.is_file() {
+    } else {
+        let rust_source = compatibility_launcher_source(&input_path)?;
+        compile_rust_binary_opt(&exe_path, &rust_source, true)?;
+    }
+    Ok((exe_path, args[1..].to_vec()))
+}
+
+fn warn_native_fallback(error: &anyhow::Error) {
+    eprintln!(
+        "Native subset unavailable ({}); emitting a compatibility launcher that requires Python at execution time.",
+        summarize_native_error(error)
+    );
+    eprintln!("Native diagnostic: {error:#}");
+}
+
+fn summarize_native_error(error: &anyhow::Error) -> String {
+    let text = error.to_string();
+    if let Some((_, details)) = text.split_once("source requires unsupported native Python syntax:")
+    {
+        let count = details
+            .lines()
+            .filter(|line| line.starts_with("unsupported "))
+            .count();
+        return if count == 0 {
+            "dynamic Python features detected".to_string()
+        } else {
+            format!("{count} dynamic Python construct(s) detected")
+        };
+    }
+    text.lines()
+        .next()
+        .unwrap_or("native compilation failed")
+        .to_string()
 }
 
 fn analyze_hot_functions(args: &[String]) -> Result<()> {
@@ -910,6 +1007,8 @@ pub(crate) fn python_mode(args: &[String]) -> Result<()> {
     let input_path = secure_input_path(input_file, &working_dir)?;
     let python = find_python_command()?;
     let status = Command::new(&python)
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
         .arg(&input_path)
         .args(&args[1..])
         .current_dir(&working_dir)
@@ -975,7 +1074,124 @@ pub(crate) fn doctor_mode(_args: &[String]) -> Result<()> {
         env::current_dir()?.display()
     );
     println!("  [✓] Transpiler Architecture: Native AST Visitor + IR Lowering + Dead-Code & Induction Optimizer");
+
+    // The local AI capability is optional, so it is reported and never required.
+    // `doctor` stays read-only: probing must not start or stop a service.
+    print_ai_capability_status();
+
     println!("\nDiagnostics complete: All core capabilities verified.\n");
+    Ok(())
+}
+
+/// Directory holding Tarvos state that must outlive the build cache.
+///
+/// Follows the same resolution as [`tarvos_cache_dir`] — `USERPROFILE` on
+/// Windows, `HOME` elsewhere — so state is per-user and never needs elevation.
+fn ai_state_dir() -> Result<PathBuf> {
+    let home = if cfg!(windows) {
+        env::var_os("USERPROFILE")
+    } else {
+        env::var_os("HOME")
+    }
+    .map(PathBuf::from)
+    .ok_or_else(|| anyhow::anyhow!("could not determine the current user's home directory"))?;
+    Ok(home.join(".tarvos"))
+}
+
+fn ai_state_path() -> Result<PathBuf> {
+    Ok(ai_state_dir()?.join("ai-capability.json"))
+}
+
+/// Render the capability report.
+///
+/// A missing capability is stated plainly rather than dressed up as a failure:
+/// the compiler is fully functional without it, and a user should not go
+/// looking for a broken install that is working exactly as intended.
+fn ai_status_lines(capability: &ai_probe::AiCapability) -> Vec<String> {
+    let mut lines = Vec::new();
+    if capability.is_usable() {
+        lines.push("  [✓] Local AI (Ollama): available (optional)".to_string());
+    } else {
+        lines.push("  [-] Local AI (Ollama): not available (optional; not required)".to_string());
+    }
+    lines.push(format!("      endpoint: {}", capability.endpoint));
+    if let Some(path) = &capability.binary_path {
+        lines.push(format!("      binary: {}", path.display()));
+    }
+    lines.push(format!(
+        "      ownership: {}",
+        ai_probe::describe_ownership(capability.ownership)
+    ));
+    if capability.models.is_empty() {
+        lines.push("      models: none reported".to_string());
+    } else {
+        lines.push(format!("      models: {}", capability.models.join(", ")));
+    }
+    if let Some(note) = &capability.note {
+        lines.push(format!("      note: {note}"));
+    }
+    lines
+}
+
+/// Probe the capability and refresh the recorded state, reporting nothing when
+/// state cannot be written.
+fn print_ai_capability_status() {
+    let Ok(path) = ai_state_path() else {
+        return;
+    };
+    let previous = ai_probe::AiState::read(&path);
+    let capability = ai_probe::probe();
+    for line in ai_status_lines(&capability) {
+        println!("{line}");
+    }
+    if let Err(error) = ai_probe::AiState::from_probe(&capability, previous.as_ref()).write(&path) {
+        eprintln!(
+            "      [!] could not record capability state at {}: {error}",
+            path.display()
+        );
+    }
+}
+
+/// `tarvos ai-status` — report the optional local AI capability.
+///
+/// Exits successfully whether or not the capability exists: it is optional, and
+/// the installer calls this to record state, so a non-zero status here would
+/// wrongly signal a failed installation.
+pub(crate) fn ai_status_mode(json: bool) -> Result<()> {
+    let path = ai_state_path()?;
+    let previous = ai_probe::AiState::read(&path);
+    let capability = ai_probe::probe();
+    let state = ai_probe::AiState::from_probe(&capability, previous.as_ref());
+
+    if json {
+        let report = serde_json::json!({
+            "schema": state.schema,
+            "ownership": state.ownership,
+            "usable": capability.is_usable(),
+            "binary_path": state.binary_path,
+            "endpoint": state.endpoint,
+            "service_reachable": state.service_reachable,
+            "models": state.models,
+            "note": capability.note,
+            "checked_at_unix": state.checked_at_unix,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("=== Tarvos Local AI Capability ===\n");
+        for line in ai_status_lines(&capability) {
+            println!("{line}");
+        }
+        println!("\n  This capability is optional. Tarvos compiles without it.");
+    }
+
+    // A read-only probe must not fail the command just because the state file
+    // could not be written (read-only home, locked-down environment).
+    if let Err(error) = state.write(&path) {
+        eprintln!(
+            "  [!] could not record capability state at {}: {error}",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -985,7 +1201,10 @@ fn transpile_python_to_rust(input_path: &Path) -> Result<String> {
         .with_context(|| format!("failed to create cache directory {}", cache_dir.display()))?;
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    "tarvos-cache-v1.0-r9-len-i64-classes-fallback".hash(&mut hasher);
+    // The epoch ties every cached verdict (including "unsupported") to the build that
+    // produced it. Without it, a dynamic-python verdict written before a compiler fix
+    // would keep forcing the CPython fallback long after the gap was closed.
+    native_cache_epoch().hash(&mut hasher);
     input_path
         .canonicalize()
         .unwrap_or_else(|_| input_path.to_path_buf())
@@ -996,6 +1215,7 @@ fn transpile_python_to_rust(input_path: &Path) -> Result<String> {
         &mut hasher,
     )?;
     let cache_path = cache_dir.join(format!("{:016x}.rs", hasher.finish()));
+    let unsupported_path = cache_path.with_extension("unsupported");
 
     if cache_path.is_file() {
         println!("Using cached native translation: {}", cache_path.display());
@@ -1003,17 +1223,28 @@ fn transpile_python_to_rust(input_path: &Path) -> Result<String> {
             format!("failed to read cached translation {}", cache_path.display())
         });
     }
+    if unsupported_path.is_file() {
+        return Err(anyhow::anyhow!(
+            "cached native translation unavailable: dynamic Python features detected"
+        ));
+    }
 
-    let rust_source = CompilePipeline::transpile_file(input_path)?;
-    let source = fs::read_to_string(input_path)
-        .with_context(|| format!("failed to read {}", input_path.display()))?;
-    let ast_json = export_python_ast(&source)?;
-    let module = parse_python_ast(&ast_json)?;
-    let detected = NativeSubsetDetector::default().analyze(&module);
-    let specialization = specialize_module(&module, &detected);
-    let rust_source = wire_specialization_runtime(&rust_source, &specialization);
-    let vector_plans = detect_vector_plans(&module);
-    let rust_source = format!("{}\n{}", rust_source, emit_runtime_helpers(&vector_plans));
+    let rust_source = match CompilePipeline::transpile_file(input_path) {
+        Ok(source) => source,
+        Err(error) => {
+            fs::write(
+                &unsupported_path,
+                format!("unsupported by Tarvos build {}", native_cache_epoch()),
+            )
+            .with_context(|| {
+                format!(
+                    "failed to write compatibility cache {}",
+                    unsupported_path.display()
+                )
+            })?;
+            return Err(error);
+        }
+    };
     fs::write(&cache_path, &rust_source).with_context(|| {
         format!(
             "failed to write cached translation {}",
@@ -1022,6 +1253,73 @@ fn transpile_python_to_rust(input_path: &Path) -> Result<String> {
     })?;
     println!("Cached native translation: {}", cache_path.display());
     Ok(rust_source)
+}
+
+fn is_dynamic_native_error(error: &anyhow::Error) -> bool {
+    let text = error.to_string();
+    text.contains("source requires unsupported native Python syntax")
+        || text.contains("cached native translation unavailable")
+        || text.contains("dynamic type in native")
+        || text.contains("unsupported feature")
+}
+
+fn compatibility_launcher_source(input_path: &Path) -> Result<String> {
+    let source_path = input_path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", input_path.display()))?;
+    let mut source_text = source_path.to_string_lossy().into_owned();
+    if source_text.starts_with(r"\\?\") {
+        source_text = source_text[4..].to_string();
+    }
+    let source_literal = serde_json::to_string(&source_text.replace('\\', "/"))
+        .context("failed to encode compatibility source path")?;
+    Ok(format!(
+        r#"use std::process::Command;
+
+fn main() {{
+    let source = {source_literal};
+    let mut command = Command::new("python");
+    command.arg(source).args(std::env::args().skip(1));
+    command.env("PYTHONIOENCODING", "utf-8").env("PYTHONUTF8", "1");
+    let status = command.status().expect("failed to start Python compatibility runtime");
+    std::process::exit(status.code().unwrap_or(1));
+}}
+"#
+    ))
+}
+
+/// Identity of this Tarvos build for translation-cache keys.
+///
+/// Hashing the version plus the running executable's size, modification time,
+/// *and contents* means every rebuild invalidates cached translations and
+/// cached "unsupported" verdicts, so a newly supported construct is retried
+/// instead of reusing the old answer. Contents matter because a fast relink
+/// can preserve size and leave `mtime` granularity unchanged, which previously
+/// reused a stale translation that predated the fix.
+fn native_cache_epoch() -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    env!("CARGO_PKG_VERSION").hash(&mut hasher);
+    if let Ok(executable) = std::env::current_exe() {
+        if let Ok(metadata) = fs::metadata(&executable) {
+            metadata.len().hash(&mut hasher);
+            if let Ok(modified) = metadata.modified() {
+                modified.hash(&mut hasher);
+            }
+        }
+        // Content hash: bounded read keeps startup fast while guaranteeing a
+        // rebuilt binary never reuses the previous build's cached verdicts.
+        if let Ok(bytes) = fs::read(&executable) {
+            const EPOCH_SAMPLE: usize = 1 << 20;
+            let head = bytes.len().min(EPOCH_SAMPLE);
+            bytes[..head].hash(&mut hasher);
+            if bytes.len() > EPOCH_SAMPLE {
+                bytes[bytes.len() - EPOCH_SAMPLE..].hash(&mut hasher);
+            }
+        }
+    }
+    format!("{:016x}", hasher.finish())
 }
 
 fn tarvos_cache_dir() -> Result<PathBuf> {
@@ -1035,7 +1333,7 @@ fn tarvos_cache_dir() -> Result<PathBuf> {
     Ok(home
         .join(".tarvos")
         .join("cache")
-        .join("tarvos-cache-v1.0-r9"))
+        .join("tarvos-cache-v1.0-r12"))
 }
 
 fn hash_project_sources(root: &Path, hasher: &mut impl Hasher) -> Result<()> {
@@ -1114,14 +1412,18 @@ fn compile_rust_binary_opt(output_path: &Path, rust_source: &str, fast_dev: bool
     let mut cmd = Command::new(&rustc);
     if fast_dev {
         cmd.arg("-C")
-            .arg("opt-level=1")
+            .arg("opt-level=3")
             .arg("-C")
-            .arg("codegen-units=16");
+            .arg("lto=thin")
+            .arg("-C")
+            .arg("codegen-units=1")
+            .arg("-C")
+            .arg("strip=symbols");
     } else {
         cmd.arg("-C")
             .arg("opt-level=3")
             .arg("-C")
-            .arg("lto=thin")
+            .arg("lto=fat")
             .arg("-C")
             .arg("codegen-units=1")
             .arg("-C")
@@ -1522,7 +1824,7 @@ fn print_help() {
     eprintln!("  tarvos compile <file.py> [output.rs]");
     eprintln!("  tarvos build <file.py> [output.exe]");
     eprintln!("  tarvos run <file.py> [args...]");
-    eprintln!("  tarvos run <file.py> --python-fallback [args...]");
+    eprintln!("  tarvos run <file.py> [--compat-runtime] [args...]");
     eprintln!("  tarvos python <file.py> [args...]");
     eprintln!("  tarvos analyze <file.py>");
     eprintln!("  tarvos benchmark <file.py> [reference.rs]");
@@ -1535,7 +1837,10 @@ fn print_help() {
     );
     eprintln!("  - `build` directly emits a native executable when a Rust toolchain is available.");
     eprintln!("  - `run` transpiles, builds, and executes the program in one command.");
-    eprintln!("  - `run --python-fallback` tries native execution, then explicitly falls back to CPython.");
+    eprintln!(
+        "  - `run` automatically tries native compilation and falls back to Python for unsupported dynamic code."
+    );
+    eprintln!("  - generated native executables do not embed Python or require pyo3.");
     eprintln!("  - `python` executes any Python program through the local CPython runtime.");
     eprintln!("  - Rust remains optional for source emission; developers can still use `tarvos compile` without final native build.");
     eprintln!();

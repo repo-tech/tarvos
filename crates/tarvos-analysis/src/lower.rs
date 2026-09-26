@@ -1,4 +1,5 @@
-use crate::{module_supported, native_constant, native_function};
+use crate::stdlib::{dict_method_mutates, list_method_mutates, MethodReceiver};
+use crate::{module_supported, native_builtin_method, native_constant, native_function};
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
 use tarvos_ir::{BinaryOp, Module, Stmt, TypeContext, Value};
@@ -16,6 +17,13 @@ pub struct Lowerer {
     imported_constants: HashMap<String, Value>,
     loop_depth: usize,
     current_class: Option<String>,
+    /// Element types for list literals that are empty where they are bound.
+    ///
+    /// `xs = []` carries no element type of its own; the only evidence is a
+    /// later `xs.append(...)`. This is resolved by a pre-pass so the binding is
+    /// declared as a real `Vec<T>` instead of `Vec<()>`, which would otherwise
+    /// make the function's own return type unusable.
+    empty_list_hints: HashMap<String, Type>,
 }
 
 impl Lowerer {
@@ -32,11 +40,25 @@ impl Lowerer {
             imported_constants: HashMap::new(),
             loop_depth: 0,
             current_class: None,
+            empty_list_hints: HashMap::new(),
         }
     }
 
     pub fn lower_module(&mut self, module: &tarvos_ast::Module) -> Result<Module> {
         let mut statements = Vec::new();
+
+        // One pre-pass serves both the empty-list element types and the
+        // unannotated parameter types, so they cannot disagree about a name.
+        let variable_types = collect_variable_types(&module.body);
+        self.empty_list_hints = variable_types
+            .iter()
+            .filter_map(|(name, ty)| match ty {
+                Type::Array(element) if **element != Type::Unknown => {
+                    Some((name.clone(), (**element).clone()))
+                }
+                _ => None,
+            })
+            .collect();
 
         for stmt in &module.body {
             if let tarvos_ast::Stmt::ClassDef { name, body, .. } = stmt {
@@ -64,14 +86,17 @@ impl Lowerer {
             } = stmt
             {
                 let param_names = args.clone();
+                let inferred = infer_function_argument_types(&module.body, name, args.len());
                 let param_types: Vec<Type> = args
                     .iter()
-                    .zip(arg_annotations.iter())
-                    .map(|(_, annotation)| {
-                        annotation
+                    .enumerate()
+                    .map(|(index, _)| {
+                        arg_annotations
+                            .get(index)
+                            .and_then(|annotation| annotation.as_deref())
                             .as_deref()
                             .and_then(|s| self.parse_type_annotation(s))
-                            .unwrap_or(Type::Unknown)
+                            .unwrap_or_else(|| inferred[index].clone())
                     })
                     .collect();
                 let return_type = returns
@@ -101,7 +126,7 @@ impl Lowerer {
                     if !module_supported(&name.name) {
                         bail!(
                             "import '{}' is not supported by the native backend yet; \
-                             supported native modules: math, time, os.path",
+                             supported native modules: math, time, os, os.path, json",
                             name.name
                         );
                     }
@@ -122,7 +147,7 @@ impl Lowerer {
                 if !module_supported(module) {
                     bail!(
                         "from '{}' import ... is not supported by the native backend yet; \
-                         supported native modules: math, time, os.path",
+                         supported native modules: math, time, os, os.path, json",
                         module
                     );
                 }
@@ -150,6 +175,11 @@ impl Lowerer {
             tarvos_ast::Stmt::Assign { target, value } => match target {
                 tarvos_ast::Expr::Name { id } => {
                     let value_ir = self.lower_expr(value)?;
+                    // An empty list literal has no element type of its own, so the
+                    // pre-pass hint from a later `append` supplies it here. Without
+                    // this the binding becomes `Vec<()>` and the function's return
+                    // type is rejected as dynamic.
+                    let value_ir = self.apply_empty_list_hint(id, value_ir);
                     let ty = self.value_type(&value_ir)?;
                     if let Some(class_name) = self.constructor_class(&value_ir) {
                         self.object_classes.insert(id.clone(), class_name);
@@ -169,18 +199,24 @@ impl Lowerer {
                         })
                     }
                 }
-                tarvos_ast::Expr::Subscript {
-                    value: container,
-                    index,
-                } => {
-                    let tarvos_ast::Expr::Name { id } = container.as_ref() else {
-                        bail!("subscript assignment target container must be a variable name");
-                    };
-                    let index_ir = self.lower_expr(index)?;
+                tarvos_ast::Expr::Subscript { .. } => {
+                    let (id, index_exprs) = Self::split_subscript_target(target)?;
+                    let mut indices = Vec::with_capacity(index_exprs.len());
+                    for (position, index_expr) in index_exprs.iter().enumerate() {
+                        let index_ir = self.lower_expr(index_expr)?;
+                        if position + 1 < index_exprs.len() && matches!(index_ir, Value::String(_))
+                        {
+                            bail!(
+                                "nested subscript assignment through a dictionary is not \
+                                 supported natively; use --python-fallback for that pattern"
+                            );
+                        }
+                        indices.push(index_ir);
+                    }
                     let value_ir = self.lower_expr(value)?;
                     Ok(Stmt::IndexAssign {
-                        target: id.clone(),
-                        index: index_ir,
+                        target: id,
+                        indices,
                         value: value_ir,
                     })
                 }
@@ -193,7 +229,43 @@ impl Lowerer {
                         value: val_ir,
                     })
                 }
-                _ => bail!("assignment target must be a variable name or subscript"),
+                tarvos_ast::Expr::Tuple { elements } => {
+                    let mut targets = Vec::with_capacity(elements.len());
+                    for element in elements {
+                        let tarvos_ast::Expr::Name { id } = element else {
+                            bail!(
+                                "tuple assignment targets must be variable names; \
+                                 starred and nested targets are not supported natively"
+                            );
+                        };
+                        targets.push(id.clone());
+                    }
+                    if targets.is_empty() {
+                        bail!("tuple assignment requires at least one target");
+                    }
+                    let value_ir = self.lower_expr(value)?;
+                    let tarvos_types::Type::Tuple(element_types) = self.value_type(&value_ir)?
+                    else {
+                        bail!(
+                            "tuple assignment requires a tuple value with the same number of elements"
+                        );
+                    };
+                    if element_types.len() != targets.len() {
+                        bail!(
+                            "tuple assignment has {} targets but {} values",
+                            targets.len(),
+                            element_types.len()
+                        );
+                    }
+                    for (target, element_type) in targets.iter().zip(element_types) {
+                        self.type_context.declare(target.clone(), element_type);
+                    }
+                    Ok(Stmt::Destructure {
+                        targets,
+                        value: value_ir,
+                    })
+                }
+                _ => bail!("assignment target must be a variable name, tuple, or subscript"),
             },
 
             tarvos_ast::Stmt::AugAssign {
@@ -201,20 +273,18 @@ impl Lowerer {
                 operator,
                 value,
             } => {
-                let tarvos_ast::Expr::Name { id } = target else {
-                    bail!("augmented assignment target must be a variable name");
-                };
-                // Desugar: x += e  →  x = x + e
-                let left_expr = tarvos_ast::Expr::Name { id: id.clone() };
+                // Desugar: x op= e  →  x = x op e
+                //
+                // Routing through `Stmt::Assign` means name targets and subscript
+                // chains (`grid[i][j] += e`) share one lowering path.
                 let synthetic = tarvos_ast::Expr::Binary {
-                    left: Box::new(left_expr),
+                    left: Box::new(target.clone()),
                     operator: operator.clone(),
                     right: Box::new(value.clone()),
                 };
-                let value_ir = self.lower_expr(&synthetic)?;
-                Ok(Stmt::Assign {
-                    name: id.clone(),
-                    value: value_ir,
+                self.lower_stmt(&tarvos_ast::Stmt::Assign {
+                    target: target.clone(),
+                    value: synthetic,
                 })
             }
 
@@ -301,6 +371,43 @@ impl Lowerer {
                         let function_name = match function.as_ref() {
                             tarvos_ast::Expr::Name { id } => id.clone(),
                             tarvos_ast::Expr::Attribute { value: obj, attr } => {
+                                if let Some(reference) = module_reference(function) {
+                                    if let Some((module_name, method)) = reference.rsplit_once('.')
+                                    {
+                                        let module = self
+                                            .module_aliases
+                                            .get(module_name)
+                                            .cloned()
+                                            .or_else(|| {
+                                                let (parent, child) =
+                                                    module_name.rsplit_once('.')?;
+                                                let parent_module =
+                                                    self.module_aliases.get(parent)?;
+                                                let qualified = format!("{parent_module}.{child}");
+                                                (qualified == module_name).then_some(qualified)
+                                            });
+                                        if let Some(module) = module.as_deref() {
+                                            if let Some(function) = native_function(module, method)
+                                            {
+                                                if function.rust_name == "tarvos_json_dumps_static"
+                                                {
+                                                    return Ok(Stmt::Expr(
+                                                        self.lower_static_json_expr(args)?,
+                                                    ));
+                                                }
+                                                let args_ir = args
+                                                    .iter()
+                                                    .map(|arg| self.lower_expr(arg))
+                                                    .collect::<Result<Vec<_>>>()?;
+                                                return Ok(Stmt::Expr(Value::Call {
+                                                    function: function.rust_name.to_string(),
+                                                    args: args_ir,
+                                                    return_type: function.return_type,
+                                                }));
+                                            }
+                                        }
+                                    }
+                                }
                                 // obj.method(...) call as statement
                                 if let tarvos_ast::Expr::Name { id } = obj.as_ref() {
                                     return self.lower_method_call_stmt(id, attr, args);
@@ -323,8 +430,18 @@ impl Lowerer {
                         args,
                     } => {
                         if let Some(module_name) = module_reference(object) {
-                            if let Some(module) = self.module_aliases.get(&module_name) {
+                            let module =
+                                self.module_aliases.get(&module_name).cloned().or_else(|| {
+                                    let (parent, child) = module_name.rsplit_once('.')?;
+                                    let parent_module = self.module_aliases.get(parent)?;
+                                    let qualified = format!("{parent_module}.{child}");
+                                    (qualified == module_name).then_some(qualified)
+                                });
+                            if let Some(module) = module.as_deref() {
                                 if let Some(function) = native_function(module, method) {
+                                    if function.rust_name == "tarvos_json_dumps_static" {
+                                        return Ok(Stmt::Expr(self.lower_static_json_expr(args)?));
+                                    }
                                     let args_ir = args
                                         .iter()
                                         .map(|arg| self.lower_expr(arg))
@@ -382,29 +499,8 @@ impl Lowerer {
                 let iter_ir = self.lower_expr(iter)?;
                 let iter_type = self.value_type(&iter_ir)?;
 
-                let element_type = match &iter_type {
-                    tarvos_types::Type::Array(elem_type) => (**elem_type).clone(),
-                    tarvos_types::Type::Dict { key, .. } => (**key).clone(),
-                    tarvos_types::Type::String => tarvos_types::Type::String,
-                    tarvos_types::Type::Tuple(types) => types
-                        .first()
-                        .cloned()
-                        .unwrap_or(tarvos_types::Type::Unknown),
-                    _ => match &iter_ir {
-                        Value::Call {
-                            function,
-                            return_type: tarvos_types::Type::Array(elem_type),
-                            ..
-                        } if function == "range" => (**elem_type).clone(),
-                        Value::List { element_type, .. } => element_type.clone(),
-                        Value::Name(name) => match self.type_context.lookup(name).cloned() {
-                            Some(tarvos_types::Type::Array(inner)) => *inner,
-                            _ => tarvos_types::Type::Unknown,
-                        },
-                        _ => tarvos_types::Type::Unknown,
-                    },
-                };
-                self.type_context.declare(id.clone(), element_type.clone());
+                let element_type = self.iterable_element_type(&iter_ir)?;
+                self.type_context.declare(id.clone(), element_type);
 
                 self.loop_depth += 1;
                 let body_ir: Result<Vec<_>> = body.iter().map(|s| self.lower_stmt(s)).collect();
@@ -430,10 +526,17 @@ impl Lowerer {
                 let mut function_context = tarvos_ir::TypeContext::new();
                 let mut params = Vec::new();
 
-                for (arg_name, arg_annotation) in args.iter().zip(arg_annotations.iter()) {
+                let inferred_params = self
+                    .function_signatures
+                    .get(name)
+                    .map(|(_, types, _)| types.clone())
+                    .unwrap_or_else(|| vec![Type::Unknown; args.len()]);
+                for (index, arg_name) in args.iter().enumerate() {
+                    let arg_annotation =
+                        arg_annotations.get(index).and_then(|value| value.as_ref());
                     let arg_type = arg_annotation
-                        .as_deref()
-                        .and_then(|s| self.parse_type_annotation(s))
+                        .and_then(|value| self.parse_type_annotation(value))
+                        .or_else(|| inferred_params.get(index).cloned())
                         .unwrap_or(tarvos_types::Type::Unknown);
                     function_context.declare(arg_name.clone(), arg_type.clone());
                     params.push((arg_name.clone(), arg_type));
@@ -614,42 +717,250 @@ impl Lowerer {
                         value: value_ir,
                     });
                 }
-                // Fallback: generic append call
-                Ok(Stmt::Expr(Value::Call {
-                    function: format!("{}_append", obj_name),
-                    args: vec![value_ir],
-                    return_type: tarvos_types::Type::None,
-                }))
+                bail!(
+                    "`{obj_name}.append()` requires a list binding, but `{obj_name}` is {obj_type}"
+                );
             }
             "extend" | "insert" | "remove" | "pop" | "sort" | "reverse" | "clear" => {
-                let args_ir: Result<Vec<_>> = args.iter().map(|a| self.lower_expr(a)).collect();
-                Ok(Stmt::Expr(Value::Call {
-                    function: format!("{}_{}", obj_name, method),
-                    args: args_ir?,
-                    return_type: tarvos_types::Type::None,
-                }))
+                // These mutate the receiver in place, so they become a statement
+                // that is evaluated for its effect rather than a call expression.
+                let value = self.lower_builtin_method(
+                    &tarvos_ast::Expr::Name {
+                        id: obj_name.to_string(),
+                    },
+                    method,
+                    args,
+                    true,
+                )?;
+                let Some(value) = value else {
+                    bail!("`{obj_name}` is not a list, so `{method}()` is not available natively");
+                };
+                Ok(Stmt::Expr(value))
             }
-            "update" | "setdefault" => {
-                let args_ir: Result<Vec<_>> = args.iter().map(|a| self.lower_expr(a)).collect();
-                Ok(Stmt::Expr(Value::Call {
-                    function: format!("{}_{}", obj_name, method),
-                    args: args_ir?,
-                    return_type: tarvos_types::Type::None,
-                }))
+            "update" | "setdefault" | "get" | "keys" | "values" | "items" => {
+                let value = self.lower_builtin_method(
+                    &tarvos_ast::Expr::Name {
+                        id: obj_name.to_string(),
+                    },
+                    method,
+                    args,
+                    true,
+                )?;
+                let Some(value) = value else {
+                    bail!("`{obj_name}` is not a dict, so `{method}()` is not available natively");
+                };
+                Ok(Stmt::Expr(value))
             }
             _ => {
-                // Generic method call — emit as a function call with obj as first arg
-                let mut args_ir = vec![Value::Name(obj_name.to_string())];
-                for a in args {
-                    args_ir.push(self.lower_expr(a)?);
+                // Non-mutating builtin (e.g. `s.strip()`) is a pure call, so it
+                // shares the expression path and its real return type.
+                if let Some(value) = self.lower_builtin_method(
+                    &tarvos_ast::Expr::Name {
+                        id: obj_name.to_string(),
+                    },
+                    method,
+                    args,
+                    true,
+                )? {
+                    return Ok(Stmt::Expr(value));
                 }
-                Ok(Stmt::Expr(Value::Call {
-                    function: format!("__method_{}_{}", obj_name, method),
-                    args: args_ir,
-                    return_type: tarvos_types::Type::None,
-                }))
+                bail!(
+                    "method `{method}()` is not supported natively on `{obj_name}`; \
+                     supported str methods: lower, upper, strip, split, join, replace, \
+                     startswith, endswith, find, count; \
+                     supported list methods: append, extend, insert, pop, remove, sort, reverse, clear"
+                );
             }
         }
+    }
+
+    /// Fill in the element type of an empty list literal bound to `name`.
+    ///
+    /// Only a list that is actually empty is touched: a non-empty literal's type
+    /// comes from its own elements, and a list that already has a known element
+    /// type is left alone so the pre-pass can never contradict the literal.
+    fn apply_empty_list_hint(&self, name: &str, value: Value) -> Value {
+        let Value::List {
+            elements,
+            element_type,
+        } = value
+        else {
+            return value;
+        };
+        if !elements.is_empty() || element_type != Type::Unknown {
+            return Value::List {
+                elements,
+                element_type,
+            };
+        }
+        match self.empty_list_hints.get(name) {
+            Some(hint) => Value::List {
+                elements,
+                element_type: hint.clone(),
+            },
+            None => Value::List {
+                elements,
+                element_type,
+            },
+        }
+    }
+
+    /// Element type produced by iterating `value`.
+    ///
+    /// Python iterates a `str` by character and a `dict` by key, so those are
+    /// resolved here rather than treated as their container type. The value's
+    /// own type is tried first, and its shape second, because a `range()` call
+    /// only reveals its element type through the value it produces.
+    fn iterable_element_type(&self, value: &Value) -> Result<Type> {
+        let ty = self.value_type(value)?;
+        let from_type = match &ty {
+            Type::Array(element) => Some((**element).clone()),
+            Type::Dict { key, .. } => Some((**key).clone()),
+            Type::String => Some(Type::String),
+            Type::Tuple(types) => types.first().cloned(),
+            _ => None,
+        };
+        if let Some(element) = from_type.filter(|element| *element != Type::Unknown) {
+            return Ok(element);
+        }
+        // `range()` and a bare list literal only know their element type here.
+        let from_value = match value {
+            Value::List { element_type, .. } | Value::ListComp { element_type, .. } => {
+                Some(element_type.clone())
+            }
+            Value::Name(name) => match self.type_context.lookup(name) {
+                Some(Type::Array(inner)) => Some(*inner.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        Ok(from_value.unwrap_or(Type::Unknown))
+    }
+
+    /// Resolve the static type of a method-call receiver.
+    ///
+    /// Only the forms the native backend can type are recognized: a named
+    /// binding from the current scope, or a literal. Anything else returns
+    /// `None` so the caller can fall through to the class-instance path.
+    fn receiver_type(&mut self, object: &tarvos_ast::Expr) -> Result<Option<Type>> {
+        Ok(match object {
+            tarvos_ast::Expr::Name { id } => self.type_context.lookup(id).cloned(),
+            tarvos_ast::Expr::String { .. } | tarvos_ast::Expr::FormatString { .. } => {
+                Some(Type::String)
+            }
+            tarvos_ast::Expr::List { elements } => {
+                let element = match elements.first() {
+                    Some(first) => self.lower_expr(first).and_then(|ir| self.value_type(&ir))?,
+                    None => Type::Unknown,
+                };
+                Some(Type::Array(Box::new(element)))
+            }
+            // A chained call such as `text.strip().lower()` names its receiver
+            // through the previous call's result, so the type has to come from
+            // lowering it rather than from the scope.
+            tarvos_ast::Expr::Call { .. } | tarvos_ast::Expr::MethodCall { .. } => {
+                let lowered = self.lower_expr(object)?;
+                Some(self.value_type(&lowered)?)
+            }
+            _ => None,
+        })
+    }
+
+    /// Lower a `str`/`list`/`dict` builtin method call, if the receiver's type selects one.
+    ///
+    /// Returns `Ok(None)` when the receiver is not a builtin container or the
+    /// method is not part of the native subset, so the caller can continue with
+    /// user-defined class methods.
+    ///
+    /// `in_statement_position` allows a method that mutates its receiver. Such a
+    /// call is fine as a statement (`xs.sort()`) but cannot be an expression,
+    /// because the IR has no way to express reading a value that a later write
+    /// would invalidate.
+    fn lower_builtin_method(
+        &mut self,
+        object: &tarvos_ast::Expr,
+        method: &str,
+        args: &[tarvos_ast::Expr],
+        in_statement_position: bool,
+    ) -> Result<Option<Value>> {
+        let receiver = match self.receiver_type(object)? {
+            Some(Type::String) => MethodReceiver::Str,
+            Some(Type::Array(_)) => MethodReceiver::List,
+            Some(Type::Dict { .. }) => MethodReceiver::Dict,
+            _ => return Ok(None),
+        };
+
+        let Some(builtin) = native_builtin_method(receiver, method) else {
+            return Ok(None);
+        };
+        let crate::stdlib::BuiltinMethod {
+            rust_name,
+            arity,
+            mut return_type,
+        } = builtin;
+
+        // A mutating builtin used in value position would need to both return and
+        // write back; the IR models that separately, so reject it here.
+        let mutates = match receiver {
+            MethodReceiver::List => list_method_mutates(method),
+            MethodReceiver::Dict => dict_method_mutates(method),
+            MethodReceiver::Str => false,
+        };
+        if mutates && !in_statement_position {
+            bail!("`{method}()` mutates its receiver in place and cannot be used as an expression");
+        }
+
+        if !arity.contains(&args.len()) {
+            let expected = if arity.start() == arity.end() {
+                format!("{}", arity.start())
+            } else {
+                format!("{} to {}", arity.start(), arity.end())
+            };
+            bail!(
+                "`{method}()` takes {expected} argument(s) but {} were given",
+                args.len()
+            );
+        }
+
+        let receiver_ir = self.lower_expr(object)?;
+        let receiver_ty = self.value_type(&receiver_ir)?;
+
+        // `sort()` needs a total order, and `f64` is not `Ord`. The element type
+        // is only known here, so the helper is selected at lowering time rather
+        // than guessed at the call site.
+        let rust_name = match (receiver, method, &receiver_ty) {
+            (MethodReceiver::List, "sort", Type::Array(element)) => match **element {
+                Type::Float => "tarvos_list_sort_f64",
+                Type::Int => "tarvos_list_sort_i64",
+                Type::String => "tarvos_list_sort_string",
+                Type::Bool => "tarvos_list_sort_bool",
+                ref other => bail!("`sort()` is not supported natively for {other} elements"),
+            },
+            _ => rust_name,
+        };
+
+        // `pop()`, `get()` and `setdefault()` return the container's element or
+        // value type, which the static registry cannot know.
+        return_type = match (receiver, method, &receiver_ty) {
+            (MethodReceiver::List, "pop", Type::Array(element)) => (**element).clone(),
+            (MethodReceiver::Dict, "get" | "pop" | "setdefault", Type::Dict { value, .. }) => {
+                (**value).clone()
+            }
+            _ => return_type,
+        };
+
+        let mut args_ir = vec![receiver_ir];
+        args_ir.extend(
+            args.iter()
+                .map(|arg| self.lower_expr(arg))
+                .collect::<Result<Vec<_>>>()?,
+        );
+
+        Ok(Some(Value::Call {
+            function: rust_name.to_string(),
+            args: args_ir,
+            return_type,
+        }))
     }
 
     fn lower_class(&mut self, class_name: &str, body: &[tarvos_ast::Stmt]) -> Result<Vec<Stmt>> {
@@ -789,22 +1100,39 @@ impl Lowerer {
                 operators,
                 comparators,
             } => {
-                // For now, only support single comparisons
-                if operators.len() != 1 || comparators.len() != 1 {
-                    bail!("chained comparisons not yet supported");
+                if operators.len() != comparators.len() || operators.is_empty() {
+                    bail!(
+                        "malformed comparison: {} operator(s) with {} operand(s)",
+                        operators.len(),
+                        comparators.len()
+                    );
                 }
 
-                let left_ir = self.lower_expr(left)?;
-                let right_ir = self.lower_expr(&comparators[0])?;
-
-                let op = self.parse_compare_op(&operators[0])?;
-
-                Ok(Value::Binary {
-                    left: Box::new(left_ir),
-                    op,
-                    right: Box::new(right_ir),
-                    ty: Type::Bool,
-                })
+                let mut left_ir = self.lower_expr(left)?;
+                let mut result = None;
+                for (operator, comparator) in operators.iter().zip(comparators) {
+                    let right_ir = self.lower_expr(comparator)?;
+                    let op = self.parse_compare_op(operator)?;
+                    let term = Value::Binary {
+                        left: Box::new(left_ir),
+                        op,
+                        right: Box::new(right_ir.clone()),
+                        ty: Type::Bool,
+                    };
+                    // `and` short-circuits, so a failing earlier term skips the rest
+                    // of the chain exactly like Python.
+                    result = Some(match result {
+                        None => term,
+                        Some(previous) => Value::Binary {
+                            left: Box::new(previous),
+                            op: BinaryOp::And,
+                            right: Box::new(term),
+                            ty: Type::Bool,
+                        },
+                    });
+                    left_ir = right_ir;
+                }
+                result.ok_or_else(|| anyhow::anyhow!("comparison has no operands"))
             }
             tarvos_ast::Expr::Call {
                 function,
@@ -826,11 +1154,20 @@ impl Lowerer {
                     {
                         return Ok(Value::String("time".into()));
                     }
+                    if matches!(id.as_str(), "list" | "sorted")
+                        && !self.class_names.contains(id)
+                        && !self.imported_functions.contains_key(id)
+                    {
+                        return self.lower_list_or_sorted_call(id, args, keywords);
+                    }
                     let function_name = self
                         .imported_functions
                         .get(id)
                         .cloned()
                         .unwrap_or_else(|| id.clone());
+                    if function_name == "tarvos_json_dumps_static" {
+                        return self.lower_static_json_expr(args);
+                    }
                     let args_ir = self.lower_call_args(&function_name, args, keywords)?;
                     if function_name == "range"
                         && args_ir.iter().any(|arg| matches!(arg, Value::Int128(_)))
@@ -857,8 +1194,17 @@ impl Lowerer {
                 args,
             } => {
                 if let Some(module_name) = module_reference(object) {
-                    if let Some(module) = self.module_aliases.get(&module_name) {
+                    let module = self.module_aliases.get(&module_name).cloned().or_else(|| {
+                        let (parent, child) = module_name.rsplit_once('.')?;
+                        let parent_module = self.module_aliases.get(parent)?;
+                        let qualified = format!("{parent_module}.{child}");
+                        (qualified == module_name).then_some(qualified)
+                    });
+                    if let Some(module) = module.as_deref() {
                         if let Some(function) = native_function(module, method) {
+                            if function.rust_name == "tarvos_json_dumps_static" {
+                                return self.lower_static_json_expr(args);
+                            }
                             let args_ir = args
                                 .iter()
                                 .map(|arg| self.lower_expr(arg))
@@ -874,6 +1220,9 @@ impl Lowerer {
                 if let tarvos_ast::Expr::Name { id } = object.as_ref() {
                     if let Some(module) = self.module_aliases.get(id) {
                         if let Some(function) = native_function(module, method) {
+                            if function.rust_name == "tarvos_json_dumps_static" {
+                                return self.lower_static_json_expr(args);
+                            }
                             let args_ir = args
                                 .iter()
                                 .map(|arg| self.lower_expr(arg))
@@ -891,6 +1240,15 @@ impl Lowerer {
                         );
                     }
                 }
+
+                // A builtin method is selected by the receiver's static type. This
+                // runs before the class-instance path so `s.lower()` resolves
+                // against a `str` receiver instead of being mistaken for a method
+                // on a user-defined class instance.
+                if let Some(value) = self.lower_builtin_method(object, method, args, false)? {
+                    return Ok(value);
+                }
+
                 let object_name = match object.as_ref() {
                     tarvos_ast::Expr::Name { id } => id,
                     _ => bail!("method calls on complex expressions are not supported"),
@@ -1020,14 +1378,28 @@ impl Lowerer {
             tarvos_ast::Expr::Unary { operator, operand } => {
                 let operand_ir = self.lower_expr(operand)?;
                 let op_type = self.value_type(&operand_ir)?;
+                // Python's unary plus is a numeric identity: `+x` keeps `x` unchanged.
+                if matches!(operator.as_str(), "uadd" | "+") {
+                    return match op_type {
+                        Type::Int | Type::Float | Type::Unknown => Ok(operand_ir),
+                        other => bail!("unary plus requires a numeric operand, got {}", other),
+                    };
+                }
                 let op = match operator.as_str() {
                     "usub" | "-" => tarvos_ir::UnaryOp::Neg,
                     "not" => tarvos_ir::UnaryOp::Not,
+                    "invert" | "~" => tarvos_ir::UnaryOp::Invert,
                     _ => bail!("unsupported unary operator: {}", operator),
                 };
                 let res_type = match op {
                     tarvos_ir::UnaryOp::Neg => op_type,
                     tarvos_ir::UnaryOp::Not => Type::Bool,
+                    tarvos_ir::UnaryOp::Invert => {
+                        if !matches!(op_type, Type::Int | Type::Unknown) {
+                            bail!("bitwise NOT (~) requires an integer operand");
+                        }
+                        Type::Int
+                    }
                 };
                 Ok(Value::Unary {
                     op,
@@ -1181,7 +1553,11 @@ impl Lowerer {
                 condition,
             } => {
                 let iter_ir = self.lower_expr(iter)?;
-                self.type_context.declare(target.clone(), Type::Int);
+                // The loop variable has the iterable's element type. Assuming
+                // `Int` here would type every comprehension over strings wrong
+                // and produce uncompilable Rust for the element expression.
+                let element_type = self.iterable_element_type(&iter_ir)?;
+                self.type_context.declare(target.clone(), element_type);
                 let elt_ir = self.lower_expr(elt)?;
                 let condition_ir = condition
                     .as_ref()
@@ -1252,6 +1628,34 @@ impl Lowerer {
         Ok(slots.into_iter().map(Option::unwrap).collect())
     }
 
+    /// Split a subscript assignment target into its base variable and index chain:
+    /// `grid[i][j]` → `("grid", [i, j])`.
+    fn split_subscript_target(
+        target: &tarvos_ast::Expr,
+    ) -> Result<(String, Vec<tarvos_ast::Expr>)> {
+        let mut indices = Vec::new();
+        let mut current = target;
+        loop {
+            match current {
+                tarvos_ast::Expr::Subscript { value, index } => {
+                    indices.insert(0, (**index).clone());
+                    current = value;
+                }
+                tarvos_ast::Expr::Name { id } => {
+                    if indices.is_empty() {
+                        bail!("subscript assignment target requires at least one index");
+                    }
+                    return Ok((id.clone(), indices));
+                }
+                other => bail!(
+                    "unsupported assignment target `{}`; only `name[i]` and `name[i][j]` \
+                     chains are supported natively",
+                    other.kind_name()
+                ),
+            }
+        }
+    }
+
     fn parse_binary_op(&self, op: &str) -> Result<BinaryOp> {
         Ok(match op {
             "add" => BinaryOp::Add,
@@ -1260,6 +1664,12 @@ impl Lowerer {
             "div" => BinaryOp::Div,
             "mod" => BinaryOp::Mod,
             "pow" => BinaryOp::Pow,
+            "bitand" => BinaryOp::BitAnd,
+            "bitor" => BinaryOp::BitOr,
+            "bitxor" => BinaryOp::BitXor,
+            "lshift" => BinaryOp::LShift,
+            "rshift" => BinaryOp::RShift,
+            "floordiv" => BinaryOp::FloorDiv,
             "eq" => BinaryOp::Eq,
             "ne" => BinaryOp::NotEq,
             "lt" => BinaryOp::Lt,
@@ -1326,6 +1736,16 @@ impl Lowerer {
             (Type::Int, Type::Int, BinaryOp::Div) => Ok(Type::Float), // Python 3: / returns float
             (Type::Int, Type::Int, BinaryOp::Mod) => Ok(Type::Int),
             (Type::Int, Type::Int, BinaryOp::Pow) => Ok(Type::Int),
+            (
+                Type::Int,
+                Type::Int,
+                BinaryOp::BitXor
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::LShift
+                | BinaryOp::RShift,
+            ) => Ok(Type::Int),
+            (Type::Int, Type::Int, BinaryOp::FloorDiv) => Ok(Type::Int),
             (Type::Int, Type::Int, BinaryOp::Eq) => Ok(Type::Bool),
             (Type::Int, Type::Int, BinaryOp::NotEq) => Ok(Type::Bool),
             (Type::Int, Type::Int, BinaryOp::Lt) => Ok(Type::Bool),
@@ -1337,16 +1757,24 @@ impl Lowerer {
             (Type::Float, Type::Float, BinaryOp::Mul) => Ok(Type::Float),
             (Type::Float, Type::Float, BinaryOp::Div) => Ok(Type::Float),
             (Type::Float, Type::Float, BinaryOp::Pow) => Ok(Type::Float),
+            (Type::Float, Type::Float, BinaryOp::FloorDiv) => Ok(Type::Float),
             (Type::Int, Type::Float, BinaryOp::Add)
             | (Type::Int, Type::Float, BinaryOp::Sub)
             | (Type::Int, Type::Float, BinaryOp::Mul)
             | (Type::Int, Type::Float, BinaryOp::Div)
+            | (Type::Int, Type::Float, BinaryOp::FloorDiv)
             | (Type::Float, Type::Int, BinaryOp::Add)
             | (Type::Float, Type::Int, BinaryOp::Sub)
             | (Type::Float, Type::Int, BinaryOp::Mul)
-            | (Type::Float, Type::Int, BinaryOp::Div) => Ok(Type::Float),
+            | (Type::Float, Type::Int, BinaryOp::Div)
+            | (Type::Float, Type::Int, BinaryOp::FloorDiv) => Ok(Type::Float),
             (Type::Int, Type::Float, BinaryOp::Pow) | (Type::Float, Type::Int, BinaryOp::Pow) => {
                 Ok(Type::Float)
+            }
+            (Type::Array(_), Type::Int, BinaryOp::Mul)
+            | (Type::Int, Type::Array(_), BinaryOp::Mul) => Ok(left.clone()),
+            (Type::String, Type::Int, BinaryOp::Mul) | (Type::Int, Type::String, BinaryOp::Mul) => {
+                Ok(Type::String)
             }
             (Type::String, Type::String, BinaryOp::Add) => Ok(Type::String),
             (Type::String, Type::String, BinaryOp::Eq) => Ok(Type::Bool),
@@ -1354,7 +1782,7 @@ impl Lowerer {
         }
     }
 
-    fn infer_call_return_type(&self, function: &str, _args: &[Value]) -> Result<Type> {
+    fn infer_call_return_type(&self, function: &str, args: &[Value]) -> Result<Type> {
         if let Some((_, _, return_type)) = self.function_signatures.get(function) {
             return Ok(return_type.clone());
         }
@@ -1372,7 +1800,16 @@ impl Lowerer {
             "any" | "all" => Type::Bool,
             "ord" => Type::Int,
             "chr" => Type::String,
-            "sorted" | "list" => Type::Array(Box::new(Type::Unknown)),
+            // `list()` / `sorted()` preserve their input's element type. The
+            // lowering stage computes the exact type; this fallback only runs
+            // for shapes the dedicated path already rejected, so `Unknown`
+            // forces an explicit fallback diagnostic instead of `Vec<()>`.
+            "sorted" | "list" => Type::Array(Box::new(
+                args.first()
+                    .map(|arg| self.call_arg_element_type(arg))
+                    .transpose()?
+                    .unwrap_or(Type::Unknown),
+            )),
             "dict" => Type::Dict {
                 key: Box::new(Type::String),
                 value: Box::new(Type::Unknown),
@@ -1385,14 +1822,247 @@ impl Lowerer {
             "tarvos_math_floor" | "tarvos_math_ceil" => Type::Int,
             "tarvos_math_isfinite" | "tarvos_math_isnan" | "tarvos_math_isinf" => Type::Bool,
             "tarvos_sleep" => Type::None,
+            "tarvos_os_getcwd" => Type::String,
+            "tarvos_os_listdir" => Type::Array(Box::new(Type::String)),
+            "tarvos_os_mkdir" | "tarvos_os_makedirs" | "tarvos_os_chdir" => Type::None,
             "tarvos_os_path_join" | "tarvos_os_path_basename" | "tarvos_os_path_dirname" => {
                 Type::String
             }
             "tarvos_os_path_exists" | "tarvos_os_path_isfile" | "tarvos_os_path_isdir" => {
                 Type::Bool
             }
+            "tarvos_json_dumps_static" => Type::String,
             _ => Type::Unknown,
         })
+    }
+
+    /// Element type produced by iterating a lowered `list()`/`sorted()` argument.
+    ///
+    /// `range()` and `str` only reveal their element type through the value,
+    /// so the value shape is checked alongside the static type.
+    fn call_arg_element_type(&self, arg: &Value) -> Result<Type> {
+        if let Value::Call { function, .. } = arg {
+            if function == "range" {
+                return Ok(Type::Int);
+            }
+        }
+        if matches!(arg, Value::String(_) | Value::FormatString { .. }) {
+            return Ok(Type::String);
+        }
+        let ty = self.value_type(arg)?;
+        match ty {
+            Type::Array(element) => Ok(*element),
+            Type::Dict { key, .. } => Ok(*key),
+            Type::Tuple(elements) => {
+                let mut uniform: Option<Type> = None;
+                for element in elements {
+                    match &uniform {
+                        None => uniform = Some(element),
+                        Some(existing) if *existing == element => {}
+                        _ => bail!(
+                            "list() over a heterogeneous tuple is not supported natively; \
+                             use --python-fallback for mixed element types"
+                        ),
+                    }
+                }
+                Ok(uniform.unwrap_or(Type::Unknown))
+            }
+            Type::String => Ok(Type::String),
+            other => bail!(
+                "list() argument of type {other} is not a supported native iterable; \
+                 supported inputs are list, range(), str, tuple, and dict; \
+                 use --python-fallback otherwise"
+            ),
+        }
+    }
+
+    /// Lower `list(...)` / `sorted(...)` with an exact, preserved element type.
+    ///
+    /// `list()` materializes its argument (`list(range(3))` collects the lazy
+    /// range, `list("ab")` splits into characters, `list(xs)` clones the vec)
+    /// while `sorted()` materializes then sorts with the element-typed helper.
+    /// The emitted call names the source kind (`__tarvos_list_from_dict`,
+    /// `__tarvos_sorted_from_range`, ...) so codegen never re-derives the
+    /// argument's type from a bare `Name`.
+    fn lower_list_or_sorted_call(
+        &mut self,
+        function: &str,
+        args: &[tarvos_ast::Expr],
+        keywords: &[tarvos_ast::Keyword],
+    ) -> Result<Value> {
+        if !keywords.is_empty() {
+            bail!("{function}() does not accept keyword arguments natively");
+        }
+        if args.len() > 1 {
+            bail!(
+                "{function}() takes at most 1 argument ({} given)",
+                args.len()
+            );
+        }
+        if args.is_empty() {
+            return Ok(Value::List {
+                elements: Vec::new(),
+                element_type: Type::Unknown,
+            });
+        }
+        let arg_ir = self.lower_expr(&args[0])?;
+        // A tuple-typed `Name` (e.g. `t = (1, 2, 3); list(t)`) cannot be
+        // cloned as a `Vec` — Rust tuples have no `.clone()`-to-`Vec` shape —
+        // so it is desugared to field reads (`[t.0, t.1, ...]`) here, where the
+        // arity is still known.
+        if let Value::Name(name) = &arg_ir {
+            if let Some(Type::Tuple(element_types)) = self.type_context.lookup(name).cloned() {
+                let mut uniform: Option<Type> = None;
+                for element in &element_types {
+                    match &uniform {
+                        None => uniform = Some(element.clone()),
+                        Some(existing) if *existing == *element => {}
+                        _ => bail!(
+                            "{function}() over a heterogeneous tuple is not supported natively; \
+                             use --python-fallback for mixed element types"
+                        ),
+                    }
+                }
+                let element = uniform.unwrap_or(Type::Unknown);
+                if element == Type::Unknown {
+                    bail!(
+                        "{function}() argument has an unknown element type; \
+                         bind it to a typed list first or use --python-fallback"
+                    );
+                }
+                let elements = element_types
+                    .iter()
+                    .enumerate()
+                    .map(|(index, ty)| Value::Field {
+                        object: Box::new(Value::Name(name.clone())),
+                        field: index.to_string(),
+                        ty: ty.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let list = Value::List {
+                    elements,
+                    element_type: element.clone(),
+                };
+                if function == "sorted" {
+                    return Ok(Value::Call {
+                        function: format!("__tarvos_sorted_from_{}", Self::list_source_kind(&list)),
+                        args: vec![list],
+                        return_type: Type::Array(Box::new(element)),
+                    });
+                }
+                return Ok(list);
+            }
+        }
+        // A homogeneous tuple is already materialized; desugar it to a list
+        // literal so tuples never reach Rust codegen as `list(tuple)`.
+        if let Value::Tuple {
+            elements,
+            element_types,
+        } = arg_ir
+        {
+            let mut uniform: Option<Type> = None;
+            for element in &element_types {
+                match &uniform {
+                    None => uniform = Some(element.clone()),
+                    Some(existing) if *existing == *element => {}
+                    _ => bail!(
+                        "{function}() over a heterogeneous tuple is not supported natively; \
+                         use --python-fallback for mixed element types"
+                    ),
+                }
+            }
+            let element = uniform.unwrap_or(Type::Unknown);
+            if element == Type::Unknown {
+                bail!(
+                    "{function}() argument has an unknown element type; \
+                     bind it to a typed list first or use --python-fallback"
+                );
+            }
+            let list = Value::List {
+                elements,
+                element_type: element.clone(),
+            };
+            if function == "sorted" {
+                return Ok(Value::Call {
+                    function: format!("__tarvos_sorted_from_{}", Self::list_source_kind(&list)),
+                    args: vec![list],
+                    return_type: Type::Array(Box::new(element)),
+                });
+            }
+            return Ok(list);
+        }
+        let element = self.call_arg_element_type(&arg_ir)?;
+        if element == Type::Unknown {
+            bail!(
+                "{function}() argument has an unknown element type; \
+                 bind it to a typed list first or use --python-fallback"
+            );
+        }
+        // `Name` dispatch must use the binding's declared type, not the value
+        // shape: `d = {...}; sorted(d)` lowers `d` to a bare `Name`, whose
+        // shape alone would select the `vec` (`.clone()`) path and emit
+        // `HashMap::sort()`. The kind tag carries the proven shape instead.
+        let kind = self.list_source_kind_for(&arg_ir);
+        let lowered = if function == "sorted" {
+            "sorted"
+        } else {
+            "list"
+        };
+        Ok(Value::Call {
+            function: format!("__tarvos_{lowered}_from_{kind}"),
+            args: vec![arg_ir],
+            return_type: Type::Array(Box::new(element)),
+        })
+    }
+
+    /// Codegen dispatch kind for a `list()` / `sorted()` source value.
+    ///
+    /// `Name` bindings are resolved through the type context: a `dict` name
+    /// must take the `keys().cloned()` shape, not the `Vec::clone()` shape,
+    /// and a `str` name must split into characters. Anything unrecognized
+    /// stays `vec` so lowering still bails with an explicit diagnostic.
+    fn list_source_kind_for(&self, arg: &Value) -> &'static str {
+        if let Value::Name(name) = arg {
+            match self.type_context.lookup(name) {
+                Some(Type::String) => return "str",
+                Some(Type::Dict { .. }) => return "dict",
+                Some(Type::Array(_)) => return "vec",
+                Some(Type::Tuple(_)) => return "tuple",
+                _ => {}
+            }
+        }
+        Self::list_source_kind(arg)
+    }
+
+    /// Codegen dispatch kind for a `list()` / `sorted()` source value.
+    fn list_source_kind(arg: &Value) -> &'static str {
+        if let Value::Call { function, .. } = arg {
+            if function == "range" {
+                return "range";
+            }
+            return "vec";
+        }
+        match arg {
+            Value::String(_) | Value::FormatString { .. } => "str",
+            Value::Dict { .. } => "dict",
+            Value::Tuple { .. } => "tuple",
+            Value::Slice { .. } => "vec",
+            Value::List { .. } | Value::ListComp { .. } => "vec",
+            _ => "vec",
+        }
+    }
+
+    fn lower_static_json_expr(&self, args: &[tarvos_ast::Expr]) -> Result<Value> {
+        let [value] = args else {
+            bail!("json.dumps() currently requires exactly one compile-time literal argument");
+        };
+        let Some(json) = static_json_expr(value) else {
+            bail!(
+                "json.dumps() requires a compile-time JSON literal in native mode; \
+                 use --python-fallback for dynamic JSON values"
+            );
+        };
+        Ok(Value::String(json))
     }
 
     fn infer_return_type_from_body(&mut self, body: &[tarvos_ast::Stmt]) -> Option<Type> {
@@ -1598,19 +2268,44 @@ fn annotation_type(annotation: &str) -> Type {
     }
 }
 
+/// Best-effort static type of an expression, resolving names through `names`.
+///
+/// The native backend is monomorphic, so a parameter that cannot be typed falls
+/// back to `i64` and silently produces wrong Rust. Resolving variable names is
+/// what lets an unannotated `def f(s): return s.lower()` bind `s: str` when it
+/// is called as `f(word)` and `word` was itself assigned a string.
 fn expression_type_with_names(expr: &tarvos_ast::Expr, names: &HashMap<String, Type>) -> Type {
     match expr {
         tarvos_ast::Expr::Name { id } => names.get(id).cloned().unwrap_or(Type::Unknown),
-        tarvos_ast::Expr::Binary { left, right, .. } => {
-            let left_type = expression_type_with_names(left, names);
-            let right_type = expression_type_with_names(right, names);
-            if left_type == Type::Float || right_type == Type::Float {
-                Type::Float
-            } else {
-                left_type
-            }
+        tarvos_ast::Expr::Binary { left, right, .. } => binary_result_type(
+            expression_type_with_names(left, names),
+            expression_type_with_names(right, names),
+        ),
+        // `list(x)` / `sorted(x)` preserve the argument's element type, so
+        // `y = list(range(3))` is `[int]` and `for c in list("ab")` binds `str`.
+        tarvos_ast::Expr::Call { function, args, .. } if matches!(function.as_ref(), tarvos_ast::Expr::Name { id } if id == "list" || id == "sorted") => {
+            Type::Array(Box::new(
+                args.first()
+                    .map(|arg| list_arg_element_type_with_names(arg, names))
+                    .unwrap_or(Type::Unknown),
+            ))
         }
         _ => expression_type(expr),
+    }
+}
+
+/// Result type of a binary expression given its operand types.
+///
+/// Python promotes to `float` when either side is a float, and concatenation
+/// keeps the string type, so both are resolved before falling back to the left
+/// operand.
+fn binary_result_type(left: Type, right: Type) -> Type {
+    if left == Type::Float || right == Type::Float {
+        Type::Float
+    } else if left == Type::String || right == Type::String {
+        Type::String
+    } else {
+        left
     }
 }
 
@@ -1626,16 +2321,408 @@ fn expression_type(expr: &tarvos_ast::Expr) -> Type {
                 .map(expression_type)
                 .unwrap_or(Type::Unknown),
         )),
+        tarvos_ast::Expr::ListComp { elt, .. } => Type::Array(Box::new(expression_type(elt))),
+        tarvos_ast::Expr::Tuple { elements } => {
+            Type::Tuple(elements.iter().map(expression_type).collect())
+        }
+        // Indexing a container yields its element type, which is what makes
+        // `words = ["a", "b"]; word = words[i]` resolve to `str`.
+        tarvos_ast::Expr::Subscript { value, .. } => match expression_type(value) {
+            Type::Array(element) => *element,
+            Type::Dict { value, .. } => *value,
+            Type::String => Type::String,
+            _ => Type::Unknown,
+        },
+        tarvos_ast::Expr::Compare { .. } | tarvos_ast::Expr::BoolOp { .. } => Type::Bool,
+        tarvos_ast::Expr::Unary { operand, .. } => expression_type(operand),
         tarvos_ast::Expr::Binary { left, right, .. } => {
-            let left_type = expression_type(left);
-            let right_type = expression_type(right);
-            if left_type == Type::Float || right_type == Type::Float {
-                Type::Float
-            } else {
-                left_type
+            binary_result_type(expression_type(left), expression_type(right))
+        }
+        _ => expression_type_fallback(expr),
+    }
+}
+
+/// Element type of a `list(x)` / `sorted(x)` argument during the pre-pass.
+fn list_arg_element_type_with_names(arg: &tarvos_ast::Expr, names: &HashMap<String, Type>) -> Type {
+    if let tarvos_ast::Expr::Call { function, .. } = arg {
+        if matches!(function.as_ref(), tarvos_ast::Expr::Name { id } if id == "range") {
+            return Type::Int;
+        }
+    }
+    if matches!(
+        arg,
+        tarvos_ast::Expr::String { .. } | tarvos_ast::Expr::FormatString { .. }
+    ) {
+        return Type::String;
+    }
+    match expression_type_with_names(arg, names) {
+        Type::Array(element) => *element,
+        Type::Dict { key, .. } => *key,
+        Type::Tuple(elements) => {
+            let mut uniform: Option<Type> = None;
+            for element in elements {
+                match &uniform {
+                    None => uniform = Some(element),
+                    Some(existing) if *existing == element => {}
+                    // Heterogeneous tuples bail later in lowering; the pre-pass
+                    // must not guess an element type here.
+                    _ => return Type::Unknown,
+                }
+            }
+            uniform.unwrap_or(Type::Unknown)
+        }
+        Type::String => Type::String,
+        _ => Type::Unknown,
+    }
+}
+
+/// Types for the call-shaped expressions, split out to keep `expression_type`
+/// readable.
+fn expression_type_fallback(expr: &tarvos_ast::Expr) -> Type {
+    match expr {
+        tarvos_ast::Expr::Call { function, args, .. } => match function.as_ref() {
+            tarvos_ast::Expr::Name { id } => match id.as_str() {
+                "str" | "chr" => Type::String,
+                "int" | "len" | "ord" | "round" => Type::Int,
+                "float" | "abs" => Type::Float,
+                "bool" | "any" | "all" => Type::Bool,
+                "range" => Type::Array(Box::new(Type::Int)),
+                // The pre-pass resolves the argument through `names`, so this
+                // literal-only path mirrors it without scope information.
+                "list" | "sorted" => Type::Array(Box::new(
+                    args.first()
+                        .map(|arg| list_arg_element_type_with_names(arg, &HashMap::new()))
+                        .unwrap_or(Type::Unknown),
+                )),
+                _ => Type::Unknown,
+            },
+            _ => Type::Unknown,
+        },
+        // A method call's result follows the builtin registry, so `s.lower()`
+        // and `"".join(items)` both stay strings.
+        tarvos_ast::Expr::MethodCall {
+            object,
+            method,
+            args,
+            ..
+        } => match builtin_method_return_type(object, method) {
+            // `split(None)` and `split(sep)` both yield a list of strings; the
+            // registry already records that, but a bare-name receiver can be
+            // guessed as a `List`, so the argument form is checked explicitly.
+            Some((_, _)) if method == "split" && !args.is_empty() => {
+                Type::Array(Box::new(Type::String))
+            }
+            Some((_, return_type)) => return_type,
+            None => Type::Unknown,
+        },
+        _ => Type::Unknown,
+    }
+}
+
+/// Static return type of a `str`/`list`/`dict` builtin for an unknown receiver.
+///
+/// The receiver is usually a name whose type is only known from the enclosing
+/// scope, so both container kinds are tried and whichever the registry knows
+/// wins. This only feeds type *inference*, so a wrong guess is re-checked by
+/// the lowering stage rather than emitted.
+fn builtin_method_return_type(
+    object: &tarvos_ast::Expr,
+    method: &str,
+) -> Option<(MethodReceiver, Type)> {
+    let candidates: &[MethodReceiver] = match object {
+        tarvos_ast::Expr::String { .. } | tarvos_ast::Expr::FormatString { .. } => {
+            return native_builtin_method(MethodReceiver::Str, method)
+                .map(|entry| (MethodReceiver::Str, entry.return_type));
+        }
+        tarvos_ast::Expr::List { .. } | tarvos_ast::Expr::ListComp { .. } => {
+            return native_builtin_method(MethodReceiver::List, method)
+                .map(|entry| (MethodReceiver::List, entry.return_type));
+        }
+        tarvos_ast::Expr::Dict { .. } => {
+            return native_builtin_method(MethodReceiver::Dict, method)
+                .map(|entry| (MethodReceiver::Dict, entry.return_type));
+        }
+        _ => &[
+            MethodReceiver::Str,
+            MethodReceiver::List,
+            MethodReceiver::Dict,
+        ],
+    };
+    candidates.iter().find_map(|receiver| {
+        native_builtin_method(*receiver, method).map(|entry| (*receiver, entry.return_type))
+    })
+}
+
+/// Collect the static type of every variable assigned anywhere in the module.
+///
+/// This runs before lowering so an unannotated function's parameters can be
+/// typed from their call sites even when the arguments are local variables
+/// rather than literals.
+fn collect_variable_types(statements: &[tarvos_ast::Stmt]) -> HashMap<String, Type> {
+    let mut names: HashMap<String, Type> = HashMap::new();
+    collect_variable_types_into(statements, &mut names, 0);
+    collect_empty_list_element_types(statements, &mut names);
+    names
+}
+
+fn collect_variable_types_into(
+    statements: &[tarvos_ast::Stmt],
+    names: &mut HashMap<String, Type>,
+    depth: usize,
+) {
+    // Guard against pathologically nested sources; deeper scopes are skipped
+    // rather than risking unbounded recursion.
+    if depth > 8 {
+        return;
+    }
+    for statement in statements {
+        match statement {
+            tarvos_ast::Stmt::Assign { target, value } => {
+                let tarvos_ast::Expr::Name { id } = target else {
+                    continue;
+                };
+                // An empty list literal has no element type of its own, so it is
+                // recorded as unknown and upgraded from its first `append`.
+                if matches!(value, tarvos_ast::Expr::List { elements } if elements.is_empty()) {
+                    names
+                        .entry(id.clone())
+                        .or_insert_with(|| Type::Array(Box::new(Type::Unknown)));
+                    continue;
+                }
+                let ty = expression_type_with_names(value, names);
+                if ty != Type::Unknown {
+                    names.insert(id.clone(), ty);
+                }
+            }
+            tarvos_ast::Stmt::AnnAssign { target, value, .. } => {
+                if let tarvos_ast::Expr::Name { id } = target {
+                    let ty = value
+                        .as_ref()
+                        .map(|value| expression_type_with_names(value, names))
+                        .unwrap_or(Type::Unknown);
+                    if ty != Type::Unknown {
+                        names.insert(id.clone(), ty);
+                    }
+                }
+            }
+            // A loop variable has the iterable's element type, so a `for` over a
+            // list of strings yields a string variable.
+            tarvos_ast::Stmt::For {
+                target, iter, body, ..
+            } => {
+                if let tarvos_ast::Expr::Name { id } = target {
+                    let element = match expression_type_with_names(iter, names) {
+                        Type::Array(inner) => *inner,
+                        Type::Dict { key, .. } => *key,
+                        Type::String => Type::String,
+                        _ => Type::Unknown,
+                    };
+                    if element != Type::Unknown {
+                        names.insert(id.clone(), element);
+                    }
+                }
+                collect_variable_types_into(body, names, depth + 1);
+            }
+            tarvos_ast::Stmt::If { body, orelse, .. } => {
+                collect_variable_types_into(body, names, depth + 1);
+                collect_variable_types_into(orelse, names, depth + 1);
+            }
+            tarvos_ast::Stmt::While { body, .. }
+            | tarvos_ast::Stmt::Try { body, .. }
+            | tarvos_ast::Stmt::With { body, .. }
+            | tarvos_ast::Stmt::FunctionDef { body, .. }
+            | tarvos_ast::Stmt::ClassDef { body, .. } => {
+                collect_variable_types_into(body, names, depth + 1)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Resolve `xs = []` followed by `xs.append(value)` to a concrete element type.
+///
+/// Without this an empty list literal would lower to `Vec<()>` and every
+/// `append` would then emit a type error instead of native code.
+fn collect_empty_list_element_types(
+    statements: &[tarvos_ast::Stmt],
+    names: &mut HashMap<String, Type>,
+) {
+    collect_empty_list_element_types_into(statements, names, 0)
+}
+
+fn collect_empty_list_element_types_into(
+    statements: &[tarvos_ast::Stmt],
+    names: &mut HashMap<String, Type>,
+    depth: usize,
+) {
+    if depth > 8 {
+        return;
+    }
+    for statement in statements {
+        // Nested scopes are visited too: an `append` inside a loop or an `if` is
+        // just as likely to be the only evidence of the element type, and a
+        // function that builds a list in a loop is an ordinary shape.
+        let nested: &[&[tarvos_ast::Stmt]] = match statement {
+            tarvos_ast::Stmt::If { body, orelse, .. } => &[body, orelse],
+            tarvos_ast::Stmt::While { body, .. }
+            | tarvos_ast::Stmt::For { body, .. }
+            | tarvos_ast::Stmt::Try { body, .. }
+            | tarvos_ast::Stmt::With { body, .. }
+            | tarvos_ast::Stmt::FunctionDef { body, .. }
+            | tarvos_ast::Stmt::ClassDef { body, .. } => &[body],
+            _ => &[],
+        };
+        for body in nested {
+            collect_empty_list_element_types_into(body, names, depth + 1);
+        }
+
+        let value = match statement {
+            // Both `xs.append(v)` and the unusual `y = xs.append(v)` name the
+            // receiver, and only the receiver matters here.
+            tarvos_ast::Stmt::Expr { value } | tarvos_ast::Stmt::Assign { value, .. } => value,
+            _ => continue,
+        };
+        let tarvos_ast::Expr::MethodCall {
+            object,
+            method,
+            args,
+            ..
+        } = value
+        else {
+            continue;
+        };
+        if !matches!(method.as_str(), "append" | "extend") {
+            continue;
+        }
+        let tarvos_ast::Expr::Name { id } = object.as_ref() else {
+            continue;
+        };
+        let Some(argument) = args.first() else {
+            continue;
+        };
+        let element = expression_type_with_names(argument, names);
+        if element == Type::Unknown {
+            continue;
+        }
+        if let Some(Type::Array(existing)) = names.get(id).cloned() {
+            if *existing == Type::Unknown {
+                names.insert(id.clone(), Type::Array(Box::new(element)));
             }
         }
-        _ => Type::Unknown,
+    }
+}
+
+fn infer_function_argument_types(
+    statements: &[tarvos_ast::Stmt],
+    function_name: &str,
+    arity: usize,
+) -> Vec<Type> {
+    let mut inferred = vec![Type::Unknown; arity];
+    let names = collect_variable_types(statements);
+    visit_call_sites(statements, function_name, &mut inferred, &names);
+    inferred
+        .into_iter()
+        .map(|ty| if ty == Type::Unknown { Type::Int } else { ty })
+        .collect()
+}
+
+/// Seed parameter types from every call site of `function_name` in the module.
+fn visit_call_sites(
+    statements: &[tarvos_ast::Stmt],
+    function_name: &str,
+    inferred: &mut [Type],
+    names: &HashMap<String, Type>,
+) {
+    for statement in statements {
+        match statement {
+            tarvos_ast::Stmt::Expr { value }
+            | tarvos_ast::Stmt::Return { value: Some(value) }
+            | tarvos_ast::Stmt::Assign { value, .. }
+            | tarvos_ast::Stmt::AugAssign { value, .. }
+            | tarvos_ast::Stmt::AnnAssign {
+                value: Some(value), ..
+            } => infer_from_expr(value, function_name, inferred, names),
+            tarvos_ast::Stmt::If { test, body, orelse } => {
+                infer_from_expr(test, function_name, inferred, names);
+                visit_call_sites(body, function_name, inferred, names);
+                visit_call_sites(orelse, function_name, inferred, names);
+            }
+            tarvos_ast::Stmt::While { test, body } => {
+                infer_from_expr(test, function_name, inferred, names);
+                visit_call_sites(body, function_name, inferred, names);
+            }
+            tarvos_ast::Stmt::For { iter, body, .. } => {
+                infer_from_expr(iter, function_name, inferred, names);
+                visit_call_sites(body, function_name, inferred, names);
+            }
+            tarvos_ast::Stmt::FunctionDef { body, .. }
+            | tarvos_ast::Stmt::ClassDef { body, .. } => {
+                visit_call_sites(body, function_name, inferred, names)
+            }
+            _ => {}
+        }
+    }
+}
+/// Walk an expression tree, seeding parameter types from matching call sites.
+fn infer_from_expr(
+    expression: &tarvos_ast::Expr,
+    function_name: &str,
+    inferred: &mut [Type],
+    names: &HashMap<String, Type>,
+) {
+    match expression {
+        tarvos_ast::Expr::Call { function, args, .. } if matches!(function.as_ref(), tarvos_ast::Expr::Name { id } if id == function_name) => {
+            for (index, argument) in args.iter().enumerate().take(inferred.len()) {
+                let ty = expression_type_with_names(argument, names);
+                if inferred[index] == Type::Unknown && ty != Type::Unknown {
+                    inferred[index] = ty;
+                }
+            }
+        }
+        // Nested expressions are walked too, so a call hidden inside a container
+        // literal, a comprehension or an f-string still contributes its types.
+        tarvos_ast::Expr::Binary { left, right, .. } => {
+            infer_from_expr(left, function_name, inferred, names);
+            infer_from_expr(right, function_name, inferred, names);
+        }
+        tarvos_ast::Expr::Call { function, args, .. } => {
+            infer_from_expr(function, function_name, inferred, names);
+            for argument in args {
+                infer_from_expr(argument, function_name, inferred, names);
+            }
+        }
+        tarvos_ast::Expr::List { elements }
+        | tarvos_ast::Expr::Tuple { elements }
+        | tarvos_ast::Expr::Set { elements } => {
+            for element in elements {
+                infer_from_expr(element, function_name, inferred, names);
+            }
+        }
+        tarvos_ast::Expr::ListComp { elt, iter, .. } => {
+            infer_from_expr(elt, function_name, inferred, names);
+            infer_from_expr(iter, function_name, inferred, names);
+        }
+        tarvos_ast::Expr::Subscript { value, index } => {
+            infer_from_expr(value, function_name, inferred, names);
+            infer_from_expr(index, function_name, inferred, names);
+        }
+        tarvos_ast::Expr::BoolOp { values, .. } => {
+            for value in values {
+                infer_from_expr(value, function_name, inferred, names);
+            }
+        }
+        tarvos_ast::Expr::Compare { comparators, .. } => {
+            for comparator in comparators {
+                infer_from_expr(comparator, function_name, inferred, names);
+            }
+        }
+        tarvos_ast::Expr::MethodCall { object, args, .. } => {
+            infer_from_expr(object, function_name, inferred, names);
+            for argument in args {
+                infer_from_expr(argument, function_name, inferred, names);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1663,4 +2750,62 @@ fn rust_identifier(name: &str) -> String {
 pub fn lower_module(module: &tarvos_ast::Module) -> Result<Module> {
     let mut lowerer = Lowerer::new();
     lowerer.lower_module(module)
+}
+
+fn static_json_expr(value: &tarvos_ast::Expr) -> Option<String> {
+    match value {
+        tarvos_ast::Expr::Int { value } => Some(value.to_string()),
+        tarvos_ast::Expr::BigInt { value } => Some(value.clone()),
+        tarvos_ast::Expr::Float { value } if value.is_finite() => Some(value.to_string()),
+        tarvos_ast::Expr::String { value } => Some(format!("\"{}\"", escape_json_string(value))),
+        tarvos_ast::Expr::Bool { value } => Some(value.to_string()),
+        tarvos_ast::Expr::None => Some("null".to_string()),
+        tarvos_ast::Expr::List { elements } | tarvos_ast::Expr::Tuple { elements } => {
+            let values = elements
+                .iter()
+                .map(static_json_expr)
+                .collect::<Option<Vec<_>>>()?;
+            Some(format!("[{}]", values.join(",")))
+        }
+        tarvos_ast::Expr::Dict { keys, values } => {
+            let mut entries = Vec::with_capacity(keys.len());
+            for (key, value) in keys.iter().zip(values) {
+                let tarvos_ast::Expr::String { value: key } = key else {
+                    return None;
+                };
+                entries.push(format!(
+                    "\"{}\":{}",
+                    escape_json_string(key),
+                    static_json_expr(value)?
+                ));
+            }
+            Some(format!("{{{}}}", entries.join(",")))
+        }
+        tarvos_ast::Expr::Unary { operator, operand } if operator == "usub" => {
+            let value = static_json_expr(operand)?;
+            (!value.starts_with('-')).then(|| format!("-{}", value))
+        }
+        _ => None,
+    }
+}
+
+fn escape_json_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0c}' => escaped.push_str("\\f"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                use std::fmt::Write;
+                let _ = write!(escaped, "\\u{:04x}", character as u32);
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }

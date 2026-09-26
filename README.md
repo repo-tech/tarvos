@@ -1,7 +1,7 @@
 # Tarvos ⚡
 
 [![Production CI Pipeline](https://github.com/repo-tech/Tarvos/actions/workflows/ci.yml/badge.svg)](https://github.com/repo-tech/Tarvos/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/version-1.1.0--rc.1-blue.svg)](https://github.com/repo-tech/Tarvos/releases)
+[![Release](https://img.shields.io/badge/version-1.1.0--rc.2-blue.svg)](https://github.com/repo-tech/Tarvos/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
 
@@ -136,7 +136,11 @@ toolchain/runner metadata. See [the benchmark methodology](docs/BENCHMARKING.md)
 ## 🛠️ Supported Python Subset
 
 - **Data Types**: `int` (i64), `float` (f64), `bool`, `str` (String), `list` (`Vec<T>`), tuples.
-- **Arithmetic & Logic**: `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `and`, `or`.
+- **Arithmetic, Bitwise & Logic**: `+`, `-`, `*`, `/`, `//`, `%`, `**`, `&`, `|`, `^`, `<<`, `>>`, `~`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `and`, `or`.
+  - `/` returns a float as CPython does; `//` keeps CPython's floor rounding for negative operands.
+  - Shifts follow CPython semantics: a negative shift count raises `ValueError`, and `>>` beyond the native width saturates to `0` / `-1`. `<<` beyond the `i64` range aborts with an explicit overflow message instead of silently wrapping.
+  - Bitwise and shift operators are integer-only; float operands are rejected with a diagnostic.
+- **f-string format specs**: literal specifications such as `:.4f`, `:05d`, `:,` and `:_` are compiled natively (`,` / `_` use a generated grouping helper). Dynamic specifications like `f"{value:{width}}"` request the compatibility runtime instead of being silently dropped.
 - **Control Flow**: `if`, `elif`, `else`, `while`, `for` over native lists, strings, dictionaries, and `range(...)` (with start, stop, step), `break`, `continue`, `return`.
 - **Functions**: Function definitions with optional or inferred type annotations (`def add(x: int, y: int) -> int:`).
 - **Built-in Functions**: `print(...)`, `len(...)`, `range(...)`, `str(...)`, `int(...)`, `float(...)`, `bool(...)`, `abs(...)`, `min(...)`, `max(...)`.
