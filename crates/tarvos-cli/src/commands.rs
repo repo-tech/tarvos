@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use colored::*;
-use std::{env, path::PathBuf, process::Command};
+use std::{env, fs, path::PathBuf, process::Command};
 
 use super::{analyze_mode, benchmark_mode, clean_mode, doctor_mode, export_mode, init_mode};
 
@@ -35,33 +35,54 @@ pub fn install_command(_args: &[String]) -> Result<()> {
         .and_then(|p| p.parent())
         .unwrap_or(&manifest_dir);
 
-    println!(
-        "{} Building and installing tarvos binary...",
-        "==>".green().bold()
-    );
+    println!("{} Building Tarvos release binary...", "==>".green().bold());
     let status = Command::new("cargo")
-        .arg("install")
-        .arg("--path")
-        .arg(repo_root.join("crates").join("tarvos-cli"))
-        .arg("--force")
+        .args(["build", "--release", "--bin", "tarvos"])
         .current_dir(repo_root)
         .status()
-        .with_context(|| "Failed to execute 'cargo install'")?;
+        .with_context(|| "Failed to execute 'cargo build --release --bin tarvos'")?;
 
-    if status.success() {
-        println!(
-            "{}",
-            "✓ Successfully installed Tarvos to ~/.cargo/bin/tarvos!"
-                .green()
-                .bold()
-        );
-        println!("Ensure {} is in your system PATH.", "~/.cargo/bin".yellow());
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "Failed to install Tarvos via cargo install"
-        ))
+    if !status.success() {
+        return Err(anyhow::anyhow!("Failed to build Tarvos release binary"));
     }
+
+    let home = if cfg!(windows) {
+        env::var_os("USERPROFILE")
+    } else {
+        env::var_os("HOME")
+    }
+    .map(PathBuf::from)
+    .ok_or_else(|| anyhow::anyhow!("could not determine the current user's home directory"))?;
+    let bin_dir = home.join(".tarvos").join("bin");
+    let destination = bin_dir.join(format!("tarvos{}", std::env::consts::EXE_SUFFIX));
+    let source = repo_root
+        .join("target")
+        .join("release")
+        .join(format!("tarvos{}", std::env::consts::EXE_SUFFIX));
+    fs::create_dir_all(&bin_dir)
+        .with_context(|| format!("failed to create {}", bin_dir.display()))?;
+    fs::copy(&source, &destination).with_context(|| {
+        format!(
+            "failed to install {} to {}. If Tarvos is running, close that process and retry.",
+            source.display(),
+            destination.display()
+        )
+    })?;
+
+    println!(
+        "{}",
+        format!(
+            "✓ Successfully installed Tarvos to {}!",
+            destination.display()
+        )
+        .green()
+        .bold()
+    );
+    println!(
+        "Add {} to your user PATH, then open a new terminal.",
+        bin_dir.display().to_string().yellow()
+    );
+    Ok(())
 }
 
 pub fn clean_command(args: &[String]) -> Result<()> {

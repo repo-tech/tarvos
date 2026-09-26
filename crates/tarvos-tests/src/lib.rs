@@ -57,6 +57,44 @@ mod pipeline {
     }
 
     #[test]
+    fn static_json_dumps_lowers_to_native_string() {
+        let ast = r#"{"type":"module","body":[
+          {"type":"import","names":[{"name":"json","asname":null}]},
+          {"type":"expr","value":{"type":"call","function":{"type":"name","id":"print"},"args":[
+            {"type":"method_call","object":{"type":"name","id":"json"},"method":"dumps","args":[
+              {"type":"dict","keys":[{"type":"string","value":"message"},{"type":"string","value":"items"}],
+               "values":[{"type":"string","value":"hello\nworld"},{"type":"list","elements":[
+                 {"type":"int","value":1},{"type":"bool","value":true}
+               ]}]}
+            ]}]}}
+        ]}"#;
+        let code = compile(ast).expect("static json.dumps should lower natively");
+        assert!(
+            code.contains(r#"\"message\":\"hello\\nworld\""#)
+                && code.contains(r#"\"items\":[1,true]"#),
+            "generated JSON literal missing or incorrectly escaped:\n{}",
+            code
+        );
+    }
+
+    #[test]
+    fn dynamic_json_dumps_requests_explicit_fallback() {
+        let ast = r#"{"type":"module","body":[
+          {"type":"import","names":[{"name":"json","asname":null}]},
+          {"type":"assign","target":{"type":"name","id":"payload"},"value":{"type":"name","id":"runtime_value"}},
+          {"type":"expr","value":{"type":"method_call","object":{"type":"name","id":"json"},"method":"dumps","args":[
+            {"type":"name","id":"payload"}
+          ]}}
+        ]}"#;
+        let error = compile(ast).expect_err("dynamic json.dumps must not be guessed native");
+        assert!(
+            error.contains("compile-time JSON literal") && error.contains("--python-fallback"),
+            "unexpected dynamic JSON diagnostic: {}",
+            error
+        );
+    }
+
+    #[test]
     fn top_level_function_call_statement_is_emitted() {
         let ast = r#"{"type":"module","body":[
           {"type":"funcdef","name":"run_benchmark","args":[],"arg_annotations":[],"body":[
@@ -655,6 +693,181 @@ mod pipeline {
 
         let code = compile(ast).expect("pipeline should succeed");
         assert_contains_all(&code, &["nums[(0_i64 as usize)] = 99_i64;"]);
+    }
+
+    #[test]
+    fn bitwise_shift_and_floor_division_lower_to_native_rust() {
+        // A function parameter keeps the values unknown, so no constant folding hides
+        // the emitted operators.
+        let ast = r#"{"type":"module","body":[
+          {"type":"funcdef","name":"kernel","args":["seed"],"arg_annotations":["int"],"returns":null,"body":[
+            {"type":"assign","target":{"type":"name","id":"state"},"value":{"type":"name","id":"seed"}},
+            {"type":"assign","target":{"type":"name","id":"state"},"value":{"type":"binary",
+              "left":{"type":"name","id":"state"},"operator":"bitxor","right":{"type":"int","value":5}}},
+            {"type":"assign","target":{"type":"name","id":"state"},"value":{"type":"binary",
+              "left":{"type":"name","id":"state"},"operator":"bitand","right":{"type":"int","value":4294967295}}},
+            {"type":"assign","target":{"type":"name","id":"merged"},"value":{"type":"binary",
+              "left":{"type":"name","id":"state"},"operator":"bitor","right":{"type":"int","value":1}}},
+            {"type":"assign","target":{"type":"name","id":"shifted"},"value":{"type":"binary",
+              "left":{"type":"name","id":"merged"},"operator":"lshift","right":{"type":"int","value":3}}},
+            {"type":"assign","target":{"type":"name","id":"restored"},"value":{"type":"binary",
+              "left":{"type":"name","id":"shifted"},"operator":"rshift","right":{"type":"int","value":3}}},
+            {"type":"assign","target":{"type":"name","id":"floored"},"value":{"type":"binary",
+              "left":{"type":"name","id":"restored"},"operator":"floordiv","right":{"type":"int","value":7}}},
+            {"type":"assign","target":{"type":"name","id":"negative"},"value":{"type":"unary",
+              "operator":"usub","operand":{"type":"name","id":"floored"}}},
+            {"type":"expr","value":{"type":"call","function":{"type":"name","id":"print"},"args":[
+              {"type":"name","id":"negative"}]}}
+          ]}
+        ]}"#;
+
+        let code = compile(ast).expect("bitwise subset should lower");
+        assert_contains_all(
+            &code,
+            &[
+                " ^ ",
+                " & ",
+                " | ",
+                "checked_shl",
+                "checked_shr",
+                "checked_div",
+                "-(",
+            ],
+        );
+    }
+
+    #[test]
+    fn floor_division_keeps_python_rounding_towards_negative_infinity() {
+        // Python: -7 // 2 == -4, but Rust's `/` truncates to -3.
+        let ast = r#"{"type":"module","body":[
+          {"type":"funcdef","name":"kernel","args":["seed"],"arg_annotations":["int"],"returns":null,"body":[
+            {"type":"assign","target":{"type":"name","id":"value"},"value":{"type":"unary",
+              "operator":"usub","operand":{"type":"name","id":"seed"}}},
+            {"type":"expr","value":{"type":"call","function":{"type":"name","id":"print"},"args":[
+              {"type":"binary","left":{"type":"name","id":"value"},
+               "operator":"floordiv","right":{"type":"int","value":2}}]}}
+          ]}
+        ]}"#;
+
+        let code = compile(ast).expect("floor division should lower");
+        assert!(
+            code.contains("__tarvos_remainder < 0_i64")
+                && code.contains("__tarvos_quotient - 1_i64"),
+            "floor division must correct the truncated quotient:\n{code}"
+        );
+    }
+
+    #[test]
+    fn unsupported_shift_of_invalid_type_is_rejected() {
+        // Bitwise operators are integer-only; floats must not silently truncate.
+        let ast = r#"{"type":"module","body":[
+          {"type":"assign","target":{"type":"name","id":"value"},"value":{"type":"binary",
+            "left":{"type":"float","value":1.5},"operator":"bitand","right":{"type":"int","value":3}}}
+        ]}"#;
+
+        let error = compile(ast).expect_err("float bitwise operands must be rejected");
+        assert!(
+            error.contains("unsupported operation"),
+            "unexpected diagnostic for float bitwise operands: {error}"
+        );
+    }
+
+    #[test]
+    fn comma_grouping_format_spec_uses_the_grouping_helper() {
+        let ast = r#"{"type":"module","body":[
+          {"type":"funcdef","name":"report","args":["total"],"arg_annotations":["int"],"returns":null,"body":[
+            {"type":"expr","value":{"type":"call","function":{"type":"name","id":"print"},"args":[
+              {"type":"format_string","parts":[
+                {"type":"literal","value":"total = "},
+                {"type":"value","value":{"type":"name","id":"total"},"format_spec":",","conversion":null}
+              ]}]}}
+          ]}
+        ]}"#;
+
+        let code = compile(ast).expect("grouping spec should lower");
+        assert!(
+            code.contains("fn __tarvos_group_numeric")
+                && code.contains("__tarvos_group_numeric(total, ',')"),
+            "comma grouping should route through the generated helper:\n{code}"
+        );
+    }
+
+    #[test]
+    fn nested_subscript_assignment_keeps_each_index_distinct() {
+        let ast = r#"{"type":"module","body":[
+          {"type":"funcdef","name":"bump","args":["grid","row","column","delta"],"arg_annotations":["int","int","int","int"],"returns":null,"body":[
+            {"type":"expr","value":{"type":"call","function":{"type":"name","id":"print"},"args":[
+              {"type":"binary",
+               "left":{"type":"subscript","value":{"type":"subscript","value":{"type":"name","id":"grid"},"index":{"type":"name","id":"row"}},"index":{"type":"name","id":"column"}},
+               "operator":"add","right":{"type":"name","id":"delta"}}]}}
+          ]}
+        ]}"#;
+
+        let code = compile(ast).expect("nested reads should lower");
+        assert_contains_all(&code, &["grid[(", "row", "column", "delta"]);
+    }
+
+    #[test]
+    fn matrix_like_nested_index_assignment_emits_a_chained_store() {
+        let ast = r#"{"type":"module","body":[
+          {"type":"assign","target":{"type":"name","id":"grid"},"value":{"type":"list","elements":[]}},
+          {"type":"assign",
+           "target":{"type":"subscript",
+             "value":{"type":"subscript","value":{"type":"name","id":"grid"},"index":{"type":"int","value":0}},
+             "index":{"type":"int","value":1}},
+           "value":{"type":"binary","operator":"add",
+             "left":{"type":"subscript",
+               "value":{"type":"subscript","value":{"type":"name","id":"grid"},"index":{"type":"int","value":0}},
+               "index":{"type":"int","value":1}},
+             "right":{"type":"int","value":2}}}
+        ]}"#;
+
+        let code = compile(ast).expect("nested subscript assignment should lower");
+        assert!(
+            code.contains("grid[(0_i64 as usize)][(1_i64 as usize)] ="),
+            "nested assignment must chain both indices:\n{code}"
+        );
+    }
+
+    #[test]
+    fn nested_list_comprehension_keeps_inner_and_outer_types() {
+        let ast = r#"{"type":"module","body":[
+          {"type":"assign","target":{"type":"name","id":"grid"},"value":{"type":"list_comp",
+            "elt":{"type":"list_comp","elt":{"type":"name","id":"j"},"target":"j",
+                   "iter":{"type":"call","function":{"type":"name","id":"range"},"args":[{"type":"name","id":"n"}],"keywords":[]},
+                   "condition":null},
+            "target":"i",
+            "iter":{"type":"call","function":{"type":"name","id":"range"},"args":[{"type":"name","id":"n"}],"keywords":[]},
+            "condition":null}},
+          {"type":"expr","value":{"type":"call","function":{"type":"name","id":"print"},"args":[
+            {"type":"name","id":"grid"}]}}
+        ]}"#;
+
+        let code = compile(ast).expect("nested comprehensions should lower");
+        assert!(
+            code.contains(".into_iter().map(|i|") && code.contains(".into_iter().map(|j|"),
+            "outer and inner loops must both be emitted:\n{code}"
+        );
+    }
+
+    #[test]
+    fn dictionary_through_path_assignment_requests_the_fallback() {
+        let ast = r#"{"type":"module","body":[
+          {"type":"assign","target":{"type":"name","id":"store"},"value":{"type":"dict",
+            "keys":[{"type":"string","value":"row"}],"values":[{"type":"dict",
+              "keys":[{"type":"string","value":"cell"}],"values":[{"type":"int","value":1}]}]}},
+          {"type":"assign",
+           "target":{"type":"subscript",
+             "value":{"type":"subscript","value":{"type":"name","id":"store"},"index":{"type":"string","value":"row"}},
+             "index":{"type":"string","value":"cell"}},
+           "value":{"type":"int","value":2}}
+        ]}"#;
+
+        let error = compile(ast).expect_err("dict-in-dict write must not be guessed native");
+        assert!(
+            error.contains("dictionary"),
+            "unexpected diagnostic for nested dict write: {error}"
+        );
     }
 
     #[test]

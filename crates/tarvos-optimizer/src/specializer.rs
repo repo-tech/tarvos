@@ -38,11 +38,14 @@ impl TypeSpecializer {
             }),
             Stmt::IndexAssign {
                 target,
-                index,
+                indices,
                 value,
             } => Ok(Stmt::IndexAssign {
                 target: target.clone(),
-                index: self.specialize_value(index)?,
+                indices: indices
+                    .iter()
+                    .map(|index| self.specialize_value(index))
+                    .collect::<Result<Vec<_>>>()?,
                 value: self.specialize_value(value)?,
             }),
             Stmt::Print(vs) => {

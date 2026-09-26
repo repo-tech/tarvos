@@ -8,11 +8,23 @@ use std::{
 };
 
 use tarvos_analysis::lower_module;
+use tarvos_ast as ast;
 use tarvos_codegen_rust::RustCodegen;
 use tarvos_optimizer::Optimizer;
 use tarvos_parser::parse_python_ast;
+use tarvos_ruff_frontend::ast_bridge as ruff;
 
 pub mod api;
+mod normalize;
+
+/// Rewrite Python constructs into the equivalent subset the shared IR models.
+///
+/// This runs on both front ends, so a construct only has to be handled once
+/// instead of in the Ruff bridge and the CPython exporter separately.
+fn normalize_module(mut module: ast::Module) -> ast::Module {
+    module.body = normalize::normalize_body(module.body, &mut 0);
+    module
+}
 
 pub struct CompilePipeline;
 
@@ -23,8 +35,9 @@ const EMBEDDED_AST_EXPORTER: &str = include_str!(concat!(
 
 impl CompilePipeline {
     pub fn transpile_file(input_path: &Path) -> Result<String> {
-        let ast_json = Self::export_project_ast(input_path)?;
-        let module = parse_python_ast(&ast_json)?;
+        let source = fs::read_to_string(input_path)
+            .with_context(|| format!("failed to read {}", input_path.display()))?;
+        let module = Self::parse_source(&source)?;
         let ir = lower_module(&module)?;
         let optimized = Optimizer::optimize(&ir)?;
         RustCodegen::generate(&optimized)
@@ -33,7 +46,7 @@ impl CompilePipeline {
 
     pub fn transpile_file_embedded(input_path: &Path) -> Result<String> {
         let ast_json = Self::export_project_ast(input_path)?;
-        let module = parse_python_ast(&ast_json)?;
+        let module = normalize_module(parse_python_ast(&ast_json)?);
         let ir = lower_module(&module)?;
         let optimized = Optimizer::optimize(&ir)?;
         RustCodegen::generate_embedded(&optimized).with_context(|| {
@@ -42,6 +55,31 @@ impl CompilePipeline {
                 input_path.display()
             )
         })
+    }
+
+    fn parse_source(source: &str) -> Result<tarvos_ast::Module> {
+        let parsed = ruff::parse_python(source)
+            .map_err(|error| anyhow::anyhow!("Ruff parse failure: {error}"))?;
+        if parsed.diagnostics.is_empty() {
+            return Ok(normalize_module(convert_ruff_module(parsed)));
+        }
+
+        if std::env::var_os("TARVOS_COMPAT_AST").is_some() {
+            let ast_json = export_python_ast(source)?;
+            return Ok(normalize_module(parse_python_ast(&ast_json)?));
+        }
+
+        let diagnostics = parsed
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>()
+            .join("\n");
+        Err(anyhow::anyhow!(
+            "source requires unsupported native Python syntax:\n{diagnostics}\n\
+             Use `tarvos run --compat-runtime` for the explicit compatibility path \
+             or set TARVOS_COMPAT_AST=1 for compiler-only migration."
+        ))
     }
 
     fn export_project_ast(input_path: &Path) -> Result<String> {
@@ -313,7 +351,230 @@ fn rewrite_local_module_references(
     }
 }
 
+fn convert_ruff_module(module: ruff::Module) -> tarvos_ast::Module {
+    tarvos_ast::Module {
+        body: module
+            .statements
+            .into_iter()
+            .map(convert_ruff_stmt)
+            .collect(),
+    }
+}
+
+fn convert_ruff_stmt(statement: ruff::Stmt) -> tarvos_ast::Stmt {
+    use tarvos_ast::Stmt;
+    match statement {
+        ruff::Stmt::Import { module, alias } => Stmt::Import {
+            names: vec![tarvos_ast::ImportName {
+                name: module,
+                asname: (alias != "").then_some(alias),
+            }],
+        },
+        ruff::Stmt::Function {
+            name,
+            params,
+            param_annotations,
+            returns,
+            body,
+            ..
+        } => Stmt::FunctionDef {
+            name,
+            args: params,
+            // Parameter and return annotations survive the Ruff front end so that
+            // declared signatures (including recursive calls) stay typed.
+            arg_annotations: param_annotations,
+            body: body.into_iter().map(convert_ruff_stmt).collect(),
+            returns,
+        },
+        ruff::Stmt::Assign { targets, value } => Stmt::Assign {
+            target: targets.into_iter().next().map(convert_ruff_expr).unwrap_or(
+                tarvos_ast::Expr::Tuple {
+                    elements: Vec::new(),
+                },
+            ),
+            value: convert_ruff_expr(value),
+        },
+        ruff::Stmt::Expr(value) => Stmt::Expr {
+            value: convert_ruff_expr(value),
+        },
+        ruff::Stmt::If { test, body, orelse } => Stmt::If {
+            test: convert_ruff_expr(test),
+            body: body.into_iter().map(convert_ruff_stmt).collect(),
+            orelse: orelse.into_iter().map(convert_ruff_stmt).collect(),
+        },
+        ruff::Stmt::While { test, body } => Stmt::While {
+            test: convert_ruff_expr(test),
+            body: body.into_iter().map(convert_ruff_stmt).collect(),
+        },
+        ruff::Stmt::For {
+            target, iter, body, ..
+        } => Stmt::For {
+            target: convert_ruff_expr(target),
+            iter: convert_ruff_expr(iter),
+            body: body.into_iter().map(convert_ruff_stmt).collect(),
+        },
+        ruff::Stmt::Return(value) => Stmt::Return {
+            value: value.map(convert_ruff_expr),
+        },
+        ruff::Stmt::Break => Stmt::Break,
+        ruff::Stmt::Continue => Stmt::Continue,
+        ruff::Stmt::Unsupported { kind } => Stmt::Expr {
+            value: tarvos_ast::Expr::String {
+                value: format!("unsupported Ruff node: {kind}"),
+            },
+        },
+    }
+}
+
+fn convert_ruff_expr(expression: ruff::Expr) -> tarvos_ast::Expr {
+    use tarvos_ast::Expr;
+    match expression {
+        ruff::Expr::None => Expr::None,
+        ruff::Expr::Bool(value) => Expr::Bool { value },
+        ruff::Expr::Int(value) => Expr::Int { value },
+        ruff::Expr::Float(value) => Expr::Float { value },
+        ruff::Expr::String(value) => Expr::String { value },
+        ruff::Expr::Name(value) => Expr::Name { id: value },
+        ruff::Expr::List(values) => Expr::List {
+            elements: values.into_iter().map(convert_ruff_expr).collect(),
+        },
+        ruff::Expr::Tuple(values) => Expr::Tuple {
+            elements: values.into_iter().map(convert_ruff_expr).collect(),
+        },
+        ruff::Expr::ListRepeat { values, count } => Expr::Binary {
+            left: Box::new(Expr::List {
+                elements: values.into_iter().map(convert_ruff_expr).collect(),
+            }),
+            operator: "mul".to_string(),
+            right: Box::new(convert_ruff_expr(*count)),
+        },
+        ruff::Expr::FormatString(parts) => Expr::FormatString {
+            parts: parts
+                .into_iter()
+                .map(|part| match part {
+                    ruff::FormatPart::Literal(value) => tarvos_ast::FormatPart::Literal { value },
+                    ruff::FormatPart::Value {
+                        value,
+                        format_spec,
+                        conversion,
+                    } => tarvos_ast::FormatPart::Value {
+                        value: convert_ruff_expr(*value),
+                        format_spec,
+                        conversion,
+                    },
+                })
+                .collect(),
+        },
+        ruff::Expr::Binary {
+            left,
+            operator,
+            right,
+        } => Expr::Binary {
+            left: Box::new(convert_ruff_expr(*left)),
+            operator: match operator {
+                ruff::BinaryOperator::Add => "add",
+                ruff::BinaryOperator::Sub => "sub",
+                ruff::BinaryOperator::Mul => "mul",
+                ruff::BinaryOperator::Div => "div",
+                ruff::BinaryOperator::FloorDiv => "floordiv",
+                ruff::BinaryOperator::Mod => "mod",
+                ruff::BinaryOperator::Pow => "pow",
+                ruff::BinaryOperator::BitOr => "bitor",
+                ruff::BinaryOperator::BitXor => "bitxor",
+                ruff::BinaryOperator::BitAnd => "bitand",
+                ruff::BinaryOperator::LShift => "lshift",
+                ruff::BinaryOperator::RShift => "rshift",
+            }
+            .to_string(),
+            right: Box::new(convert_ruff_expr(*right)),
+        },
+        ruff::Expr::Subscript { value, slice } => Expr::Subscript {
+            value: Box::new(convert_ruff_expr(*value)),
+            index: Box::new(convert_ruff_expr(*slice)),
+        },
+        ruff::Expr::Slice { lower, upper, step } => Expr::Slice {
+            lower: lower.map(|value| Box::new(convert_ruff_expr(*value))),
+            upper: upper.map(|value| Box::new(convert_ruff_expr(*value))),
+            step: step.map(|value| Box::new(convert_ruff_expr(*value))),
+        },
+        ruff::Expr::ListComp {
+            elt,
+            target,
+            iter,
+            condition,
+        } => Expr::ListComp {
+            elt: Box::new(convert_ruff_expr(*elt)),
+            // The bridge only accepts simple name targets, so this is already a name.
+            target,
+            iter: Box::new(convert_ruff_expr(*iter)),
+            condition: condition.map(|value| Box::new(convert_ruff_expr(*value))),
+        },
+        ruff::Expr::Set(values) => Expr::Set {
+            elements: values.into_iter().map(convert_ruff_expr).collect(),
+        },
+        ruff::Expr::Dict { keys, values } => Expr::Dict {
+            keys: keys.into_iter().map(convert_ruff_expr).collect(),
+            values: values.into_iter().map(convert_ruff_expr).collect(),
+        },
+        ruff::Expr::BoolOp { operator, values } => Expr::BoolOp {
+            operator,
+            values: values.into_iter().map(convert_ruff_expr).collect(),
+        },
+        ruff::Expr::Unary { operator, operand } => Expr::Unary {
+            operator: match operator {
+                ruff::UnaryOperator::UAdd => "uadd",
+                ruff::UnaryOperator::USub => "usub",
+                ruff::UnaryOperator::Not => "not",
+                ruff::UnaryOperator::Invert => "invert",
+            }
+            .to_string(),
+            operand: Box::new(convert_ruff_expr(*operand)),
+        },
+        ruff::Expr::Compare {
+            left,
+            operator,
+            right,
+        } => Expr::Compare {
+            left: Box::new(convert_ruff_expr(*left)),
+            operators: vec![match operator {
+                ruff::CompareOperator::Eq => "eq",
+                ruff::CompareOperator::NotEq => "ne",
+                ruff::CompareOperator::Lt => "lt",
+                ruff::CompareOperator::LtEq => "le",
+                ruff::CompareOperator::Gt => "gt",
+                ruff::CompareOperator::GtEq => "ge",
+            }
+            .to_string()],
+            comparators: vec![convert_ruff_expr(*right)],
+        },
+        ruff::Expr::Call { function, args } => {
+            let args = args.into_iter().map(convert_ruff_expr).collect();
+            match *function {
+                ruff::Expr::Attribute { object, attribute } => Expr::MethodCall {
+                    object: Box::new(convert_ruff_expr(*object)),
+                    method: attribute,
+                    args,
+                },
+                function => Expr::Call {
+                    function: Box::new(convert_ruff_expr(function)),
+                    args,
+                    keywords: Vec::new(),
+                },
+            }
+        }
+        ruff::Expr::Attribute { object, attribute } => Expr::Attribute {
+            value: Box::new(convert_ruff_expr(*object)),
+            attr: attribute,
+        },
+        ruff::Expr::Await(value) => convert_ruff_expr(*value),
+        ruff::Expr::Unsupported { kind } => Expr::String {
+            value: format!("unsupported Ruff expression: {kind}"),
+        },
+    }
+}
+
 pub fn export_python_ast(source: &str) -> Result<String> {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let script_path = std::env::temp_dir().join(format!(
         "tarvos-ast-export-{}-{}.py",
         std::process::id(),

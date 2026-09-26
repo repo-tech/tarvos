@@ -78,7 +78,20 @@ class PythonAstExporter(ast.NodeVisitor):
         }
 
     def visit_AugAssign(self, node):
-        operators = {ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul", ast.Div: "div", ast.Mod: "mod"}
+        operators = {
+            ast.Add: "add",
+            ast.Sub: "sub",
+            ast.Mult: "mul",
+            ast.Div: "div",
+            ast.FloorDiv: "floordiv",
+            ast.Mod: "mod",
+            ast.Pow: "pow",
+            ast.BitAnd: "bitand",
+            ast.BitOr: "bitor",
+            ast.BitXor: "bitxor",
+            ast.LShift: "lshift",
+            ast.RShift: "rshift",
+        }
         op_type = type(node.op)
         if op_type not in operators:
             raise ValueError(
@@ -145,7 +158,20 @@ class PythonAstExporter(ast.NodeVisitor):
         raise ValueError(f"unsupported constant: {type(value).__name__}")
 
     def visit_BinOp(self, node):
-        operators = {ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul", ast.Div: "div", ast.Mod: "mod", ast.Pow: "pow", ast.BitAnd: "and", ast.BitOr: "or"}
+        operators = {
+            ast.Add: "add",
+            ast.Sub: "sub",
+            ast.Mult: "mul",
+            ast.Div: "div",
+            ast.FloorDiv: "floordiv",
+            ast.Mod: "mod",
+            ast.Pow: "pow",
+            ast.BitAnd: "bitand",
+            ast.BitOr: "bitor",
+            ast.BitXor: "bitxor",
+            ast.LShift: "lshift",
+            ast.RShift: "rshift",
+        }
         op_type = type(node.op)
         if op_type not in operators:
             raise ValueError(
@@ -408,6 +434,7 @@ class PythonAstExporter(ast.NodeVisitor):
 
 def export_python_ast(source):
     try:
+        source = source.lstrip("\ufeff")
         tree = ast.parse(source)
     except SyntaxError as error:
         line = error.lineno or 0

@@ -233,6 +233,16 @@ impl Optimizer {
                         value: new_val,
                     });
                 }
+                Stmt::Destructure { targets, value } => {
+                    let new_val = Self::substitute_value(value, &env);
+                    for target in targets {
+                        env.remove(target);
+                    }
+                    result.push(Stmt::Destructure {
+                        targets: targets.clone(),
+                        value: new_val,
+                    });
+                }
                 Stmt::FieldAssign {
                     object,
                     field,
@@ -246,15 +256,18 @@ impl Optimizer {
                 }
                 Stmt::IndexAssign {
                     target,
-                    index,
+                    indices,
                     value,
                 } => {
-                    let new_idx = Self::substitute_value(index, &env);
+                    let new_indices = indices
+                        .iter()
+                        .map(|index| Self::substitute_value(index, &env))
+                        .collect();
                     let new_val = Self::substitute_value(value, &env);
                     env.remove(target);
                     result.push(Stmt::IndexAssign {
                         target: target.clone(),
-                        index: new_idx,
+                        indices: new_indices,
                         value: new_val,
                     });
                 }
@@ -613,6 +626,10 @@ impl Optimizer {
                     value: folded_value,
                 })
             }
+            Stmt::Destructure { targets, value } => Ok(Stmt::Destructure {
+                targets: targets.clone(),
+                value: Self::fold_value(value)?,
+            }),
             Stmt::FieldAssign {
                 object,
                 field,
@@ -624,11 +641,14 @@ impl Optimizer {
             }),
             Stmt::IndexAssign {
                 target,
-                index,
+                indices,
                 value,
             } => Ok(Stmt::IndexAssign {
                 target: target.clone(),
-                index: Self::fold_value(index)?,
+                indices: indices
+                    .iter()
+                    .map(|index| Self::fold_value(index))
+                    .collect::<Result<Vec<_>>>()?,
                 value: Self::fold_value(value)?,
             }),
             Stmt::ListAppend { target, value } => Ok(Stmt::ListAppend {
@@ -938,6 +958,33 @@ impl Optimizer {
                 }
                 left % right
             }
+            BinaryOp::FloorDiv => {
+                if right == 0 {
+                    return None;
+                }
+                let quotient = left.checked_div(right)?;
+                let remainder = left.checked_rem(right)?;
+                if remainder != 0 && ((remainder < 0) != (right < 0)) {
+                    quotient.checked_sub(1)?
+                } else {
+                    quotient
+                }
+            }
+            BinaryOp::BitAnd => left & right,
+            BinaryOp::BitOr => left | right,
+            BinaryOp::BitXor => left ^ right,
+            BinaryOp::LShift => {
+                if !(0..i64::BITS as i64).contains(&right) {
+                    return None;
+                }
+                left.checked_shl(right as u32)?
+            }
+            BinaryOp::RShift => {
+                if !(0..i64::BITS as i64).contains(&right) {
+                    return None;
+                }
+                left.checked_shr(right as u32)?
+            }
             _ => return None,
         })
     }
@@ -954,6 +1001,13 @@ impl Optimizer {
 
                 left / right
             }
+            BinaryOp::FloorDiv => {
+                if right == 0.0 {
+                    return None;
+                }
+
+                (left / right).floor()
+            }
             _ => return None,
         })
     }
@@ -965,6 +1019,22 @@ impl Optimizer {
             BinaryOp::Mul => left.checked_mul(right)?,
             BinaryOp::Div => left.checked_div(right)?,
             BinaryOp::Mod => left.checked_rem(right)?,
+            BinaryOp::FloorDiv => left.checked_div(right)?,
+            BinaryOp::BitAnd => left & right,
+            BinaryOp::BitOr => left | right,
+            BinaryOp::BitXor => left ^ right,
+            BinaryOp::LShift => {
+                if !(0..u128::BITS as u128).contains(&right) {
+                    return None;
+                }
+                left.checked_shl(right as u32)?
+            }
+            BinaryOp::RShift => {
+                if !(0..u128::BITS as u128).contains(&right) {
+                    return None;
+                }
+                left.checked_shr(right as u32)?
+            }
             _ => return None,
         })
     }
@@ -1091,6 +1161,10 @@ impl Optimizer {
                 name: name.clone(),
                 value: Self::eliminate_value(value),
             },
+            Stmt::Destructure { targets, value } => Stmt::Destructure {
+                targets: targets.clone(),
+                value: Self::eliminate_value(value),
+            },
             Stmt::FieldAssign {
                 object,
                 field,
@@ -1102,11 +1176,11 @@ impl Optimizer {
             },
             Stmt::IndexAssign {
                 target,
-                index,
+                indices,
                 value,
             } => Stmt::IndexAssign {
                 target: target.clone(),
-                index: Self::eliminate_value(index),
+                indices: indices.iter().map(Self::eliminate_value).collect(),
                 value: Self::eliminate_value(value),
             },
             Stmt::ListAppend { target, value } => Stmt::ListAppend {
@@ -1306,6 +1380,11 @@ impl Optimizer {
                 names.insert(name.clone());
                 names
             }
+            Stmt::Destructure { targets, value } => {
+                let mut names = Self::value_names(value);
+                names.extend(targets.iter().cloned());
+                names
+            }
             Stmt::FieldAssign { object, value, .. } => {
                 let mut names = Self::value_names(object);
                 names.extend(Self::value_names(value));
@@ -1313,12 +1392,14 @@ impl Optimizer {
             }
             Stmt::IndexAssign {
                 target,
-                index,
+                indices,
                 value,
             } => {
                 let mut names = HashSet::new();
                 names.insert(target.clone());
-                names.extend(Self::value_names(index));
+                for index in indices {
+                    names.extend(Self::value_names(index));
+                }
                 names.extend(Self::value_names(value));
                 names
             }

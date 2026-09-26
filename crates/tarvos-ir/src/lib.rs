@@ -25,6 +25,11 @@ pub enum Stmt {
         name: String,
         value: Value,
     },
+    /// Assign tuple elements to names in one evaluation.
+    Destructure {
+        targets: Vec<String>,
+        value: Value,
+    },
     FieldAssign {
         object: Value,
         field: String,
@@ -32,10 +37,10 @@ pub enum Stmt {
     },
     /// Print statement (multi-argument supported)
     Print(Vec<Value>),
-    /// Subscript mutation: target[index] = value;
+    /// Subscript mutation through an index chain: `target[i0][i1]... = value;`
     IndexAssign {
         target: String,
-        index: Value,
+        indices: Vec<Value>,
         value: Value,
     },
     /// If statement
@@ -200,6 +205,8 @@ pub enum FormatPart {
 pub enum UnaryOp {
     Neg,
     Not,
+    /// Python `~value` (bitwise NOT) on native integers.
+    Invert,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -218,6 +225,12 @@ pub enum BinaryOp {
     And,
     Or,
     Pow,
+    BitXor,
+    BitAnd,
+    BitOr,
+    LShift,
+    RShift,
+    FloorDiv,
 }
 
 impl BinaryOp {
@@ -237,6 +250,12 @@ impl BinaryOp {
             BinaryOp::And => "&&",
             BinaryOp::Or => "||",
             BinaryOp::Pow => "**",
+            BinaryOp::BitXor => "^",
+            BinaryOp::BitAnd => "&",
+            BinaryOp::BitOr => "|",
+            BinaryOp::LShift => "<<",
+            BinaryOp::RShift => ">>",
+            BinaryOp::FloorDiv => "//",
         }
     }
 }

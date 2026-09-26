@@ -17,12 +17,12 @@ BUILD_TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 PRESETS = {
     "dev": {
-        "rustflags": "",
-        "cranelift": False,
+        "rustflags": "-C opt-level=2 -C codegen-units=1 debuginfo=0",
+        "cranelift": True,
     },
     "release": {
-        "rustflags": "-C opt-level=2 -C codegen-units=1",
-        "cranelift": False,
+        "rustflags": "-C opt-level=2 -C codegen-units=1 debuginfo=0",
+        "cranelift": True,
     },
     "cranelift": {
         "rustflags": "-C codegen-units=1 -C debuginfo=0",

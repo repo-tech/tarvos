@@ -1,7 +1,9 @@
 {
   "arithmetic.py": "15150",
+  "bitwise_xorshift.py": "131072\n2428744725\n9487284\n16720\n2428",
   "branching.py": "1",
   "comparisons.py": "True\nFalse\nTrue",
+  "matrix_multiply.py": "688248",
   "function_calls.py": "12",
   "integer_loops.py": "4999950000",
   "list_indexing.py": "80",
