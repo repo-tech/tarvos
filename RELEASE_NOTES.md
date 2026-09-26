@@ -103,7 +103,7 @@ against the tagged commit `cb1c333`, including the ones that did not pass.
   `scripts/extract_release_notes.py` and published by the release workflow.
   GitHub's auto-generated notes are deliberately disabled, and the extractor
   refuses to emit more than one comparison link, because auto-generation
-  previously appended a second "Full Changelog" block to the hand-written body.
+  previously appended a second comparison link to the hand-written body.
 - The release workflow verifies before it publishes: the release tag must exist,
   must be an ancestor of `main`, must match the workspace version, and must have
   a non-empty body.
