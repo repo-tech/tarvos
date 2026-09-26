@@ -72,7 +72,9 @@ jobs:
         run: cargo test --workspace --no-fail-fast
 
   cross-target:
-    name: Cross-target build (${{ matrix.target }})
+    # A static job name: GitHub renders a matrix expression in `name` literally,
+    # which turns a failure notification into "${{ matrix.target }} failed".
+    name: Cross-target build
     # Release-grade cross-platform artifacts are built by release.yml from the
     # tag. This sweep exists so a target that stopped compiling is still caught
     # between releases, which is why it must not run on every commit.
