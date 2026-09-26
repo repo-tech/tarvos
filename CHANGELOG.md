@@ -6,37 +6,75 @@ All notable changes to Tarvos are documented here. The format follows
 
 ## [Unreleased]
 
-Release-engineering follow-up to the `v1.1.0-rc.3` tag. No product behaviour
-changes; the tag was not moved.
+CI/CD and release-pipeline work. No compiler behaviour changes. The
+`v1.1.0-rc.3` tag was not moved and its published release description was not
+rewritten.
 
-### Fixed
+### Changed - workflow responsibilities
 
-- The release workflow checked out the default branch instead of the release
-  tag, so a `workflow_dispatch` publish would have built `main` HEAD and
-  uploaded it under the release tag. The build jobs now check out
-  `inputs.release_tag || github.ref`.
-- The workflow published release assets only to the distribution repository
-  `repo-tech/tarvos-engine`, so the compiler repository never received a
-  GitHub release for its own tag, and `install.ps1` (which downloads
-  `tarvos-windows-x86_64.exe` from this repository) had nothing to install.
-  A `publish-source-release` job now creates or updates the release here,
-  refuses to run unless the tag already exists, and titles it `Tarvos <tag>`.
-- `scripts/extract_release_notes.py` now rejects a section that would emit more
-  than one comparison link, so a duplicated "Full Changelog" block cannot be
-  published again.
-- `scripts/extract_release_notes.py` writes UTF-8 bytes instead of text, so
-  generating a release body on Windows no longer emits console-code-page bytes
-  that mangle the notes.
-- The release-validation workflow is no longer named after a specific release
-  candidate. Its title was a version site that had to be edited on every
-  release, so it is now version neutral and the check was removed from
-  `scripts/check_version_consistency.py` (13 sites remain, all still gated).
-- `cargo fmt` is now a CI gate (`formatting` job), fixing the single
-  line-wrap deviation the `v1.1.0-rc.3` Clippy cleanup introduced.
-- The obsolete `v1.2.0` draft release in this repository, which referenced no
-  existing tag and carried a duplicated "Full Changelog" body, was deleted.
-  The `v1.1.0-rc.3` release was published in its place, carrying the notes from
-  `RELEASE_NOTES.md` and the Windows CLI built from the tagged commit.
+- `ci.yml` is now the only "is the source healthy?" workflow. It runs
+  `fmt`, `check`, `clippy`, and `cargo test --no-fail-fast` on a single Linux
+  runner, on pull requests and pushes to `main`. It no longer runs on tags and
+  no longer builds release artifacts.
+- Cross-platform verification moved to a `cross-target` job that runs on demand
+  and on a weekly schedule instead of on every commit. A normal commit no longer
+  pays for five cross-target builds.
+- `.github/workflows/release-ci.yml` was deleted. Its release-grade validation
+  (workspace tests, the production validation suite, the compile/build smoke
+  test) moved into `release.yml` as the `validate` job, and its benchmark
+  matrix became the non-gating `benchmarks` job. Previously the same tests ran
+  on every push to `main` while releases skipped them.
+- `release.yml` is the only workflow that may create or edit a release. It runs
+  on a pushed `v*` tag or a manual dispatch that names an existing tag, never
+  on a branch push.
+
+### Fixed - release safety
+
+- The release gate checked out the default branch, so a `workflow_dispatch`
+  publish validated the metadata of `main` instead of the commit being
+  released. Every job in the pipeline now checks out the release tag.
+- The pipeline asserted that the tag exists and matches the version, but never
+  that the checked-out tree was the tagged commit. It now fails with
+  `Wrong source commit` when they differ.
+- A blank, `main`, or malformed `release_tag` is refused with a specific error
+  instead of resolving to a branch. The dispatch input no longer carries a
+  hard-coded version default, which was a footgun that republished a stale
+  release.
+- Release binaries were built with `-C target-cpu=native`, producing a binary
+  tuned to the runner's CPU that can fault on older hardware. Release builds are
+  now portable; size and stripping are unchanged.
+- The built CLI's reported version is checked against the release tag, and each
+  release asset is required to exist together with its checksum before anything
+  is published.
+- A leftover draft release for the tag is refused rather than silently edited.
+- `fail_on_unmatched_files` and `overwrite_files` were set on the distribution
+  upload, so a re-run replaces assets by name instead of accumulating
+  duplicates.
+
+### Changed - permissions, concurrency, and reporting
+
+- `ci.yml` declares `permissions: contents: read` explicitly, as does
+  `release.yml` at workflow level. Only the `publish-source-release` job holds
+  `contents: write`.
+- Release concurrency is keyed on the release tag, so two different tags do not
+  block each other, and `cancel-in-progress` stays false: a publication is never
+  cancelled by a newer run.
+- CI cancels only superseded pull request runs, never push, schedule, or manual
+  runs.
+- Guard failures emit `::error title=...` annotations, and each job prints the
+  tag, commit, target, and version it is working on, so a failure identifies
+  itself instead of exiting silently. No step suppresses a failure with
+  `|| true`.
+- `check_version_consistency.py` now runs in exactly one place, the release
+  gate, against the tagged commit. The two workflow-internal version sites were
+  removed, leaving 12 version sites that are all shipped metadata.
+
+### Known limitation
+
+- The `repo-tech/tarvos-engine` release for `v1.1.0-rc.3` is still
+  outstanding. It depends on GitHub Actions runners, and every job on this
+  account currently fails before its first step with no log. The compiler source
+  release in `repo-tech/tarvos` is unaffected and complete.
 
 ## [1.1.0-rc.3] - release candidate
 
