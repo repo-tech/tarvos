@@ -177,14 +177,9 @@ def declarations() -> list[tuple[str, str, str | None]]:
             extract("README.md", r"badge/version-(\S+?)-blue"),
         ),
         (
-            ".github/workflows/release-ci.yml",
-            "workflow title",
-            extract(
-                ".github/workflows/release-ci.yml",
-                r'^name: Tarvos (\S+) release validation',
-            ),
-        ),
-        (
+            # A workflow file name is deliberately not a version site: the
+            # release-validation workflow is version neutral, so the version
+            # only has to be updated in one place, the Cargo workspace.
             ".github/workflows/release.yml",
             "dispatch default",
             extract(".github/workflows/release.yml", r'default: "v([^"]+)"'),

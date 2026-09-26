@@ -24,10 +24,19 @@ changes; the tag was not moved.
 - `scripts/extract_release_notes.py` now rejects a section that would emit more
   than one comparison link, so a duplicated "Full Changelog" block cannot be
   published again.
+- `scripts/extract_release_notes.py` writes UTF-8 bytes instead of text, so
+  generating a release body on Windows no longer emits console-code-page bytes
+  that mangle the notes.
+- The release-validation workflow is no longer named after a specific release
+  candidate. Its title was a version site that had to be edited on every
+  release, so it is now version neutral and the check was removed from
+  `scripts/check_version_consistency.py` (13 sites remain, all still gated).
 - `cargo fmt` is now a CI gate (`formatting` job), fixing the single
   line-wrap deviation the `v1.1.0-rc.3` Clippy cleanup introduced.
 - The obsolete `v1.2.0` draft release in this repository, which referenced no
   existing tag and carried a duplicated "Full Changelog" body, was deleted.
+  The `v1.1.0-rc.3` release was published in its place, carrying the notes from
+  `RELEASE_NOTES.md` and the Windows CLI built from the tagged commit.
 
 ## [1.1.0-rc.3] - release candidate
 
