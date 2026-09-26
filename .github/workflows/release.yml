@@ -1,4 +1,18 @@
-name: Tarvos Production Release
+name: Release
+
+# The only workflow that may create or edit a release.
+#
+# Responsibilities, in order:
+#   verify   -> the tag exists, is an ancestor of main, matches the workspace
+#               version, and the checked-out tree IS the tagged commit
+#   validate -> release-grade compiler validation of the tagged source
+#   build    -> cross-platform binaries, checksums, and the Windows installer,
+#               produced from the tag and never from main HEAD
+#   publish  -> idempotent release publication, in this repository and in the
+#               separate distribution repository
+#
+# Nothing here runs for an ordinary push to main. A release is either an
+# existing tag being pushed, or a manual dispatch that names that tag.
 
 on:
   push:
@@ -7,28 +21,36 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Existing release tag to publish"
+        description: "Existing release tag to publish, for example v1.1.0-rc.3"
         required: true
-        default: "v1.1.0-rc.3"
+        type: string
 
-# The workflow only builds and validates artifacts; publishing uses the
-# dedicated distribution token, so the default GITHUB_TOKEN only needs read
-# access to this repository.
+# Default for every job: read only. The publication job opts in to exactly the
+# extra scope it needs, so nothing else in the repository can write.
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  # One active publication per release tag. Different tags do not block each
+  # other, and an in-flight publication is never cancelled by a newer run.
+  group: release-${{ inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  verify-release-source:
-    name: Verify release source and version
+  verify:
+    name: Verify release source, tag, and version
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
     steps:
-      - name: Check out source
+      - name: Check out the release tag
         uses: actions/checkout@v4
         with:
+          # The gate must inspect the release source, not the default branch. A
+          # workflow_dispatch run checks out `main` by default, which would
+          # validate the metadata of a commit that is never shipped.
+          ref: ${{ inputs.release_tag || github.ref }}
           fetch-depth: 0
 
       - name: Set up Python
@@ -36,39 +58,162 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Verify version metadata consistency
-        run: python scripts/check_version_consistency.py
-
-      - name: Verify the release tag exists and matches the workspace version
+      - name: Report release context
         shell: bash
-        env:
-          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
-          python scripts/check_version_consistency.py --require-tag "$RELEASE_TAG"
+          echo "workflow : ${{ github.workflow }}"
+          echo "event    : ${{ github.event_name }}"
+          echo "tag      : $RELEASE_TAG"
+          echo "checkout : $(git rev-parse HEAD)"
+          echo -n "workspace version: "
+          awk '/^version = /{ gsub(/"/, "", $3); print $3; exit }' Cargo.toml
 
-      - name: Verify the release tag points into main history
+      - name: Guard the release tag
         shell: bash
-        env:
-          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
-          git rev-parse --verify "refs/tags/$RELEASE_TAG" >/dev/null
-          git merge-base --is-ancestor "refs/tags/$RELEASE_TAG" origin/main
+          if [ -z "${RELEASE_TAG:-}" ] || [ "$RELEASE_TAG" = "main" ]; then
+            echo "::error title=No release tag::Set the release_tag input to an existing tag such as v1.1.0-rc.3. Refusing to publish from a branch."
+            exit 1
+          fi
+          if [[ "$RELEASE_TAG" != v* ]]; then
+            echo "::error title=Malformed release tag::'$RELEASE_TAG' is not a version tag (expected vMAJOR.MINOR.PATCH[-rc.N])."
+            exit 1
+          fi
+          if ! git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG" >/dev/null; then
+            echo "::error title=Missing release tag::Tag '$RELEASE_TAG' does not exist. A release must never invent a version."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "refs/tags/$RELEASE_TAG" origin/main; then
+            echo "::error title=Tag not on main::'$RELEASE_TAG' is not an ancestor of origin/main. Refusing to release untagged history."
+            exit 1
+          fi
 
-      - name: Verify the release body exists for the tag
+      - name: Verify the checked-out tree is the tagged commit
         shell: bash
-        env:
-          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
-          python scripts/extract_release_notes.py "$RELEASE_TAG" > /tmp/release-body.md
-          test -s /tmp/release-body.md
+          tag_commit="$(git rev-list -n 1 "$RELEASE_TAG")"
+          head_commit="$(git rev-parse HEAD)"
+          echo "tag commit : $tag_commit"
+          echo "HEAD       : $head_commit"
+          if [ "$tag_commit" != "$head_commit" ]; then
+            echo "::error title=Wrong source commit::HEAD ($head_commit) is not $RELEASE_TAG ($tag_commit). Artifacts would not match the tag."
+            exit 1
+          fi
+
+      - name: Verify release metadata and version consistency
+        run: python scripts/check_version_consistency.py --require-tag "$RELEASE_TAG"
+
+      - name: Verify the release description
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/extract_release_notes.py "$RELEASE_TAG" > release-body.md
+          if [ ! -s release-body.md ]; then
+            echo "::error title=Empty release body::RELEASE_NOTES.md has no usable section for $RELEASE_TAG"
+            exit 1
+          fi
+          links="$(awk '/^https:\/\/github\.com\/repo-tech\/tarvos\/compare\//{c++} END{print c+0}' release-body.md)"
+          echo "comparison links: $links (expected 1)"
+          if [ "$links" -gt 1 ]; then
+            echo "::error title=Duplicated changelog::The release body would contain $links comparison links. Exactly one is allowed."
+            exit 1
+          fi
+          echo "description lines: $(wc -l < release-body.md)"
+
+  validate:
+    name: Validate the release source
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Report validation context
+        run: |
+          echo "tag    : $RELEASE_TAG"
+          echo "commit : $(git rev-parse HEAD)"
+          echo "cargo  : $(cargo --version)"
+
+      - name: Build the CLI
+        run: cargo build --release --bin tarvos
+
+      - name: Run workspace tests
+        run: cargo test --workspace --no-fail-fast
+
+      - name: Run the production validation suite
+        run: python validation/run_validation.py
+
+      - name: Verify the compile and native build flows
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .build-tmp/release-smoke
+          ./target/release/tarvos compile examples/simple.py --output .build-tmp/release-smoke/simple.rs
+          ./target/release/tarvos build examples/simple.py --output .build-tmp/release-smoke/simple
+          test -s .build-tmp/release-smoke/simple.rs
+          actual="$(.build-tmp/release-smoke/simple)"
+          echo "program output: $actual"
+          if [ "$actual" != "50000005000000" ]; then
+            echo "::error title=Smoke test mismatch::expected 50000005000000, got $actual"
+            exit 1
+          fi
+
+      - name: Run the native-vs-CPython differential suite
+        run: python scripts/diff_test.py --binary target/release/tarvos
+
+  benchmarks:
+    name: Record benchmark measurements
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Measurement, not a gate. The numbers are attached to the run as
+      # evidence for the release notes; publication does not wait on them, so a
+      # slow or busy runner cannot block a release. Nothing is suppressed: a
+      # real failure still fails this job and stays visible in the run.
+      - name: Run benchmark matrix
+        run: python benchmarks/benchmark_matrix.py --runtime all --repeats 7 --json-output benchmarks/results/runtime_matrix.json
+
+      - name: Upload runtime matrix JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-matrix-${{ inputs.release_tag || github.ref_name }}
+          path: benchmarks/results/runtime_matrix.json
 
   build:
-    name: Build release binary
-    needs: verify-release-source
+    name: Build ${{ matrix.platform }}
+    needs: verify
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -87,11 +232,15 @@ jobs:
             binary_name: tarvos
 
     env:
-      RUSTFLAGS: "-C opt-level=z -C strip=symbols -C target-cpu=native"
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+      # Size- and stripping-oriented flags, but deliberately portable.
+      # -C target-cpu=native produced a binary tuned to the runner's own CPU
+      # that can fault on older hardware, which is unacceptable in a download.
+      RUSTFLAGS: "-C opt-level=z -C strip=symbols"
       CARGO_INCREMENTAL: "0"
 
     steps:
-      - name: Check out tagged source
+      - name: Check out the release tag
         uses: actions/checkout@v4
         with:
           # Always build the tagged commit. Without an explicit `ref`, a
@@ -103,8 +252,39 @@ jobs:
       - name: Set up stable Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Report build context
+        shell: bash
+        run: |
+          set -euo pipefail
+          head_commit="$(git rev-parse HEAD)"
+          tag_commit="$(git rev-list -n 1 "$RELEASE_TAG")"
+          echo "tag        : $RELEASE_TAG"
+          echo "tag commit : $tag_commit"
+          echo "HEAD       : $head_commit"
+          echo "target     : ${{ matrix.platform }}"
+          echo "asset      : ${{ matrix.asset_name }}"
+          echo "rustflags  : $RUSTFLAGS"
+          if [ "$tag_commit" != "$head_commit" ]; then
+            echo "::error title=Wrong source commit::${{ matrix.platform }} would be built from $head_commit instead of $tag_commit"
+            exit 1
+          fi
+
       - name: Build optimized CLI
         run: cargo build --release --bin tarvos
+
+      - name: Report the built CLI version
+        shell: bash
+        run: |
+          set -euo pipefail
+          reported="$(./target/release/tarvos --version)"
+          echo "$reported"
+          case "$reported" in
+            *"$RELEASE_TAG"|*"${RELEASE_TAG#v}") ;;
+            *)
+              echo "::error title=Version mismatch::binary reports '$reported' but the release tag is $RELEASE_TAG"
+              exit 1
+              ;;
+          esac
 
       - name: Stage Windows binary
         if: runner.os == 'Windows'
@@ -119,7 +299,7 @@ jobs:
           $hash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  ${{ matrix.asset_name }}" | Set-Content -LiteralPath "$destination.sha256" -NoNewline
 
-      - name: Build blue Windows setup executable
+      - name: Build the Windows setup executable
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -129,7 +309,7 @@ jobs:
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\Tarvos.iss
           $setup = "installer\output\Tarvos-Setup-Windows-x86_64.exe"
           if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) {
-            throw "Windows setup executable was not produced."
+            throw "Windows setup executable was not produced by Inno Setup."
           }
           Copy-Item $setup Tarvos-Setup-Windows-x86_64.exe
           $hash = (Get-FileHash Tarvos-Setup-Windows-x86_64.exe -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -142,10 +322,14 @@ jobs:
           set -euo pipefail
           source="target/release/${{ matrix.binary_name }}"
           destination="${{ matrix.asset_name }}"
-          test -f "$source"
+          if [ ! -f "$source" ]; then
+            echo "::error title=Missing release binary::$source was not produced for ${{ matrix.platform }}"
+            exit 1
+          fi
           cp "$source" "$destination"
           chmod 0755 "$destination"
           shasum -a 256 "$destination" > "$destination.sha256"
+          "$destination" --version
 
       - name: Upload staged binary
         uses: actions/upload-artifact@v4
@@ -169,14 +353,16 @@ jobs:
           retention-days: 1
 
   publish-source-release:
-    name: Publish source release on GitHub
-    needs: [verify-release-source, build]
+    name: Publish the compiler release on GitHub
+    needs: [verify, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
     steps:
-      - name: Check out release metadata
+      - name: Check out the release tag
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.release_tag || github.ref }}
@@ -187,50 +373,84 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Prepare release body from RELEASE_NOTES.md
+      - name: Report publication context
+        run: |
+          echo "tag        : $RELEASE_TAG"
+          echo "tag commit : $(git rev-list -n 1 "$RELEASE_TAG")"
+          echo "repository : ${{ github.repository }}"
+
+      - name: Prepare the release description
         shell: bash
-        env:
-          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
           python scripts/extract_release_notes.py "$RELEASE_TAG" > release-body.md
-          test -s release-body.md
-          # At most one comparison link. Auto-generated notes used to append a
-          # second "Full Changelog" block to the hand-written one, which is the
-          # duplicated body seen on the deleted v1.2.0 draft.
-          links="$(grep -c '^https://github.com/repo-tech/tarvos/compare/' release-body.md || true)"
-          test "$links" -le 1
+          if [ ! -s release-body.md ]; then
+            echo "::error title=Empty release body::no description could be produced for $RELEASE_TAG"
+            exit 1
+          fi
+          links="$(awk '/^https:\/\/github\.com\/repo-tech\/tarvos\/compare\//{c++} END{print c+0}' release-body.md)"
+          if [ "$links" -gt 1 ]; then
+            echo "::error title=Duplicated changelog::release body has $links comparison links"
+            exit 1
+          fi
+          echo "description prepared: $(wc -l < release-body.md) lines"
 
-      - name: Create or update the GitHub release for the tag
+      # Idempotent by construction: a release that already exists for the tag is
+      # updated, never duplicated, and no assets are re-uploaded here. A leftover
+      # draft is refused rather than silently edited, so a half-finished release
+      # cannot be mistaken for a published one.
+      - name: Create or update the release for the tag
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        shell: bash
         run: |
           set -euo pipefail
-          # A release must never invent a version: the tag has to exist already.
           git rev-parse --verify "refs/tags/$RELEASE_TAG"
           title="Tarvos $RELEASE_TAG"
+          expected_pre="false"
+          if [[ "$RELEASE_TAG" == *-* ]]; then expected_pre="true"; fi
+
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            draft="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)"
+            if [ "$draft" = "true" ]; then
+              echo "::error title=Draft release::$RELEASE_TAG is still an unfinished draft. Publish or delete it before re-running this workflow."
+              exit 1
+            fi
             gh release edit "$RELEASE_TAG" --title "$title" --notes-file release-body.md
           else
             gh release create "$RELEASE_TAG" \
               --title "$title" \
               --notes-file release-body.md \
               --verify-tag \
-              --prerelease="$([[ "$RELEASE_TAG" == *-* ]] && echo true || echo false)"
+              --prerelease="$expected_pre"
+          fi
+
+          actual_pre="$(gh release view "$RELEASE_TAG" --json isPrerelease --jq .isPrerelease)"
+          if [ "$actual_pre" != "$expected_pre" ]; then
+            echo "::error title=Wrong prerelease flag::$RELEASE_TAG should be prerelease=$expected_pre but is $actual_pre"
+            exit 1
           fi
           gh release view "$RELEASE_TAG" --json tagName,name,isDraft,isPrerelease,url
 
   publish-distribution:
-    name: Publish distribution assets
-    needs: [verify-release-source, build]
+    name: Publish distribution artifacts
+    needs: [verify, build]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
       actions: read
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+      # The compiler source release lives in repo-tech/tarvos. The cross-platform
+      # binaries and the Windows installer are mirrored to this separate
+      # distribution repository, which holds the published artifact history for
+      # v1.0.0, v1.1.0-rc.1, and v1.1.0-rc.2. The destination is an explicit
+      # repository variable, not a hidden constant and not a secret, because it
+      # is not a credential.
+      DISTRIBUTION_REPO: ${{ vars.TARVOS_DISTRIBUTION_REPO || 'repo-tech/tarvos-engine' }}
     steps:
-      - name: Check out release metadata
+      - name: Check out the release tag
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.release_tag || github.ref }}
@@ -240,14 +460,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Prepare release body from RELEASE_NOTES.md
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+      - name: Report publication context
         run: |
-          set -euo pipefail
-          python scripts/extract_release_notes.py "$RELEASE_TAG" > release-body.md
-          test -s release-body.md
+          echo "tag               : $RELEASE_TAG"
+          echo "source repository : ${{ github.repository }}"
+          echo "target repository : $DISTRIBUTION_REPO"
 
       - name: Download production binaries
         uses: actions/download-artifact@v4
@@ -262,7 +479,7 @@ jobs:
           name: Tarvos-Setup-Windows-x86_64
           path: release-assets
 
-      - name: Verify release asset boundary
+      - name: Verify the release asset set
         shell: bash
         run: |
           set -euo pipefail
@@ -270,20 +487,30 @@ jobs:
             "tarvos-windows-x86_64.exe"
             "tarvos-linux-x86_64"
             "tarvos-macos-x86_64"
+            "Tarvos-Setup-Windows-x86_64.exe"
           )
           for asset in "${expected[@]}"; do
-            test -f "release-assets/$asset"
-            test -f "release-assets/$asset.sha256"
+            if [ ! -f "release-assets/$asset" ]; then
+              echo "::error title=Missing release artifact::$asset was not produced for $RELEASE_TAG"
+              exit 1
+            fi
+            if [ ! -f "release-assets/$asset.sha256" ]; then
+              echo "::error title=Missing checksum::$asset.sha256 was not produced for $RELEASE_TAG"
+              exit 1
+            fi
           done
-          test -f release-assets/Tarvos-Setup-Windows-x86_64.exe
-          test -f release-assets/Tarvos-Setup-Windows-x86_64.exe.sha256
           find release-assets -type f -printf '%f\n' | sort
-          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 8
+          count="$(find release-assets -maxdepth 1 -type f | wc -l)"
+          echo "asset count: $count (expected 8)"
+          if [ "$count" -ne 8 ]; then
+            echo "::error title=Unexpected artifact set::expected exactly 8 files, found $count"
+            exit 1
+          fi
 
-      - name: Upload production binaries to GitHub Release
+      - name: Upload the distribution artifacts
         uses: softprops/action-gh-release@v2
         with:
-          repository: repo-tech/tarvos-engine
+          repository: ${{ env.DISTRIBUTION_REPO }}
           token: ${{ secrets.TARVOS_DISTRIBUTION_TOKEN }}
           tag_name: ${{ inputs.release_tag || github.ref_name }}
           # The body comes from RELEASE_NOTES.md only. Auto-generated notes
@@ -300,5 +527,9 @@ jobs:
             release-assets/tarvos-linux-x86_64.sha256
             release-assets/tarvos-macos-x86_64
             release-assets/tarvos-macos-x86_64.sha256
+          # Re-running replaces the same asset names instead of accumulating
+          # duplicates, and a missing file is an error rather than a silent skip.
+          fail_on_unmatched_files: true
+          overwrite_files: true
           draft: false
           prerelease: ${{ contains(inputs.release_tag || github.ref_name, '-') }}
