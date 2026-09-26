@@ -58,7 +58,10 @@ def main(argv: list[str]) -> int:
         )
         return 1
 
-    sys.stdout.write(section)
+    # Emit UTF-8 bytes rather than text. The default stdout encoding on Windows
+    # is the console code page, which silently mangles the em dashes in the
+    # notes into invalid UTF-8 and corrupts the published release body.
+    sys.stdout.buffer.write(section.encode("utf-8"))
     return 0
 
 
