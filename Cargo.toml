@@ -15,6 +15,17 @@ members = [
     "crates/tarvos-tests",
 ]
 
+# Canonical product version.
+#
+# Every workspace member inherits this with `version.workspace = true`, so the
+# Cargo workspace is the only place a crate version is written down. Release
+# metadata outside Cargo (installer, launcher, README, gateway banner) is
+# verified against this value by `scripts/check_version_consistency.py`, which
+# CI runs on every push.
+[workspace.package]
+version = "1.1.0-rc.3"
+edition = "2021"
+
 [profile.dev]
 incremental = true
 codegen-units = 8

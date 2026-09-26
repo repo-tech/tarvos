@@ -94,7 +94,7 @@ async fn health() -> impl IntoResponse {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
-        r#"{"status":"operational","version":"1.1.0-rc.2"}"#,
+        r#"{"status":"operational","version":"1.1.0-rc.3"}"#,
     )
 }
 
@@ -519,7 +519,7 @@ fn forward_process_output<R: Read>(mut reader: R, sender: tokio::sync::mpsc::Sen
             Ok(0) | Err(_) => break,
             Ok(length) => {
                 if sender
-                    .blocking_send(Message::Binary(buffer[..length].to_vec().into()))
+                    .blocking_send(Message::Binary(buffer[..length].to_vec()))
                     .is_err()
                 {
                     break;
@@ -531,7 +531,7 @@ fn forward_process_output<R: Read>(mut reader: R, sender: tokio::sync::mpsc::Sen
 
 fn docker_binary() -> String {
     if cfg!(windows) {
-        return env::var("ProgramFiles")
+        env::var("ProgramFiles")
             .map(|program_files| {
                 PathBuf::from(program_files)
                     .join("Docker")
@@ -542,9 +542,9 @@ fn docker_binary() -> String {
                     .to_string_lossy()
                     .into_owned()
             })
-            .unwrap_or_else(|_| "docker".to_owned());
+            .unwrap_or_else(|_| "docker".to_owned())
     } else {
-        return "docker".to_owned();
+        "docker".to_owned()
     }
 }
 
@@ -613,7 +613,7 @@ async fn get_files(
 ) -> Result<Json<FileResponse>, GatewayError> {
     let session_header = headers.get("x-tarvos-session-id");
     let query_header = query.session_id.as_deref().map(HeaderValue::from_str);
-    let header = session_header.or_else(|| match &query_header {
+    let header = session_header.or(match &query_header {
         Some(Ok(v)) => Some(v),
         _ => None,
     });
@@ -735,7 +735,7 @@ async fn get_raw_file(
 ) -> Result<Response, GatewayError> {
     let session_header = headers.get("x-tarvos-session-id");
     let query_header = query.session_id.as_deref().map(HeaderValue::from_str);
-    let header = session_header.or_else(|| match &query_header {
+    let header = session_header.or(match &query_header {
         Some(Ok(v)) => Some(v),
         _ => None,
     });
@@ -805,7 +805,7 @@ async fn put_file(
 ) -> Result<Json<serde_json::Value>, GatewayError> {
     let session_header = headers.get("x-tarvos-session-id");
     let query_header = query.session_id.as_deref().map(HeaderValue::from_str);
-    let header = session_header.or_else(|| match &query_header {
+    let header = session_header.or(match &query_header {
         Some(Ok(v)) => Some(v),
         _ => None,
     });
@@ -860,7 +860,7 @@ async fn delete_file(
 ) -> Result<Json<serde_json::Value>, GatewayError> {
     let session_header = headers.get("x-tarvos-session-id");
     let query_header = query.session_id.as_deref().map(HeaderValue::from_str);
-    let header = session_header.or_else(|| match &query_header {
+    let header = session_header.or(match &query_header {
         Some(Ok(v)) => Some(v),
         _ => None,
     });
@@ -902,7 +902,7 @@ async fn mkdir(
 ) -> Result<Json<serde_json::Value>, GatewayError> {
     let session_header = headers.get("x-tarvos-session-id");
     let query_header = query.session_id.as_deref().map(HeaderValue::from_str);
-    let header = session_header.or_else(|| match &query_header {
+    let header = session_header.or(match &query_header {
         Some(Ok(v)) => Some(v),
         _ => None,
     });
@@ -988,7 +988,7 @@ fn cache_root() -> PathBuf {
         .or_else(|| env::var_os("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir);
-    home.join(".tarvos").join("cache").join("v1.1.0-rc.2")
+    home.join(".tarvos").join("cache").join("v1.1.0-rc.3")
 }
 
 fn workspace_root() -> PathBuf {
@@ -996,7 +996,7 @@ fn workspace_root() -> PathBuf {
         .or_else(|| env::var_os("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir);
-    home.join(".tarvos").join("workspaces").join("v1.1.0-rc.2")
+    home.join(".tarvos").join("workspaces").join("v1.1.0-rc.3")
 }
 
 #[derive(Debug)]

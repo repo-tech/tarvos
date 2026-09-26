@@ -1595,7 +1595,7 @@ checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
 
 [[package]]
 name = "tarvos"
-version = "0.2.0"
+version = "1.1.0-rc.3"
 dependencies = [
  "ruff_python_ast",
  "ruff_python_parser",
@@ -1603,7 +1603,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-analysis"
-version = "1.1.0-rc.2"
+version = "1.1.0-rc.3"
 dependencies = [
  "anyhow",
  "tarvos-ast",
@@ -1614,7 +1614,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-ast"
-version = "1.1.0-rc.2"
+version = "1.1.0-rc.3"
 dependencies = [
  "serde",
  "tarvos-types",
@@ -1622,7 +1622,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-cli"
-version = "1.1.0-rc.2"
+version = "1.1.0-rc.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1641,7 +1641,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-codegen-rust"
-version = "1.1.0-rc.2"
+version = "1.1.0-rc.3"
 dependencies = [
  "anyhow",
  "tarvos-ir",
@@ -1650,7 +1650,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-core"
-version = "1.1.0-rc.2"
+version = "1.1.0-rc.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -1671,7 +1671,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-ir"
-version = "1.1.0-rc.2"
+version = "1.1.0-rc.3"
 dependencies = [
  "anyhow",
  "tarvos-ast",
@@ -1680,7 +1680,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-optimizer"
-version = "1.1.0-rc.2"
+version = "1.1.0-rc.3"
 dependencies = [
  "anyhow",
  "tarvos-ir",
@@ -1689,7 +1689,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-parser"
-version = "1.1.0-rc.2"
+version = "1.1.0-rc.3"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -1698,7 +1698,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-server"
-version = "1.1.0-rc.2"
+version = "1.1.0-rc.3"
 dependencies = [
  "axum",
  "serde_json",
@@ -1708,7 +1708,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-tests"
-version = "1.1.0-rc.2"
+version = "1.1.0-rc.3"
 dependencies = [
  "tarvos-analysis",
  "tarvos-ast",
@@ -1721,7 +1721,7 @@ dependencies = [
 
 [[package]]
 name = "tarvos-types"
-version = "1.1.0-rc.2"
+version = "1.1.0-rc.3"
 dependencies = [
  "serde",
  "thiserror 2.0.20",

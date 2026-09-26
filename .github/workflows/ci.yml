@@ -8,6 +8,21 @@ on:
     branches: [ main, master, develop ]
 
 jobs:
+  version-consistency:
+    name: Version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Codebase
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify release metadata matches the workspace version
+        run: python scripts/check_version_consistency.py
+
   test-and-build:
     name: Build (${{ matrix.os }} - ${{ matrix.target }})
     runs-on: ${{ matrix.os }}

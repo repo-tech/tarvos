@@ -9,18 +9,65 @@ on:
       release_tag:
         description: "Existing release tag to publish"
         required: true
-        default: "v1.1.0-rc.2"
+        default: "v1.1.0-rc.3"
 
+# The workflow only builds and validates artifacts; publishing uses the
+# dedicated distribution token, so the default GITHUB_TOKEN only needs read
+# access to this repository.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  verify-release-source:
+    name: Verify release source and version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify version metadata consistency
+        run: python scripts/check_version_consistency.py
+
+      - name: Verify the release tag exists and matches the workspace version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          python scripts/check_version_consistency.py --require-tag "$RELEASE_TAG"
+
+      - name: Verify the release tag points into main history
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          git rev-parse --verify "refs/tags/$RELEASE_TAG" >/dev/null
+          git merge-base --is-ancestor "refs/tags/$RELEASE_TAG" origin/main
+
+      - name: Verify the release body exists for the tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          python scripts/extract_release_notes.py "$RELEASE_TAG" > /tmp/release-body.md
+          test -s /tmp/release-body.md
+
   build:
     name: Build ${{ matrix.platform }}
+    needs: verify-release-source
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -119,7 +166,26 @@ jobs:
     name: Publish release assets
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
+      - name: Check out release metadata
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare release body from RELEASE_NOTES.md
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          python scripts/extract_release_notes.py "$RELEASE_TAG" > release-body.md
+          test -s release-body.md
+
       - name: Download production binaries
         uses: actions/download-artifact@v4
         with:
@@ -157,6 +223,11 @@ jobs:
           repository: repo-tech/tarvos-engine
           token: ${{ secrets.TARVOS_DISTRIBUTION_TOKEN }}
           tag_name: ${{ inputs.release_tag || github.ref_name }}
+          # The body comes from RELEASE_NOTES.md only. Auto-generated notes were
+          # removed because they appended a second "Full Changelog" block to the
+          # hand-written one (the duplicated content on the stale v1.2.0 draft).
+          body_path: release-body.md
+          generate_release_notes: false
           files: |
             release-assets/tarvos-windows-x86_64.exe
             release-assets/tarvos-windows-x86_64.exe.sha256
@@ -168,4 +239,3 @@ jobs:
             release-assets/tarvos-macos-x86_64.sha256
           draft: false
           prerelease: ${{ contains(inputs.release_tag || github.ref_name, '-') }}
-          generate_release_notes: true

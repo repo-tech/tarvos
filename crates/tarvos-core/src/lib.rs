@@ -367,7 +367,7 @@ fn convert_ruff_stmt(statement: ruff::Stmt) -> tarvos_ast::Stmt {
         ruff::Stmt::Import { module, alias } => Stmt::Import {
             names: vec![tarvos_ast::ImportName {
                 name: module,
-                asname: (alias != "").then_some(alias),
+                asname: (!alias.is_empty()).then_some(alias),
             }],
         },
         ruff::Stmt::Function {

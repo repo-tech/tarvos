@@ -1492,22 +1492,24 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
     }
 
     fn value_needs_display_helper(value: &Value) -> bool {
-        match value {
+        // Only values without a Python-faithful `{}` rendering need the display
+        // helper; the scalar types and scalar-typed expressions render directly.
+        !matches!(
+            value,
             Value::Bool(_)
-            | Value::Int(_)
-            | Value::Int128(_)
-            | Value::Float(_)
-            | Value::String(_) => false,
-            Value::Call {
-                return_type: Type::Bool | Type::Int | Type::Float | Type::String,
-                ..
-            }
-            | Value::Binary {
-                ty: Type::Bool | Type::Int | Type::Float | Type::String,
-                ..
-            } => false,
-            _ => true,
-        }
+                | Value::Int(_)
+                | Value::Int128(_)
+                | Value::Float(_)
+                | Value::String(_)
+                | Value::Call {
+                    return_type: Type::Bool | Type::Int | Type::Float | Type::String,
+                    ..
+                }
+                | Value::Binary {
+                    ty: Type::Bool | Type::Int | Type::Float | Type::String,
+                    ..
+                }
+        )
     }
 
     fn emit_value(value: &Value) -> Result<String> {

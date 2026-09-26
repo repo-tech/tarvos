@@ -94,7 +94,6 @@ impl Lowerer {
                         arg_annotations
                             .get(index)
                             .and_then(|annotation| annotation.as_deref())
-                            .as_deref()
                             .and_then(|s| self.parse_type_annotation(s))
                             .unwrap_or_else(|| inferred[index].clone())
                     })
@@ -2494,15 +2493,17 @@ fn collect_variable_types_into(
                     names.insert(id.clone(), ty);
                 }
             }
-            tarvos_ast::Stmt::AnnAssign { target, value, .. } => {
-                if let tarvos_ast::Expr::Name { id } = target {
-                    let ty = value
-                        .as_ref()
-                        .map(|value| expression_type_with_names(value, names))
-                        .unwrap_or(Type::Unknown);
-                    if ty != Type::Unknown {
-                        names.insert(id.clone(), ty);
-                    }
+            tarvos_ast::Stmt::AnnAssign {
+                target: tarvos_ast::Expr::Name { id },
+                value,
+                ..
+            } => {
+                let ty = value
+                    .as_ref()
+                    .map(|value| expression_type_with_names(value, names))
+                    .unwrap_or(Type::Unknown);
+                if ty != Type::Unknown {
+                    names.insert(id.clone(), ty);
                 }
             }
             // A loop variable has the iterable's element type, so a `for` over a

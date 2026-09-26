@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -16,13 +16,13 @@ fn temporary_project(name: &str) -> PathBuf {
     path
 }
 
-fn write_program(project: &PathBuf, source: &str) -> PathBuf {
+fn write_program(project: &Path, source: &str) -> PathBuf {
     let input = project.join("main.py");
     fs::write(&input, source).expect("write Python compatibility test");
     input
 }
 
-fn run_tarvos(project: &PathBuf, args: &[&str]) -> std::process::Output {
+fn run_tarvos(project: &Path, args: &[&str]) -> std::process::Output {
     let binary = env!("CARGO_BIN_EXE_tarvos");
     Command::new(binary)
         .current_dir(project)
@@ -39,7 +39,7 @@ fn cleanup(project: PathBuf) {
 ///
 /// The fallback warning is the signal that a construct regressed out of the
 /// native subset, so it is checked alongside the program's own output.
-fn assert_native_output(project: &PathBuf, source: &str, expected: &[&str]) {
+fn assert_native_output(project: &Path, source: &str, expected: &[&str]) {
     write_program(project, source);
     let output = run_tarvos(project, &["run", "main.py"]);
     let stdout = String::from_utf8_lossy(&output.stdout);

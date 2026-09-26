@@ -647,7 +647,7 @@ impl Optimizer {
                 target: target.clone(),
                 indices: indices
                     .iter()
-                    .map(|index| Self::fold_value(index))
+                    .map(Self::fold_value)
                     .collect::<Result<Vec<_>>>()?,
                 value: Self::fold_value(value)?,
             }),
@@ -1571,9 +1571,7 @@ impl Optimizer {
             } => {
                 Self::is_pure_value(iter)
                     && Self::is_pure_value(element)
-                    && condition
-                        .as_ref()
-                        .map_or(true, |value| Self::is_pure_value(value))
+                    && condition.as_ref().is_none_or(|value| Self::is_pure_value(value))
             }
             Value::Tuple { elements, .. } => elements.iter().all(Self::is_pure_value),
             Value::Dict { keys, values, .. } => {
@@ -1590,9 +1588,9 @@ impl Optimizer {
                 ..
             } => {
                 Self::is_pure_value(container)
-                    && lower.as_ref().map_or(true, |l| Self::is_pure_value(l))
-                    && upper.as_ref().map_or(true, |u| Self::is_pure_value(u))
-                    && step.as_ref().map_or(true, |s| Self::is_pure_value(s))
+                    && lower.as_ref().is_none_or(|l| Self::is_pure_value(l))
+                    && upper.as_ref().is_none_or(|u| Self::is_pure_value(u))
+                    && step.as_ref().is_none_or(|s| Self::is_pure_value(s))
             }
             Value::FormatString { parts } => parts.iter().all(|part| match part {
                 tarvos_ir::FormatPart::Literal(_) => true,

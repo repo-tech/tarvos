@@ -532,12 +532,11 @@ impl AstBridge {
                 let mut keys = Vec::with_capacity(dict.items.len());
                 let mut values = Vec::with_capacity(dict.items.len());
                 for item in &dict.items {
-                    if item.key.is_some() {
-                        keys.push(self.expr(item.key.as_ref().expect("key present")));
-                    } else {
+                    let Some(key) = item.key.as_ref() else {
                         // `{**other}` unpacking is dynamically shaped.
                         return self.bad_expr(expr);
-                    }
+                    };
+                    keys.push(self.expr(key));
                     values.push(self.expr(&item.value));
                 }
                 Expr::Dict { keys, values }
@@ -609,7 +608,7 @@ impl AstBridge {
                 // the compatibility runtime rather than compiling to wrong code.
                 if !v.comparators[..v.comparators.len() - 1]
                     .iter()
-                    .all(|operand| Self::is_pure_operand(operand))
+                    .all(Self::is_pure_operand)
                 {
                     return self.bad_expr(expr);
                 }
