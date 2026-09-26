@@ -93,6 +93,12 @@ jobs:
     steps:
       - name: Check out tagged source
         uses: actions/checkout@v4
+        with:
+          # Always build the tagged commit. Without an explicit `ref`, a
+          # workflow_dispatch run checks out `main` HEAD and then publishes
+          # those binaries under the release tag, so the artifact would not
+          # match the tagged source.
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Set up stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -162,15 +168,72 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  publish:
-    name: Publish release assets
-    needs: build
+  publish-source-release:
+    name: Publish source release on GitHub
+    needs: [verify-release-source, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
-      contents: read
+      contents: write
     steps:
       - name: Check out release metadata
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare release body from RELEASE_NOTES.md
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          python scripts/extract_release_notes.py "$RELEASE_TAG" > release-body.md
+          test -s release-body.md
+          # At most one comparison link. Auto-generated notes used to append a
+          # second "Full Changelog" block to the hand-written one, which is the
+          # duplicated body seen on the deleted v1.2.0 draft.
+          links="$(grep -c '^https://github.com/repo-tech/tarvos/compare/' release-body.md || true)"
+          test "$links" -le 1
+
+      - name: Create or update the GitHub release for the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # A release must never invent a version: the tag has to exist already.
+          git rev-parse --verify "refs/tags/$RELEASE_TAG"
+          title="Tarvos $RELEASE_TAG"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "$title" --notes-file release-body.md
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "$title" \
+              --notes-file release-body.md \
+              --verify-tag \
+              --prerelease="$([[ "$RELEASE_TAG" == *-* ]] && echo true || echo false)"
+          fi
+          gh release view "$RELEASE_TAG" --json tagName,name,isDraft,isPrerelease,url
+
+  publish-distribution:
+    name: Publish distribution assets
+    needs: [verify-release-source, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check out release metadata
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -223,9 +286,9 @@ jobs:
           repository: repo-tech/tarvos-engine
           token: ${{ secrets.TARVOS_DISTRIBUTION_TOKEN }}
           tag_name: ${{ inputs.release_tag || github.ref_name }}
-          # The body comes from RELEASE_NOTES.md only. Auto-generated notes were
-          # removed because they appended a second "Full Changelog" block to the
-          # hand-written one (the duplicated content on the stale v1.2.0 draft).
+          # The body comes from RELEASE_NOTES.md only. Auto-generated notes
+          # would append a second "Full Changelog" block to the hand-written
+          # one, which is the duplicated body seen on the deleted v1.2.0 draft.
           body_path: release-body.md
           generate_release_notes: false
           files: |

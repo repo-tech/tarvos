@@ -1,11 +1,20 @@
 # Tarvos 1.1.0-rc.3
 
-Stabilization release candidate on the 1.1.0 line. It adds the native
-`list()`/`sorted()` builtins, closes the front-end gaps that forced the CPython
-fallback, and removes a class of stale-cache bugs. This is a **pre-release**:
-the installer and cross-platform artifacts are produced by the release
-workflow, and the gates listed under *Validation* are the ones actually run for
-this commit.
+## Summary
+
+`1.1.0-rc.3` is a stabilization release candidate on the 1.1.0 line. It extends
+the natively compiled Python subset with the `list()` and `sorted()` builtins,
+closes the front-end gaps that used to force the CPython fallback, and removes a
+class of stale-cache bugs. It also makes the release itself reproducible: one
+workspace version drives every crate, the binary, the installers, and the
+packaging metadata, and CI fails if any of them drift.
+
+This is a **pre-release**. It is not the stable 1.1.0 line: the supported-subset
+contract is unchanged from `1.1.0-rc.2`, so nothing in this release requires
+rewriting code, but the artifacts are still release candidates.
+
+The gates listed under [Validation](#validation) are the ones actually run
+against the tagged commit `cb1c333`, including the ones that did not pass.
 
 ## Highlights
 
@@ -87,7 +96,17 @@ this commit.
 
 - Version drift between the workspace, CLI, installer, launcher, README,
   gateway banner, workflow defaults and Python packaging is now a CI failure
-  (`scripts/check_version_consistency.py`).
+  (`scripts/check_version_consistency.py`). The Cargo workspace version is the
+  single source of truth: all twelve member crates inherit
+  `version.workspace = true`.
+- This release page is generated from one section of `RELEASE_NOTES.md` by
+  `scripts/extract_release_notes.py` and published by the release workflow.
+  GitHub's auto-generated notes are deliberately disabled, and the extractor
+  refuses to emit more than one comparison link, because auto-generation
+  previously appended a second "Full Changelog" block to the hand-written body.
+- The release workflow verifies before it publishes: the release tag must exist,
+  must be an ancestor of `main`, must match the workspace version, and must have
+  a non-empty body.
 - New benchmark workloads: `matrix_multiply.py`, `bitwise_xorshift.py` with
   recorded expected outputs.
 - `SECURITY.md`, `CONTRIBUTING.md`, `SUPPORT.md`, `CHANGELOG.md`, issue
@@ -135,48 +154,78 @@ compiling).
 - `list()` over a dict requires `sorted()` or `--python-fallback`.
 - `set`, `enumerate`, `zip`, dynamic JSON, and third-party imports require
   `--python-fallback`.
-- Cross-platform binaries and the Windows installer are built by the release
-  workflow on their own runners; they are not produced by this local
-  validation run.
+- Full dynamic Python semantics (reflection, dynamic dispatch, monkey patching)
+  are outside the native subset by design; Tarvos is not a drop-in CPython
+  replacement.
+- Tarvos only publishes Windows x86_64 binaries and the Windows installer. Linux
+  and macOS artifacts are built by the release workflow on their own runners and
+  are distributed from `repo-tech/tarvos-engine`; on those platforms `install.sh`
+  builds the CLI from source.
+- The tagged commit has one known non-functional defect: a single
+  `rustfmt`-only line-wrap deviation in `crates/tarvos-optimizer/src/lib.rs`
+  (see [Validation](#validation)). It is corrected on `main` after the tag.
 
 ## Validation
 
-Run against this release commit:
+Every result below was produced against the tagged commit `cb1c333`, not against
+a later working tree.
 
-- `cargo fmt --all -- --check`
-- `cargo check --workspace --all-targets`
-- `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --no-fail-fast`
-- `cargo build --workspace --release`
-- `python scripts/check_version_consistency.py`
-- `python scripts/diff_test.py` (native vs CPython output parity)
-- `crates/tarvos-cli/tests/compatibility_gate.rs` (native path, fallback path,
-  range step semantics, string/list methods, matrix kernel, `list()`/`sorted()`
-  builtins, dict-order refusal)
+| Gate | Result |
+| --- | --- |
+| `cargo check --workspace --all-targets` | PASS |
+| `cargo clippy --workspace --all-targets -- -D warnings` | PASS |
+| `cargo test --workspace --no-fail-fast` | PASS — 25 suites, 110 tests, 0 failed |
+| `cargo build --workspace --release` | PASS |
+| `cargo fmt --all -- --check` | **FAIL** — see below |
+| `python scripts/check_version_consistency.py --require-tag v1.1.0-rc.3` | PASS — 12/12 declarations plus the tag |
+| `python scripts/diff_test.py` (release binary from the tag) | PASS — 13/13 workloads |
+| `tarvos --version` | `tarvos 1.1.0-rc.3` |
+| `crates/tarvos-cli/tests/compatibility_gate.rs` | PASS — native path, fallback path, range step semantics, string/list methods, matrix kernel, `list()`/`sorted()`, dict-order refusal |
+| GitHub Actions `Production CI Pipeline` (`cb1c333`) | PASS — five cross-target builds, workspace tests, production validation suite |
+| GitHub Actions `Tarvos 1.1.0-rc.3 release validation` (`cb1c333`) | PASS — benchmark matrix plus a compile/build smoke test asserting the program output |
 
-Not run for this commit: Windows installer build/install (requires Inno Setup
-and is produced by the release workflow), macOS/Linux artifacts, and a fresh
+The `cargo fmt` failure is a single line-wrap deviation in
+`crates/tarvos-optimizer/src/lib.rs` that the Clippy cleanup in the same commit
+introduced. It changes no behaviour, it is not covered by the CI gates that ran
+for this tag, and it is fixed on `main` after the tag, where `cargo fmt --all --
+--check` passes. The tag was deliberately not moved, so the shipped binary is
+built from exactly the commit the tag names.
+
+Not run for this commit: the Windows installer build and install (Inno Setup,
+produced by the release workflow), Linux/macOS artifact builds, and a fresh
 timing benchmark.
-
-## Installation
-
-- Windows: `install.ps1 -Version v1.1.0-rc.3` (user-local, no administrator
-  rights) or the release artifacts from the GitHub release.
-- Linux/macOS: `install.sh` or the platform binary attached to the release.
-- From source: `cargo build --workspace --release` then
-  `target/release/tarvos --version` (prints `1.1.0-rc.3`).
 
 ## Release Artifacts
 
-Attached to the GitHub pre-release for this candidate:
+Release notes and the Windows CLI live in this repository; the cross-platform
+binaries and the installer live in the distribution repository.
 
-- `tarvos-windows-x86_64-msvc.exe` — CLI built from this commit with
-  `cargo build --release`.
-- `tarvos-windows-x86_64-msvc.exe.sha256` — SHA-256 checksum of that binary.
+Attached to this release in `repo-tech/tarvos`:
 
-Produced by `.github/workflows/release.yml` on demand and **not** part of this
-local run: Linux/macOS binaries and `Tarvos-Setup-Windows-x86_64.exe`
-(installer).
+- `tarvos-windows-x86_64.exe` — CLI built from the tagged commit `cb1c333` with
+  `cargo build --release`; `tarvos --version` reports `1.1.0-rc.3`.
+  SHA-256: `e5dfff0eb04e827122db4bd966ade56bb005b5d6b5e2d7088c92c9b8733a4208`.
+- `tarvos-windows-x86_64.exe.sha256` — checksum file for the binary above, in
+  `sha256sum` format, verified by `install.ps1` before installation.
+
+Published to `repo-tech/tarvos-engine` by `.github/workflows/release.yml` on
+their own runners: `tarvos-linux-x86_64`, `tarvos-macos-x86_64`,
+`tarvos-windows-x86_64.exe`, and `Tarvos-Setup-Windows-x86_64.exe`, each with a
+`.sha256` companion. That repository holds the v1.0.0, v1.1.0-rc.1, and
+v1.1.0-rc.2 artifact history.
+
+## Installation
+
+- Windows: `install.ps1 -Version v1.1.0-rc.3` downloads
+  `tarvos-windows-x86_64.exe` from this repository's release, verifies its
+  SHA-256, and installs it to `%USERPROFILE%\.tarvos\bin\tarvos.exe` without
+  administrator rights. Pass `-Repository repo-tech/tarvos-engine` to install
+  from the distribution repository instead.
+- Linux/macOS: `./install.sh`, which builds and installs the CLI from source
+  with `cargo install --locked --path crates/tarvos-cli`, or download the
+  platform binary from `repo-tech/tarvos-engine`.
+- From source: `cargo build --workspace --release`, then
+  `target/release/tarvos --version` (prints `1.1.0-rc.3`).
 
 ## Full Changelog
 

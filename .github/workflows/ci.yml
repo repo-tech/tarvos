@@ -23,6 +23,23 @@ jobs:
       - name: Verify release metadata matches the workspace version
         run: python scripts/check_version_consistency.py
 
+  formatting:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Codebase
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # Formatting is gated so a release commit can never ship a tree that
+      # `cargo fmt --check` rejects.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
   test-and-build:
     name: Build (${{ matrix.os }} - ${{ matrix.target }})
     runs-on: ${{ matrix.os }}

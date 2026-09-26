@@ -1571,7 +1571,9 @@ impl Optimizer {
             } => {
                 Self::is_pure_value(iter)
                     && Self::is_pure_value(element)
-                    && condition.as_ref().is_none_or(|value| Self::is_pure_value(value))
+                    && condition
+                        .as_ref()
+                        .is_none_or(|value| Self::is_pure_value(value))
             }
             Value::Tuple { elements, .. } => elements.iter().all(Self::is_pure_value),
             Value::Dict { keys, values, .. } => {

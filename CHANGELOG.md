@@ -6,7 +6,28 @@ All notable changes to Tarvos are documented here. The format follows
 
 ## [Unreleased]
 
-Nothing yet. Work merged after the 1.1.0-rc.3 release candidate is recorded here.
+Release-engineering follow-up to the `v1.1.0-rc.3` tag. No product behaviour
+changes; the tag was not moved.
+
+### Fixed
+
+- The release workflow checked out the default branch instead of the release
+  tag, so a `workflow_dispatch` publish would have built `main` HEAD and
+  uploaded it under the release tag. The build jobs now check out
+  `inputs.release_tag || github.ref`.
+- The workflow published release assets only to the distribution repository
+  `repo-tech/tarvos-engine`, so the compiler repository never received a
+  GitHub release for its own tag, and `install.ps1` (which downloads
+  `tarvos-windows-x86_64.exe` from this repository) had nothing to install.
+  A `publish-source-release` job now creates or updates the release here,
+  refuses to run unless the tag already exists, and titles it `Tarvos <tag>`.
+- `scripts/extract_release_notes.py` now rejects a section that would emit more
+  than one comparison link, so a duplicated "Full Changelog" block cannot be
+  published again.
+- `cargo fmt` is now a CI gate (`formatting` job), fixing the single
+  line-wrap deviation the `v1.1.0-rc.3` Clippy cleanup introduced.
+- The obsolete `v1.2.0` draft release in this repository, which referenced no
+  existing tag and carried a duplicated "Full Changelog" body, was deleted.
 
 ## [1.1.0-rc.3] - release candidate
 
@@ -94,11 +115,21 @@ declared in the binary until this release: `tarvos --version` now reports
 
 ### Validation
 
-- `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`,
+- `cargo check --workspace --all-targets`,
   `cargo clippy --workspace --all-targets -- -D warnings`,
-  `cargo test --workspace --no-fail-fast`, `cargo build --workspace --release`,
-  `python scripts/check_version_consistency.py`, and the native-vs-CPython
-  differential gate in `crates/tarvos-cli/tests/compatibility_gate.rs`.
+  `cargo test --workspace --no-fail-fast` (25 suites, 110 tests),
+  `cargo build --workspace --release`, `python
+  scripts/check_version_consistency.py --require-tag v1.1.0-rc.3`, and the
+  native-vs-CPython differential gate in
+  `crates/tarvos-cli/tests/compatibility_gate.rs` all pass against the tagged
+  commit `cb1c333`.
+- `python scripts/diff_test.py` reports 13/13 workloads for the release binary
+  built from that commit.
+- One gate does not pass: `cargo fmt --all -- --check` reports a single
+  line-wrap deviation in `crates/tarvos-optimizer/src/lib.rs` introduced by the
+  Clippy cleanup in the same commit. It is behaviour-neutral, the tag was not
+  moved, and the deviation is fixed on `main`, where formatting is now a CI
+  gate.
 
 ### Known limitations
 

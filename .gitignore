@@ -40,6 +40,12 @@ ENV/
 *.benchmark.json
 *_benchmark.json
 
+# Locally staged release artifacts. These are built and uploaded by the release
+# workflow, or staged by hand when publishing a release; they are never part of
+# the source tree.
+/tarvos-windows-x86_64.exe
+/*.sha256
+
 # IDE and operating-system files
 .vscode/
 .idea/
