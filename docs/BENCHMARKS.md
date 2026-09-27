@@ -55,8 +55,9 @@ Times in milliseconds, median of 3. `binary` is the raw artifact.
 
 Reading these honestly:
 
-- **The compiler is fast; the Rust toolchain is not.** Transpile is 50–105 ms.
-  Cargo is 2.3–4.6 s, so a one-off build is dominated by `rustc`, not by Tarvos.
+- **The compiler is fast; the Rust toolchain is not.** Transpile is 31–42 ms.
+  Cargo is 1.0–1.5 s on a warm cache, so a one-off build is dominated by
+  `rustc`, not by Tarvos.
 - **A generated program is close to an empty Rust binary.** An empty
   `fn main() {}` with the same profile is 104 KiB; the generated programs are
   126–133 KiB. The delta is the Python runtime helpers the compiler emits for
@@ -64,6 +65,12 @@ Reading these honestly:
 - **Binary size is dominated by that floor, not by the program.** hello and the
   100k-iteration arithmetic loop differ by 1 KiB. Adding computation does not
   add size; adding library surface would.
+- **Unused helpers are not emitted.** A `print("hello")` program generates
+  exactly `fn main()` and no runtime at all. An earlier revision pushed a
+  thousands-separator helper into every file unconditionally; it is now emitted
+  only when a program uses `f"{value:,}"`. This did **not** change binary size,
+  because LTO already eliminated the dead code, so it is a code-quality fix
+  rather than a size win.
 
 ## Baselines measured the same way
 
