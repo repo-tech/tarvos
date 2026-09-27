@@ -1,4 +1,4 @@
-print(1 + 2)
+﻿print(1 + 2)
 print(10 - 4)
 print(6 * 7)
 print(2 + 3 * 4)
@@ -47,3 +47,20 @@ print(bool(0.0))
 print(bool(0.5))
 print(bool(""))
 print(bool("x"))
+
+# json.dumps on a value computed at run time. The compile-time literal path
+# renders during lowering; anything the program builds needs a real serializer.
+import json
+
+nums = [1, 2, 3]
+print(json.dumps(nums))
+jname = "Tarvos"
+print(json.dumps(jname))
+jnum = 7
+print(json.dumps(jnum))
+jfloat = 1.5
+print(json.dumps(jfloat))
+jbool = True
+print(json.dumps(jbool))
+counts = {"a": 1, "b": 2}
+print(json.dumps(counts))

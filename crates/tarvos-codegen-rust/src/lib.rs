@@ -289,6 +289,69 @@ fn __tarvos_str_index(value: &str, index: i64) -> String {
 }
 "##;
 
+/// Runtime that serializes the supported Tarvos value types to JSON.
+///
+/// `json.dumps` on a compile-time literal is resolved during lowering. A value
+/// computed at run time needs a real serializer, otherwise `json.dumps(data)`
+/// on a dict built by the program is rejected.
+const JSON_RUNTIME: &str = r##"
+#[allow(dead_code)]
+trait __TarvosJson {
+    fn __tarvos_json(&self) -> String;
+}
+
+impl __TarvosJson for i64 { fn __tarvos_json(&self) -> String { self.to_string() } }
+impl __TarvosJson for f64 {
+    fn __tarvos_json(&self) -> String {
+        // JSON has no NaN or Infinity; Python emits `null` for them.
+        if self.is_finite() { format!("{:?}", self) } else { "null".to_string() }
+    }
+}
+impl __TarvosJson for bool { fn __tarvos_json(&self) -> String { self.to_string() } }
+impl __TarvosJson for String {
+    fn __tarvos_json(&self) -> String {
+        let mut out = String::with_capacity(self.len() + 2);
+        out.push('"');
+        for ch in self.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+}
+impl<T: __TarvosJson> __TarvosJson for Vec<T> {
+    fn __tarvos_json(&self) -> String {
+        // Python's json.dumps default separator is ", " between items.
+        let items: Vec<String> = self.iter().map(|item| item.__tarvos_json()).collect();
+        format!("[{}]", items.join(", "))
+    }
+}
+impl<K: __TarvosJson, V: __TarvosJson> __TarvosJson for std::collections::HashMap<K, V> {
+    fn __tarvos_json(&self) -> String {
+        // A HashMap has no insertion order, so the output is sorted by the
+        // rendered key. That is deterministic, which is what a differential
+        // test needs; it is not Python's insertion order, which a HashMap
+        // cannot represent.
+        //
+        // Python's default separator is ": " between key and value.
+        let mut entries: Vec<String> = self
+            .iter()
+            .map(|(key, value)| format!("{}: {}", key.__tarvos_json(), value.__tarvos_json()))
+            .collect();
+        entries.sort();
+        format!("{{{}}}", entries.join(", "))
+    }
+}
+"##;
+
 /// Runtime that backs Python's thousands separator (`f"{value:,}"`).
 ///
 /// Only emitted into a generated program that actually formats a number with
@@ -483,6 +546,9 @@ impl RustCodegen {
         }
         if needs("__tarvos_index") {
             out.push_str(INDEX_RUNTIME);
+        }
+        if needs("tarvos_json_dumps_runtime") {
+            out.push_str(JSON_RUNTIME);
         }
         // The conversion and truthiness helpers live in one block; either a
         // parse or a truthiness test pulls in the whole runtime, and nothing
@@ -857,6 +923,9 @@ impl RustCodegen {
                 // tests truthiness. Both pull in the conversion runtime, so the
                 // prelude has to know about them before emission runs.
                 match function.as_str() {
+                    "tarvos_json_dumps_runtime" => {
+                        names.insert("tarvos_json_dumps_runtime".to_string());
+                    }
                     "int" => {
                         names.insert("__tarvos_parse_int".to_string());
                     }
@@ -1922,6 +1991,10 @@ impl RustCodegen {
                 match function.as_str() {
                     name if name.starts_with("__tarvos_ctor_") => {
                         format!("{}({})", name, args_str)
+                    }
+                    // `json.dumps(x)` on a value computed at run time.
+                    "tarvos_json_dumps_runtime" => {
+                        format!("(&({})).__tarvos_json()", args_str)
                     }
                     name if name.starts_with("__tarvos_mut_call_") => {
                         let function = name.trim_start_matches("__tarvos_mut_call_");

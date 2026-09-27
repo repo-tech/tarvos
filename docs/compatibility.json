@@ -394,7 +394,24 @@
       "category": "stdlib",
       "feature": "json",
       "status": "supported",
-      "tests": []
+      "tests": [],
+      "note": "dumps only; loads is unsupported."
+    },
+    {
+      "category": "stdlib",
+      "feature": "json.dumps on a literal",
+      "status": "supported",
+      "tests": [],
+      "note": "Rendered during lowering; no runtime needed."
+    },
+    {
+      "category": "stdlib",
+      "feature": "json.dumps on a runtime value",
+      "status": "partial",
+      "tests": [
+        "04_float"
+      ],
+      "note": "Serializes int, float, bool, str, list, and dict. A dict must have one value type, so heterogeneous values are rejected. A HashMap cannot reproduce Python insertion order, so keys are emitted sorted."
     },
     {
       "category": "stdlib",

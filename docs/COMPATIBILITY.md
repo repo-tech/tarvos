@@ -26,8 +26,8 @@ Nothing here is inferred from the fact that Python parses.
 
 ## Current summary
 
-70 classified features: **36 supported**, **13 partial**, **20 unsupported**,
-
+72 classified features: **37 supported**, **14 partial**, **20 unsupported**,
+**1 planned**.
 ## The limits worth knowing before you write code for Tarvos
 
 These are the ones most likely to surprise, each carried in the matrix with the

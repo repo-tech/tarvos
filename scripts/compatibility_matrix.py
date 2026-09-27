@@ -110,7 +110,12 @@ ROWS: list[tuple[str, str, str, list[str], str]] = [
     # --- stdlib ------------------------------------------------------------
     ("stdlib", "math", "supported", [], ""),
     ("stdlib", "time", "supported", [], ""),
-    ("stdlib", "json", "supported", [], ""),
+    ("stdlib", "json", "supported", [], "dumps only; loads is unsupported."),
+    ("stdlib", "json.dumps on a literal", "supported", [], "Rendered during lowering; no runtime needed."),
+    ("stdlib", "json.dumps on a runtime value", "partial", ["04_float"],
+     "Serializes int, float, bool, str, list, and dict. A dict must have one "
+     "value type, so heterogeneous values are rejected. A HashMap cannot "
+     "reproduce Python insertion order, so keys are emitted sorted."),
     ("stdlib", "os / os.path", "partial", [], ""),
     ("stdlib", "collections / itertools / functools", "unsupported", [], "Not in the supported stdlib list."),
     ("stdlib", "file I/O (open)", "unsupported", [], "No filesystem runtime is emitted into generated code."),

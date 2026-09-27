@@ -1,4 +1,4 @@
-﻿use crate::stdlib::{dict_method_mutates, list_method_mutates, MethodReceiver};
+use crate::stdlib::{dict_method_mutates, list_method_mutates, MethodReceiver};
 use crate::{module_supported, native_builtin_method, native_constant, native_function};
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
@@ -2091,17 +2091,22 @@ impl Lowerer {
         }
     }
 
-    fn lower_static_json_expr(&self, args: &[tarvos_ast::Expr]) -> Result<Value> {
+    fn lower_static_json_expr(&mut self, args: &[tarvos_ast::Expr]) -> Result<Value> {
         let [value] = args else {
-            bail!("json.dumps() currently requires exactly one compile-time literal argument");
+            bail!("json.dumps() currently requires exactly one argument");
         };
-        let Some(json) = static_json_expr(value) else {
-            bail!(
-                "json.dumps() requires a compile-time JSON literal in native mode; \
-                 use --python-fallback for dynamic JSON values"
-            );
-        };
-        Ok(Value::String(json))
+        // A compile-time literal is rendered during lowering, which is exact
+        // and needs no runtime. Anything computed at run time goes through the
+        // serializer; rejecting it would make `json.dumps(data)` impossible for
+        // any dict the program actually built.
+        if let Some(json) = static_json_expr(value) {
+            return Ok(Value::String(json));
+        }
+        Ok(Value::Call {
+            function: "tarvos_json_dumps_runtime".to_string(),
+            args: vec![self.lower_expr(value)?],
+            return_type: Type::String,
+        })
     }
 
     fn infer_return_type_from_body(&mut self, body: &[tarvos_ast::Stmt]) -> Option<Type> {
