@@ -1,4 +1,4 @@
-"""Acceptance test: compile a real multi-module Python project natively.
+﻿"""Acceptance test: compile a real multi-module Python project natively.
 
 Builds a fixture project (entry, sibling module, package with `__init__` and a
 submodule, pyproject.toml), compiles it with `tarvos package`, runs the emitted
@@ -16,7 +16,8 @@ import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-CLI = ROOT / "target" / "debug" / "tarvos.exe"
+EXE_SUFFIX = ".exe" if os.name == "nt" else ""
+CLI = ROOT / "target" / "debug" / f"tarvos{EXE_SUFFIX}"
 
 MAIN = """from package.math_utils import sum_all, average
 from helpers import describe

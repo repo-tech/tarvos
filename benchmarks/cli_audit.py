@@ -1,4 +1,4 @@
-"""Audit every advertised `tarvos` subcommand for real behaviour.
+﻿"""Audit every advertised `tarvos` subcommand for real behaviour.
 
 A command is PASS only when it runs, produces its documented effect, and
 returns a correct exit code. "The parser accepts it" is not evidence. Destructive
@@ -16,7 +16,8 @@ import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-CLI = ROOT / "target" / "debug" / "tarvos.exe"
+EXE_SUFFIX = ".exe" if os.name == "nt" else ""
+CLI = ROOT / "target" / "debug" / f"tarvos{EXE_SUFFIX}"
 
 SAMPLE = 'print("hello from tarvos")\n'
 

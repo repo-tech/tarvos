@@ -1,4 +1,4 @@
-"""Differential test harness: CPython vs Tarvos-native.
+﻿"""Differential test harness: CPython vs Tarvos-native.
 
 For each case in a corpus:
   1. run CPython
@@ -24,8 +24,9 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "tests" / "corpus"
 WORK = ROOT / ".build-tmp" / "difftest"
-CLI = ROOT / "target" / "debug" / "tarvos.exe"
-EXE = ".exe" if os.name == "nt" else ""
+EXE_SUFFIX = ".exe" if os.name == "nt" else ""
+CLI = ROOT / "target" / "debug" / f"tarvos{EXE_SUFFIX}"
+EXE = EXE_SUFFIX
 
 
 def run(cmd, cwd=None, timeout=180):

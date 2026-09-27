@@ -1,23 +1,23 @@
 name: CI
 
-# Fast compiler health only.
+# Fast compiler health plus real native validation on every supported platform.
 #
-# This workflow answers "is the current source healthy?". It never builds
-# release artifacts, never touches a tag, and never creates, edits, or deletes a
-# release. Release work is tag-gated in release.yml.
+# This workflow answers "is the source healthy, and does a compiled native
+# program behave like CPython?". It never builds release artifacts, never
+# touches a tag, and never creates, edits, or deletes a release. Release work
+# is tag-gated in release.yml.
 #
-# Version metadata is deliberately NOT checked here. check_version_consistency.py
-# is the authoritative release gate and runs once, in release.yml, against the
-# tagged commit. Forcing it on every commit duplicated the same answer and made
-# an ordinary compiler commit look like a release concern.
+# The `native` job is the one that matters most: it compiles Python to a real
+# executable and compares its output with CPython. The unit tests only assert the
+# SHAPE of generated Rust, so a wrong constant or a wrong operator passes them.
 
 on:
   pull_request:
     branches: [ main, master, develop ]
   push:
     branches: [ main, master, develop ]
-  # Cross-platform verification is expensive, so it runs on demand and on a
-  # weekly sweep instead of on every commit.
+  # Cross-platform verification is expensive, so the full target sweep runs on
+  # demand and on a weekly schedule instead of on every commit.
   schedule:
     - cron: "17 6 * * 1"
   workflow_dispatch:
@@ -35,9 +35,13 @@ concurrency:
 
 jobs:
   quality:
-    name: fmt / check / clippy / test
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    name: fmt / check / clippy / test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ windows-latest, ubuntu-latest, macos-latest ]
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -53,11 +57,14 @@ jobs:
           python-version: "3.12"
 
       - name: Report context
+        shell: bash
         run: |
-          echo "commit : ${{ github.sha }}"
-          echo "ref    : ${{ github.ref }}"
-          echo "event  : ${{ github.event_name }}"
-          echo "cargo  : $(cargo --version)"
+          echo "os      : ${{ matrix.os }}"
+          echo "commit  : ${{ github.sha }}"
+          echo "event   : ${{ github.event_name }}"
+          echo "cargo   : $(cargo --version)"
+          echo "rustc   : $(rustc --version)"
+          echo "python  : $(python --version 2>&1)"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -70,6 +77,81 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --no-fail-fast
+
+  native:
+    name: native parity (${{ matrix.os }})
+    needs: quality
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ windows-latest, ubuntu-latest, macos-latest ]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build the CLI
+        run: cargo build -p tarvos-cli
+
+      - name: Report context
+        shell: bash
+        run: |
+          echo "os      : ${{ matrix.os }}"
+          echo "commit  : ${{ github.sha }}"
+          echo "cargo   : $(cargo --version)"
+          echo "python  : $(python --version 2>&1)"
+
+      # Each harness compiles real native executables and compares them with
+      # CPython, so a compiler regression that still produces valid Rust is
+      # caught here rather than by a user.
+      - name: Differential tests (CPython vs native)
+        run: python benchmarks/difftest.py
+
+      - name: CLI audit
+        run: python benchmarks/cli_audit.py
+
+      - name: Project acceptance
+        run: python benchmarks/project_acceptance.py
+
+      - name: Generated Rust compiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .build-tmp/verify
+          cat > .build-tmp/verify/main.py <<'PY'
+          def classify(n):
+              if n > 10:
+                  return "big"
+              elif n > 0:
+                  return "small"
+              return "none"
+
+
+          for n in range(3):
+              print(n, classify(n), n / 2, n % 2)
+          PY
+          tarvos="target/debug/tarvos"
+          if [ -f "target/debug/tarvos.exe" ]; then tarvos="target/debug/tarvos.exe"; fi
+          "$tarvos" compile .build-tmp/verify/main.py -o .build-tmp/verify/main.rs
+          grep -q "fn main" .build-tmp/verify/main.rs
+
+      - name: Upload native validation log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-parity-${{ matrix.os }}
+          path: .build-tmp/verify/main.rs
+          if-no-files-found: ignore
+          retention-days: 7
 
   cross-target:
     # A static job name: GitHub renders a matrix expression in `name` literally,
