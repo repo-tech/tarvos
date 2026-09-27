@@ -254,6 +254,41 @@ const STR_CASE_HELPERS: [&str; 3] = [
     "tarvos_str_swapcase",
 ];
 
+/// Runtime that backs Python subscript reads on lists and strings.
+///
+/// Python resolves a negative index against the end of the sequence and raises
+/// `IndexError` when the resolved position is out of range. Rust's `[i as usize]`
+/// cannot express either rule: `-1i64 as usize` wraps to `usize::MAX`, so a
+/// negative index silently became a wild out-of-bounds access.
+const INDEX_RUNTIME: &str = r##"
+#[allow(dead_code)]
+#[inline]
+fn __tarvos_index(length: i64, index: i64) -> usize {
+    let resolved = if index < 0 { length + index } else { index };
+    if resolved < 0 || resolved >= length {
+        panic!("IndexError: index out of range");
+    }
+    resolved as usize
+}
+#[allow(dead_code)]
+#[inline]
+fn __tarvos_str_index(value: &str, index: i64) -> String {
+    // Python indexes a str by character, not by byte, so a multi-byte
+    // character must not be split. Collecting the scalar values also makes the
+    // length used for negative indices the same count Python reports.
+    let characters: Vec<char> = value.chars().collect();
+    let resolved = if index < 0 {
+        characters.len() as i64 + index
+    } else {
+        index
+    };
+    if resolved < 0 || resolved >= characters.len() as i64 {
+        panic!("IndexError: string index out of range");
+    }
+    characters[resolved as usize].to_string()
+}
+"##;
+
 /// Runtime that backs the native `list` builtin methods.
 ///
 /// Generic over the element type so one set of helpers serves `list[int]`,
@@ -277,7 +312,26 @@ fn tarvos_list_remove<T: PartialEq>(target: &mut Vec<T>, value: T) {
 }
 #[allow(dead_code)]
 #[inline]
-fn tarvos_list_pop<T: Default>(target: &mut Vec<T>) -> T { target.pop().unwrap_or_default() }
+fn tarvos_list_pop<T: Default>(target: &mut Vec<T>) -> T {
+    match target.pop() {
+        Some(value) => value,
+        // Python raises IndexError here; returning a default would silently
+        // hand the program a value that was never in the list.
+        None => panic!("IndexError: pop from empty list"),
+    }
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_list_pop_at<T: Default>(target: &mut Vec<T>, index: i64) -> T {
+    // Python resolves a negative index against the end of the list and raises
+    // IndexError when the result is out of range in either direction.
+    let length = target.len() as i64;
+    let resolved = if index < 0 { length + index } else { index };
+    if resolved < 0 || resolved >= length {
+        panic!("IndexError: pop index out of range");
+    }
+    target.remove(resolved as usize)
+}
 #[allow(dead_code)]
 #[inline]
 fn tarvos_list_clear<T>(target: &mut Vec<T>) { target.clear(); }
@@ -371,6 +425,9 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
             .any(|name| name.starts_with("tarvos_list_"))
         {
             out.push_str(LIST_RUNTIME);
+        }
+        if needs("__tarvos_index") {
+            out.push_str(INDEX_RUNTIME);
         }
         if needs("tarvos_range") {
             out.push_str(RANGE_RUNTIME);
@@ -667,6 +724,14 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
             Stmt::IndexAssign { indices, value, .. } => {
                 indices.iter().for_each(&mut values);
                 values(value);
+                // Non-string indices are emitted through `__tarvos_index`, so
+                // the helper has to be present whenever such a write exists.
+                if indices
+                    .iter()
+                    .any(|index| !matches!(index, Value::String(_)))
+                {
+                    names.insert("__tarvos_index".to_string());
+                }
             }
             Stmt::FieldAssign { object, value, .. } => {
                 values(object);
@@ -754,10 +819,20 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
                     .for_each(|entry| Self::collect_value_calls(entry, names));
             }
             Value::Index {
-                container, index, ..
+                container,
+                index,
+                container_type,
+                ..
             } => {
                 Self::collect_value_calls(container, names);
                 Self::collect_value_calls(index, names);
+                // Sequence reads are emitted through `__tarvos_index` so a
+                // negative index resolves from the end instead of wrapping to
+                // `usize::MAX`. A dict read is a key lookup and a tuple read
+                // uses field access; neither uses the helper.
+                if matches!(container_type, Type::Array(_) | Type::String) {
+                    names.insert("__tarvos_index".to_string());
+                }
             }
             Value::Slice {
                 container,
@@ -955,12 +1030,21 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
                     ));
                 } else {
                     let mut chain = target.clone();
-                    for index in indices {
+                    for (position, index) in indices.iter().enumerate() {
                         let index_str = Self::emit_value(index)?;
                         if matches!(index, Value::String(_)) {
-                            chain = format!("{}[{}]", chain, index_str);
+                            chain = format!("{chain}[{index_str}]");
                         } else {
-                            chain = format!("{}[({} as usize)]", chain, index_str);
+                            // Resolve the index into a temporary before the
+                            // write. Inlining `target.len()` into the subscript
+                            // would borrow the list immutably while the
+                            // assignment borrows it mutably, which cannot
+                            // compile.
+                            let temporary = format!("__tarvos_index_{position}");
+                            out.push_str(&format!(
+                                "{ind}let {temporary} = __tarvos_index({chain}.len() as i64, ({index_str}) as i64);\n"
+                            ));
+                            chain = format!("{chain}[{temporary}]");
                         }
                     }
                     out.push_str(&format!("{}{} = {};\n", ind, chain, value_str));
@@ -1400,16 +1484,36 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
                     format!("if {} {{ \"True\" }} else {{ \"False\" }}", expr),
                 ))
             }
+            // A float-typed expression has the same `4` vs `4.0` problem as a
+            // float literal, so it is rendered through the display helper too.
             Value::Call {
-                return_type: Type::Int | Type::Float | Type::String,
+                return_type: Type::Int | Type::String,
                 ..
             }
             | Value::Binary {
-                ty: Type::Int | Type::Float | Type::String,
+                ty: Type::Int | Type::String,
                 ..
             } => Ok(("{}".into(), Self::emit_value(value)?)),
-            Value::Int(_) | Value::Int128(_) | Value::Float(_) | Value::String(_) => {
+            Value::Call {
+                return_type: Type::Float,
+                ..
+            }
+            | Value::Binary {
+                ty: Type::Float, ..
+            } => {
+                let expr = Self::emit_value(value)?;
+                Ok(("{}".into(), format!("(&({})).__tarvos_display()", expr)))
+            }
+            // Ints and strings have a Python-faithful `{}` rendering, but a
+            // float does not: Rust prints an integral float as `4` while
+            // Python prints `4.0`. The display helper formats with `{:?}`,
+            // which keeps the fractional part Python's `str()` shows.
+            Value::Int(_) | Value::Int128(_) | Value::String(_) => {
                 Ok(("{}".into(), Self::emit_value(value)?))
+            }
+            Value::Float(_) => {
+                let expr = Self::emit_value(value)?;
+                Ok(("{}".into(), format!("(&({})).__tarvos_display()", expr)))
             }
             // For a Name that might be a bool — we can't know the runtime value at codegen time
             // without tracking types through all let-bindings. For now emit {} and note this as a
@@ -1418,6 +1522,18 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
                 let expr = Self::emit_value(other)?;
                 Ok(("{}".into(), format!("(&({})).__tarvos_display()", expr)))
             }
+        }
+    }
+
+    /// Whether a value is statically a float, so a mixed numeric expression can
+    /// promote the integer side to `f64`.
+    fn value_is_float(value: &Value) -> bool {
+        match value {
+            Value::Float(_) => true,
+            Value::Binary { ty, .. } => *ty == Type::Float,
+            Value::Call { return_type, .. } => *return_type == Type::Float,
+            Value::Unary { ty, .. } => *ty == Type::Float,
+            _ => false,
         }
     }
 
@@ -1494,19 +1610,22 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
     fn value_needs_display_helper(value: &Value) -> bool {
         // Only values without a Python-faithful `{}` rendering need the display
         // helper; the scalar types and scalar-typed expressions render directly.
+        // `Float` and float-typed expressions are deliberately NOT in the
+        // direct-rendering list. Rust's `{}` prints an integral float as `4`,
+        // while Python's `str(4.0)` is `4.0`. The helper formats with `{:?}`,
+        // which keeps the fractional part.
         !matches!(
             value,
             Value::Bool(_)
                 | Value::Int(_)
                 | Value::Int128(_)
-                | Value::Float(_)
                 | Value::String(_)
                 | Value::Call {
-                    return_type: Type::Bool | Type::Int | Type::Float | Type::String,
+                    return_type: Type::Bool | Type::Int | Type::String,
                     ..
                 }
                 | Value::Binary {
-                    ty: Type::Bool | Type::Int | Type::Float | Type::String,
+                    ty: Type::Bool | Type::Int | Type::String,
                     ..
                 }
         )
@@ -1626,6 +1745,30 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
                     ));
                 }
                 let op_str = op.symbol();
+                // Python compares numbers across int and float (`1 == 1.0` is
+                // True), so a mixed comparison has to promote the integer side.
+                // Emitting `1_i64 == 1.0_f64` is not even valid Rust.
+                if matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::NotEq
+                        | BinaryOp::Lt
+                        | BinaryOp::LtEq
+                        | BinaryOp::Gt
+                        | BinaryOp::GtEq
+                ) {
+                    let left_is_float = Self::value_is_float(left);
+                    let right_is_float = Self::value_is_float(right);
+                    if left_is_float != right_is_float {
+                        let (left_str, right_str) = if left_is_float {
+                            (left_str, format!("({right_str} as f64)"))
+                        } else {
+                            (format!("({left_str} as f64)"), right_str)
+                        };
+                        return Ok(format!("({left_str}) {op_str} ({right_str})"));
+                    }
+                }
+
                 if *ty == Type::String && *op == BinaryOp::Add {
                     format!("format!(\"{{}}{{}}\", {}, {})", left_str, right_str)
                 } else if *ty == Type::Float {
@@ -1994,6 +2137,22 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
                         element_type,
                     ));
                 }
+                // A sequence read resolves the index through the runtime so a
+                // negative index counts from the end and an out-of-range index
+                // raises IndexError, as CPython does.
+                if matches!(container_type, Type::String) {
+                    return Ok(format!(
+                        "__tarvos_str_index(&{container_str}, ({index_str}) as i64)"
+                    ));
+                }
+                if matches!(container_type, Type::Array(_)) {
+                    return Ok(Self::clone_if_owned(
+                        format!(
+                            "{container_str}[__tarvos_index({container_str}.len() as i64, ({index_str}) as i64)]"
+                        ),
+                        element_type,
+                    ));
+                }
                 Self::clone_if_owned(
                     format!("{container_str}[({index_str} as usize)]"),
                     element_type,
@@ -2193,13 +2352,23 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
             ("tarvos_list_insert", [index, value]) => {
                 format!("tarvos_list_insert({borrowed}, ({index}) as i64, {value})")
             }
-            ("tarvos_list_remove", [value])
-            | ("tarvos_list_index", [value])
-            | ("tarvos_list_count", [value]) => {
+            // `remove` mutates the list in place, so it takes the `&mut`
+            // reborrow. `index` and `count` only read, and sharing the
+            // immutable-slice arm with `remove` generated a call that could
+            // never compile.
+            ("tarvos_list_remove", [value]) => {
+                format!("tarvos_list_remove({borrowed}, {value})")
+            }
+            ("tarvos_list_index", [value]) | ("tarvos_list_count", [value]) => {
                 let view = format!("(&{receiver}[..])");
                 format!("{name}({view}, {value})")
             }
+            // `pop()` and `pop(i)` are different operations: one pops the last
+            // element, the other removes at a (possibly negative) index.
             ("tarvos_list_pop", []) => format!("tarvos_list_pop({borrowed})"),
+            ("tarvos_list_pop", [index]) => {
+                format!("tarvos_list_pop_at({borrowed}, ({index}) as i64)")
+            }
             (_, []) => format!("{name}({borrowed})"),
             (_, arguments) => {
                 return Err(anyhow::anyhow!(
@@ -2562,6 +2731,86 @@ mod tests {
     use super::*;
     use tarvos_ir::{BinaryOp, Module, Stmt, Value};
     use tarvos_types::Type;
+
+    #[test]
+    fn print_float_uses_python_display_not_rust_display() {
+        // Rust's `{}` renders 4.0 as `4`; Python's `str(4.0)` is `4.0`.
+        let module = Module {
+            statements: vec![Stmt::Print(vec![Value::Float(4.0)])],
+        };
+        let code = RustCodegen::generate(&module).unwrap();
+        assert!(
+            code.contains("__tarvos_display()"),
+            "float print must go through the display helper:\n{code}"
+        );
+        assert!(
+            !code.contains("println!(\"{}\", 4.0_f64)"),
+            "float print must not use Rust's Display:\n{code}"
+        );
+    }
+
+    #[test]
+    fn mixed_int_float_comparison_promotes_the_integer_side() {
+        // `1_i64 == 1.0_f64` is not valid Rust. Python compares across int and
+        // float, so the integer operand is promoted.
+        let module = Module {
+            statements: vec![Stmt::Print(vec![Value::Binary {
+                left: Box::new(Value::Int(1)),
+                op: BinaryOp::Eq,
+                right: Box::new(Value::Float(1.0)),
+                ty: Type::Bool,
+            }])],
+        };
+        let code = RustCodegen::generate(&module).unwrap();
+        assert!(
+            code.contains("(1_i64 as f64)") && code.contains("== (1.0_f64)"),
+            "mixed comparison must promote the int side:\n{code}"
+        );
+    }
+
+    #[test]
+    fn negative_sequence_index_goes_through_the_runtime_helper() {
+        // `-1_i64 as usize` wraps to usize::MAX, so a negative index must be
+        // resolved against the sequence length instead.
+        let module = Module {
+            statements: vec![Stmt::Print(vec![Value::Index {
+                container: Box::new(Value::Name("xs".into())),
+                index: Box::new(Value::Int(-1)),
+                element_type: Type::Int,
+                container_type: Type::Array(Box::new(Type::Int)),
+            }])],
+        };
+        let code = RustCodegen::generate(&module).unwrap();
+        assert!(
+            code.contains("xs[__tarvos_index(xs.len() as i64, (-1_i64) as i64)]"),
+            "negative index must resolve through the runtime:\n{code}"
+        );
+        assert!(
+            !code.contains("as usize)]"),
+            "index must not be cast straight to usize:\n{code}"
+        );
+    }
+
+    #[test]
+    fn list_remove_is_emitted_with_a_mutable_reborrow() {
+        // `tarvos_list_remove` takes `&mut Vec<T>`; sharing the immutable-slice
+        // arm with `index`/`count` produced a call that could not compile.
+        let module = Module {
+            statements: vec![Stmt::ListAppend {
+                target: "xs".into(),
+                value: Value::Call {
+                    function: "tarvos_list_remove".into(),
+                    args: vec![Value::Name("xs".into()), Value::Int(3)],
+                    return_type: Type::None,
+                },
+            }],
+        };
+        let code = RustCodegen::generate(&module).unwrap();
+        assert!(
+            code.contains("tarvos_list_remove((&mut xs), 3_i64)"),
+            "remove must take the mutable reborrow:\n{code}"
+        );
+    }
 
     #[test]
     fn print_integer_uses_display_format() {

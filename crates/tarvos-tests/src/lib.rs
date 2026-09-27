@@ -666,9 +666,16 @@ mod pipeline {
         }"#;
 
         let code = compile(ast).expect("pipeline should succeed");
+        // Sequence reads resolve the index through the runtime so a negative
+        // index counts from the end and an out-of-range read raises IndexError,
+        // matching CPython. `nums[1 as usize]` could express neither rule.
         assert_contains_all(
             &code,
-            &["vec![10_i64, 20_i64, 30_i64]", "nums[(1_i64 as usize)]"],
+            &[
+                "vec![10_i64, 20_i64, 30_i64]",
+                "fn __tarvos_index(length: i64, index: i64) -> usize",
+                "nums[__tarvos_index(nums.len() as i64, (1_i64) as i64)]",
+            ],
         );
     }
 
@@ -692,7 +699,16 @@ mod pipeline {
         }"#;
 
         let code = compile(ast).expect("pipeline should succeed");
-        assert_contains_all(&code, &["nums[(0_i64 as usize)] = 99_i64;"]);
+        // The index is resolved into a temporary first: inlining `nums.len()`
+        // into the subscript would borrow the vector immutably while the store
+        // borrows it mutably.
+        assert_contains_all(
+            &code,
+            &[
+                "let __tarvos_index_0 = __tarvos_index(nums.len() as i64, (0_i64) as i64);",
+                "nums[__tarvos_index_0] = 99_i64;",
+            ],
+        );
     }
 
     #[test]
@@ -823,9 +839,13 @@ mod pipeline {
         ]}"#;
 
         let code = compile(ast).expect("nested subscript assignment should lower");
+        // Both indices are resolved into named temporaries before the store, so
+        // the chain is `grid[<tmp0>][<tmp1>]`.
         assert!(
-            code.contains("grid[(0_i64 as usize)][(1_i64 as usize)] ="),
-            "nested assignment must chain both indices:\n{code}"
+            code.contains("let __tarvos_index_0 =")
+                && code.contains("let __tarvos_index_1 =")
+                && code.contains("grid[__tarvos_index_0][__tarvos_index_1] ="),
+            "nested assignment must chain both resolved indices:\n{code}"
         );
     }
 
