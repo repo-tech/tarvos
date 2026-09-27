@@ -832,6 +832,31 @@ fn convert_ruff_stmt(statement: ruff::Stmt) -> tarvos_ast::Stmt {
         },
         ruff::Stmt::Break => Stmt::Break,
         ruff::Stmt::Continue => Stmt::Continue,
+        ruff::Stmt::Raise(value) => Stmt::Raise {
+            exc: value.map(convert_ruff_expr),
+        },
+        ruff::Stmt::Try {
+            body,
+            handlers,
+            orelse,
+            finalbody,
+            ..
+        } => Stmt::Try {
+            body: body.into_iter().map(convert_ruff_stmt).collect(),
+            handlers: handlers
+                .into_iter()
+                .map(|handler| tarvos_ast::ExceptHandler {
+                    name: handler.name,
+                    // The bridge already reduced the exception expression to its
+                    // final dotted component, so it round-trips as a plain name
+                    // and `lower.rs` needs no special case for it.
+                    exc_type: handler.exc_type.map(|id| tarvos_ast::Expr::Name { id }),
+                    body: handler.body.into_iter().map(convert_ruff_stmt).collect(),
+                })
+                .collect(),
+            orelse: orelse.into_iter().map(convert_ruff_stmt).collect(),
+            finalbody: finalbody.into_iter().map(convert_ruff_stmt).collect(),
+        },
         ruff::Stmt::Unsupported { kind } => Stmt::Expr {
             value: tarvos_ast::Expr::String {
                 value: format!("unsupported Ruff node: {kind}"),

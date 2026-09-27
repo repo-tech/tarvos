@@ -132,6 +132,19 @@ impl Emitter {
             // Imports carry no runtime effect here; the module resolver has
             // already inlined the imported definitions by this point.
             Stmt::ImportFrom { .. } => Ok(()),
+            // Exception control flow is lowered by `tarvos-codegen-rust`, which
+            // models it with `Result` values and a real error type. This legacy
+            // generator targets a different object runtime and has no way to
+            // express a propagating error, so it reports rather than emitting
+            // something that would silently fail to catch.
+            Stmt::Try { .. } => Err(CodegenError::new(
+                "try/except is not supported by the legacy object-runtime backend; \
+                 use the tarvos-codegen-rust native backend",
+            )),
+            Stmt::Raise(_) => Err(CodegenError::new(
+                "raise is not supported by the legacy object-runtime backend; \
+                 use the tarvos-codegen-rust native backend",
+            )),
             Stmt::Function { .. } => Err(CodegenError::new("nested functions are unsupported")),
             Stmt::Assign { targets, value } => self.assign(targets, value),
             Stmt::Expr(Expr::Call { function, args }) if matches!(function.as_ref(), Expr::Name(name) if name == "print") =>

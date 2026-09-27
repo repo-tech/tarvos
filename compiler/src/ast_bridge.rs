@@ -59,9 +59,34 @@ pub enum Stmt {
     Return(Option<Expr>),
     Break,
     Continue,
+    /// `try: ... except ...: ... else: ... finally: ...`
+    Try {
+        body: Vec<Stmt>,
+        handlers: Vec<ExceptHandler>,
+        orelse: Vec<Stmt>,
+        finalbody: Vec<Stmt>,
+    },
+    /// `raise` / `raise ValueError("...")`
+    Raise(Option<Expr>),
     Unsupported {
         kind: String,
     },
+}
+
+/// `except [Type] [as name]:` clause.
+///
+/// `exc_type` is the dotted name rendered as a string (`ValueError`,
+/// `ZeroDivisionError`). `None` means a bare `except:`, which catches everything.
+///
+/// The fields are read by the native pipeline (`tarvos-core` converts them into
+/// `tarvos_ast::ExceptHandler`) but not by the legacy `tarvos-ruff` binary, so
+/// this carries the same `dead_code` allowance as `Stmt` above.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct ExceptHandler {
+    pub name: Option<String>,
+    pub exc_type: Option<String>,
+    pub body: Vec<Stmt>,
 }
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -479,7 +504,47 @@ impl AstBridge {
             }
             pyast::Stmt::Break(_) => Stmt::Break,
             pyast::Stmt::Continue(_) => Stmt::Continue,
+            pyast::Stmt::Raise(node) => {
+                Stmt::Raise(node.exc.as_deref().map(|value| self.expr(value)))
+            }
+            pyast::Stmt::Try(node) => Stmt::Try {
+                body: self.suite(&node.body),
+                handlers: node
+                    .handlers
+                    .iter()
+                    .map(|handler| {
+                        // `ExceptHandler` is an enum wrapper; every supported
+                        // variant carries the same shape, so each maps across.
+                        let (name, exc_type, body) = match handler {
+                            pyast::ExceptHandler::ExceptHandler(handler) => (
+                                handler.name.as_ref().map(|name| name.id.to_string()),
+                                handler.type_.as_deref().map(Self::exception_type_name),
+                                &handler.body,
+                            ),
+                        };
+                        ExceptHandler {
+                            name,
+                            exc_type,
+                            body: self.suite(body),
+                        }
+                    })
+                    .collect(),
+                orelse: self.suite(&node.orelse),
+                finalbody: self.suite(&node.finalbody),
+            },
             _ => self.bad_stmt(stmt),
+        }
+    }
+
+    /// Render an exception type expression as the dotted name the runtime matches
+    /// on. `ValueError` and `statistics.StatisticsError` both reduce to their
+    /// final component, which is what CPython's `type.__name__` compares against.
+    fn exception_type_name(expression: &pyast::Expr) -> String {
+        match expression {
+            pyast::Expr::Name(name) => name.id.to_string(),
+            pyast::Expr::Call(call) => Self::exception_type_name(&call.func),
+            pyast::Expr::Attribute(attribute) => attribute.attr.to_string(),
+            _ => "Exception".to_string(),
         }
     }
     fn expr(&mut self, expr: &pyast::Expr) -> Expr {

@@ -67,6 +67,53 @@ impl<T: __TarvosRepr> __TarvosDisplay for Vec<T> { fn __tarvos_display(&self) ->
 impl<K: __TarvosRepr, V: __TarvosRepr> __TarvosDisplay for std::collections::HashMap<K, V> { fn __tarvos_display(&self) -> String { self.__tarvos_repr() } }
 "##;
 
+/// State threaded through statement emission.
+///
+/// Exceptions cannot be emitted without knowing whether the statement sits
+/// inside a `try` (a `raise` sets the pending error and jumps to the handler
+/// dispatch instead of returning) and what the enclosing function returns (a
+/// `return` inside `try` must be deferred so `finally` still runs).
+struct EmitCtx {
+    /// Stack of enclosing `try` frames, innermost last. Each frame is
+    /// `(block label, error variable)`. A `raise` writes to the innermost frame's
+    /// error variable and breaks its label; an uncaught error in a nested `try`
+    /// propagates by writing the *enclosing* frame's error variable and breaking
+    /// the enclosing label, after running its own `finally`.
+    try_stack: Vec<(String, String)>,
+    /// Rust return type of the enclosing function, for the deferred-return slot.
+    return_type: Option<String>,
+    /// Nesting depth, used to give each `try` a unique label.
+    try_depth: usize,
+    /// Names of user functions that can raise, so a call to one has to be
+    /// unwrapped from its `Result` at the call site.
+    fallible: std::collections::HashSet<String>,
+    /// Whether the function currently being emitted returns a `Result`, so a
+    /// `raise` in it propagates instead of terminating.
+    in_fallible_fn: bool,
+}
+
+impl EmitCtx {
+    fn top_level() -> Self {
+        Self {
+            try_stack: Vec::new(),
+            return_type: None,
+            try_depth: 0,
+            fallible: std::collections::HashSet::new(),
+            in_fallible_fn: false,
+        }
+    }
+
+    fn in_function(return_type: String) -> Self {
+        Self {
+            try_stack: Vec::new(),
+            return_type: Some(return_type),
+            try_depth: 0,
+            fallible: std::collections::HashSet::new(),
+            in_fallible_fn: false,
+        }
+    }
+}
+
 /// Runtime backing `range()` calls whose step is not a statically positive literal.
 ///
 /// Python's three-argument `range` counts down for a negative step and rejects a
@@ -312,43 +359,51 @@ impl __TarvosNum for f64 {
 
 #[allow(dead_code)]
 #[inline]
-fn __tarvos_statistics_require<T>(data: &[T], what: &str) {
+fn __tarvos_statistics_require<T>(data: &[T], what: &str) -> __TarvosResult<()> {
     if data.is_empty() {
-        panic!("StatisticsError: no data points for {what}");
+        return Err(__TarvosError::new(
+            "StatisticsError",
+            &format!("no data points for {what}"),
+        ));
     }
+    Ok(())
 }
+
 #[allow(dead_code)]
 #[inline]
-fn tarvos_statistics_mean<T: __TarvosNum>(data: &[T]) -> __TarvosStat {
-    __tarvos_statistics_require(data, "mean");
+fn tarvos_statistics_mean<T: __TarvosNum>(data: &[T]) -> __TarvosResult<__TarvosStat> {
+    __tarvos_statistics_require(data, "mean")?;
     // CPython reduces through Fraction and returns an int when the inputs are
     // all ints and the quotient is whole: `mean([10, 20, 30, 40, 50])` is 30,
     // not 30.0. The integer path is exact, so it cannot lose precision the way
     // a float sum would, and i128 keeps the sum clear of overflow.
-    let integer_inputs: Option<Vec<i64>> =
-        data.iter().map(|v| v.__tarvos_int()).collect();
+    let integer_inputs: Option<Vec<i64>> = data.iter().map(|v| v.__tarvos_int()).collect();
     if let Some(values) = integer_inputs {
         let sum: i128 = values.iter().map(|v| *v as i128).sum();
         let count = values.len() as i128;
         if sum % count == 0 {
-            return __TarvosStat::Int((sum / count) as i64);
+            return Ok(__TarvosStat::Int((sum / count) as i64));
         }
-        return __TarvosStat::Float(sum as f64 / count as f64);
+        return Ok(__TarvosStat::Float(sum as f64 / count as f64));
     }
-    __TarvosStat::Float(data.iter().map(|v| v.__tarvos_f64()).sum::<f64>() / data.len() as f64)
+    let total: f64 = data.iter().map(|v| v.__tarvos_f64()).sum();
+    Ok(__TarvosStat::Float(total / data.len() as f64))
 }
+
 #[allow(dead_code)]
 #[inline]
-fn tarvos_statistics_fmean<T: __TarvosNum>(data: &[T]) -> f64 {
-    __tarvos_statistics_require(data, "fmean");
+fn tarvos_statistics_fmean<T: __TarvosNum>(data: &[T]) -> __TarvosResult<f64> {
+    __tarvos_statistics_require(data, "fmean")?;
     // Unlike `mean`, fmean is documented to always return a float: fmean of
     // [10, 20, 30, 40, 50] is 30.0 even though mean of the same list is 30.
-    data.iter().map(|v| v.__tarvos_f64()).sum::<f64>() / data.len() as f64
+    let total: f64 = data.iter().map(|v| v.__tarvos_f64()).sum();
+    Ok(total / data.len() as f64)
 }
+
 #[allow(dead_code)]
 #[inline]
-fn tarvos_statistics_geometric_mean<T: __TarvosNum>(data: &[T]) -> f64 {
-    __tarvos_statistics_require(data, "geometric_mean");
+fn tarvos_statistics_geometric_mean<T: __TarvosNum>(data: &[T]) -> __TarvosResult<f64> {
+    __tarvos_statistics_require(data, "geometric_mean")?;
     // CPython reduces through logarithms rather than taking the n-th root of
     // the product. The product form is less accurate: [1.0, 4.0, 16.0] gives
     // 3.9999999999999996 by `powf` where the log form gives exactly 4.0.
@@ -356,34 +411,194 @@ fn tarvos_statistics_geometric_mean<T: __TarvosNum>(data: &[T]) -> f64 {
     for value in data {
         let value = value.__tarvos_f64();
         if value < 0.0 {
-            panic!("StatisticsError: geometric mean requires a non-negative product");
+            return Err(__TarvosError::new(
+                "StatisticsError",
+                "geometric mean requires a non-negative product",
+            ));
         }
         if value == 0.0 {
-            return 0.0;
+            return Ok(0.0);
         }
         total += value.ln();
     }
-    (total / data.len() as f64).exp()
+    Ok((total / data.len() as f64).exp())
 }
+
 #[allow(dead_code)]
 #[inline]
-fn tarvos_statistics_harmonic_mean<T: __TarvosNum>(data: &[T]) -> f64 {
-    __tarvos_statistics_require(data, "harmonic_mean");
-    let reciprocals: f64 = data
+fn tarvos_statistics_harmonic_mean<T: __TarvosNum>(data: &[T]) -> __TarvosResult<__TarvosStat> {
+    __tarvos_statistics_require(data, "harmonic_mean")?;
+    // CPython returns 0 as soon as it sees a zero, rather than dividing by an
+    // infinite sum of reciprocals or raising. `harmonic_mean([0.0, 1.0])` is the
+    // int 0 in CPython, so this returns an int to match.
+    let mut reciprocals = 0.0_f64;
+    for value in data {
+        let value = value.__tarvos_f64();
+        if value == 0.0 {
+            return Ok(__TarvosStat::Int(0));
+        }
+        reciprocals += 1.0 / value;
+    }
+    Ok(__TarvosStat::Float(data.len() as f64 / reciprocals))
+}
+
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_median<T: __TarvosNum>(data: &[T]) -> __TarvosResult<__TarvosStat> {
+    __tarvos_statistics_require(data, "median")?;
+    let mut values: Vec<(f64, T)> = data.iter().map(|v| (v.__tarvos_f64(), *v)).collect();
+    values.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let middle = values.len() / 2;
+    // CPython returns the middle *element* for odd-length input, so an int list
+    // yields an int: `median([1,2,3,4,5,6,7])` is 4, not 4.0. Even-length input
+    // averages the two central values and is always a float.
+    if values.len() % 2 == 1 {
+        return Ok(match values[middle].1.__tarvos_int() {
+            Some(value) => __TarvosStat::Int(value),
+            None => __TarvosStat::Float(values[middle].0),
+        });
+    }
+    Ok(__TarvosStat::Float(
+        (values[middle - 1].0 + values[middle].0) / 2.0,
+    ))
+}
+
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_median_low<T: __TarvosNum>(data: &[T]) -> __TarvosResult<T> {
+    __tarvos_statistics_require(data, "median_low")?;
+    // Sorted by numeric value while carrying the original element, so an int
+    // list yields an int result the way CPython does.
+    let mut values: Vec<(f64, T)> = data.iter().map(|v| (v.__tarvos_f64(), *v)).collect();
+    values.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(values[(values.len() - 1) / 2].1)
+}
+
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_median_high<T: __TarvosNum>(data: &[T]) -> __TarvosResult<T> {
+    __tarvos_statistics_require(data, "median_high")?;
+    let mut values: Vec<(f64, T)> = data.iter().map(|v| (v.__tarvos_f64(), *v)).collect();
+    values.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(values[values.len() / 2].1)
+}
+
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_mode<T: __TarvosNum + PartialEq>(data: &[T]) -> __TarvosResult<T> {
+    __tarvos_statistics_require(data, "mode")?;
+    let mut best = data[0];
+    let mut best_count = 0usize;
+    for candidate in data {
+        let count = data.iter().filter(|v| *v == candidate).count();
+        if count > best_count {
+            best_count = count;
+            best = *candidate;
+        }
+    }
+    // Returns an element of the input, not a fresh float: CPython's
+    // `mode([1, 2, 2, 3])` is the int 2, not 2.0.
+    Ok(best)
+}
+
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_multimode<T: __TarvosNum + PartialEq>(data: &[T]) -> __TarvosResult<Vec<T>> {
+    __tarvos_statistics_require(data, "multimode")?;
+    let mut modes: Vec<T> = Vec::new();
+    let mut best_count = 0usize;
+    for candidate in data {
+        if modes.contains(candidate) {
+            continue;
+        }
+        let count = data.iter().filter(|v| *v == candidate).count();
+        if count > best_count {
+            best_count = count;
+            modes.clear();
+            modes.push(*candidate);
+        } else if count == best_count {
+            modes.push(*candidate);
+        }
+    }
+    // CPython returns the modes in first-appearance order.
+    modes.sort_by(|a, b| {
+        data.iter().position(|v| v == a).cmp(&data.iter().position(|v| v == b))
+    });
+    Ok(modes)
+}
+
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_pvariance<T: __TarvosNum>(data: &[T]) -> __TarvosResult<f64> {
+    __tarvos_statistics_require(data, "pvariance")?;
+    let mean = tarvos_statistics_fmean(data)?;
+    let total: f64 = data
         .iter()
         .map(|v| {
-            let value = v.__tarvos_f64();
-            if value == 0.0 {
-                panic!("StatisticsError: harmonic mean is undefined for zero");
-            }
-            1.0 / value
+            let delta = v.__tarvos_f64() - mean;
+            delta * delta
         })
         .sum();
-    data.len() as f64 / reciprocals
+    Ok(total / data.len() as f64)
 }
+
 #[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_variance<T: __TarvosNum>(data: &[T]) -> __TarvosResult<f64> {
+    __tarvos_statistics_require(data, "variance")?;
+    if data.len() < 2 {
+        return Err(__TarvosError::new(
+            "StatisticsError",
+            "variance requires at least two data points",
+        ));
+    }
+    let mean = tarvos_statistics_fmean(data)?;
+    let total: f64 = data
+        .iter()
+        .map(|v| {
+            let delta = v.__tarvos_f64() - mean;
+            delta * delta
+        })
+        .sum();
+    Ok(total / (data.len() - 1) as f64)
+}
+
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_pstdev<T: __TarvosNum>(data: &[T]) -> __TarvosResult<f64> {
+    Ok(tarvos_statistics_pvariance(data)?.sqrt())
+}
+
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_stdev<T: __TarvosNum>(data: &[T]) -> __TarvosResult<f64> {
+    Ok(tarvos_statistics_variance(data)?.sqrt())
+}
+"##;
+
+/// A raised Tarvos exception.///
+/// This replaces the previous `panic!("Tarvos exception")` approach. A panic
+/// cannot carry a Python exception *class* and *message*, cannot be matched
+/// against `except ValueError`, and cannot be caught at all in a release build
+/// compiled with `panic = "abort"`. A `Result` propagates the real value and
+/// works under either panic strategy.
+const ERROR_RUNTIME: &str = r##"
+#[derive(Clone, Debug)]
+pub struct __TarvosError {
+    pub kind: String,
+    pub message: String,
+}
+
+pub type __TarvosResult<T> = Result<T, __TarvosError>;
+
+/// A statistics result that keeps the input's numeric kind.
+///
+/// CPython returns an *element of the input* from `mode`, `median_low`, and
+/// friends, and reduces `mean` through `Fraction`, so `mode([1, 2, 2, 3])` is the
+/// int `2` and `mean([10, 20, 30])` is the int `20`. Returning a plain `f64`
+/// would print `2.0` and `20.0`, which is a different value in Python.
 #[derive(Clone, Copy)]
-enum __TarvosStat {
+pub enum __TarvosStat {
     Int(i64),
     Float(f64),
 }
@@ -406,123 +621,48 @@ impl __TarvosDisplay for __TarvosStat {
     }
 }
 
-#[allow(dead_code)]
-#[inline]
-fn tarvos_statistics_median<T: __TarvosNum>(data: &[T]) -> __TarvosStat {
-    __tarvos_statistics_require(data, "median");
-    let mut values: Vec<(f64, T)> = data.iter().map(|v| (v.__tarvos_f64(), *v)).collect();
-    values.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    let middle = values.len() / 2;
-    // CPython returns the middle *element* for odd-length input, so an int list
-    // yields an int: `median([1,2,3,4,5,6,7])` is 4, not 4.0. Even-length input
-    // averages the two central values and is always a float.
-    if values.len() % 2 == 1 {
-        match values[middle].1.__tarvos_int() {
-            Some(value) => __TarvosStat::Int(value),
-            None => __TarvosStat::Float(values[middle].0),
-        }
-    } else {
-        __TarvosStat::Float((values[middle - 1].0 + values[middle].0) / 2.0)
+impl __TarvosError {
+    pub fn new(kind: &str, message: &str) -> Self {
+        Self { kind: kind.to_string(), message: message.to_string() }
     }
 }
-#[allow(dead_code)]
-#[inline]
-fn tarvos_statistics_median_low<T: __TarvosNum>(data: &[T]) -> T {
-    __tarvos_statistics_require(data, "median_low");
-    // Sorted by numeric value while carrying the original element, so an int
-    // list yields an int result the way CPython does.
-    let mut values: Vec<(f64, T)> = data.iter().map(|v| (v.__tarvos_f64(), *v)).collect();
-    values.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    values[(values.len() - 1) / 2].1
-}
-#[allow(dead_code)]
-#[inline]
-fn tarvos_statistics_median_high<T: __TarvosNum>(data: &[T]) -> T {
-    __tarvos_statistics_require(data, "median_high");
-    let mut values: Vec<(f64, T)> = data.iter().map(|v| (v.__tarvos_f64(), *v)).collect();
-    values.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    values[values.len() / 2].1
-}
-#[allow(dead_code)]
-#[inline]
-fn tarvos_statistics_mode<T: __TarvosNum + PartialEq>(data: &[T]) -> T {
-    __tarvos_statistics_require(data, "mode");
-    let mut best = data[0];
-    let mut best_count = 0usize;
-    for candidate in data {
-        let count = data.iter().filter(|v| *v == candidate).count();
-        if count > best_count {
-            best_count = count;
-            best = *candidate;
+
+/// Python's exception hierarchy, reduced to the classes the native backend emits.
+///
+/// `except X` matches when the raised class is `X` or a subclass of it, which is
+/// what CPython does. `StatisticsError` is a `ValueError` subclass in CPython, so
+/// `except ValueError` catches it; modelling that is the difference between a
+/// handler that works and one that silently falls through.
+pub fn __tarvos_error_matches(kind: &str, wanted: &str) -> bool {
+    if kind == wanted || wanted == "Exception" || wanted == "BaseException" {
+        return true;
+    }
+    let subclasses: &[(&str, &[&str])] = &[
+        ("ValueError", &["StatisticsError"]),
+        ("ArithmeticError", &["ZeroDivisionError", "OverflowError"]),
+        ("LookupError", &["IndexError", "KeyError"]),
+        ("OSError", &["FileNotFoundError"]),
+    ];
+    for (parent, children) in subclasses {
+        if *parent == wanted && children.contains(&kind) {
+            return true;
         }
     }
-    // Returns an element of the input, not a fresh float: CPython's
-    // `mode([1, 2, 2, 3])` is the int 2, not 2.0.
-    best
+    false
 }
-#[allow(dead_code)]
-#[inline]
-fn tarvos_statistics_multimode<T: __TarvosNum + PartialEq>(data: &[T]) -> Vec<T> {
-    __tarvos_statistics_require(data, "multimode");
-    let mut modes: Vec<T> = Vec::new();
-    let mut best_count = 0usize;
-    for candidate in data {
-        if modes.contains(candidate) {
-            continue;
-        }
-        let count = data.iter().filter(|v| *v == candidate).count();
-        if count > best_count {
-            best_count = count;
-            modes.clear();
-            modes.push(*candidate);
-        } else if count == best_count {
-            modes.push(*candidate);
-        }
-    }
-    // CPython returns the modes in first-appearance order.
-    modes.sort_by(|a, b| {
-        data.iter().position(|v| v == a).cmp(&data.iter().position(|v| v == b))
-    });
-    modes
+
+/// Terminate the way an uncaught Python exception does: message on stderr, exit 1.
+pub fn __tarvos_uncaught(error: &__TarvosError) -> ! {
+    eprintln!("{}: {}", error.kind, error.message);
+    std::process::exit(1);
 }
-#[allow(dead_code)]
-#[inline]
-fn tarvos_statistics_pvariance<T: __TarvosNum>(data: &[T]) -> f64 {
-    __tarvos_statistics_require(data, "pvariance");
-    let mean = tarvos_statistics_fmean(data);
-    data.iter()
-        .map(|v| {
-            let delta = v.__tarvos_f64() - mean;
-            delta * delta
-        })
-        .sum::<f64>()
-        / data.len() as f64
-}
-#[allow(dead_code)]
-#[inline]
-fn tarvos_statistics_variance<T: __TarvosNum>(data: &[T]) -> f64 {
-    __tarvos_statistics_require(data, "variance");
-    if data.len() < 2 {
-        panic!("StatisticsError: variance requires at least two data points");
-    }
-    let mean = tarvos_statistics_fmean(data);
-    data.iter()
-        .map(|v| {
-            let delta = v.__tarvos_f64() - mean;
-            delta * delta
-        })
-        .sum::<f64>()
-        / (data.len() - 1) as f64
-}
-#[allow(dead_code)]
-#[inline]
-fn tarvos_statistics_pstdev<T: __TarvosNum>(data: &[T]) -> f64 {
-    tarvos_statistics_pvariance(data).sqrt()
-}
-#[allow(dead_code)]
-#[inline]
-fn tarvos_statistics_stdev<T: __TarvosNum>(data: &[T]) -> f64 {
-    tarvos_statistics_variance(data).sqrt()
+
+/// Whether a `try` body ran to completion, which decides if `else` runs.
+/// A body that left through `return` did not, so `else` is skipped for it.
+#[derive(Clone, Copy, PartialEq)]
+pub enum TryFlow {
+    Normal,
+    Returned,
 }
 "##;
 
@@ -788,11 +928,23 @@ impl RustCodegen {
             out.push_str(JSON_RUNTIME);
         }
         // Emitted only when a program actually calls a statistics function.
-        if runtime_calls
+        let uses_statistics = runtime_calls
             .iter()
-            .any(|name| name.starts_with("tarvos_statistics_"))
-        {
+            .any(|name| name.starts_with("tarvos_statistics_"));
+        if uses_statistics {
             out.push_str(STATISTICS_RUNTIME);
+        }
+        // Emitted only when the program can actually raise or catch: a `try`
+        // statement, a `raise`, or a call to a fallible runtime helper.
+        // The statistics runtime reports failure through `Result`, so it needs
+        // the error types even when the program has no `try` at all.
+        if uses_statistics
+            || runtime_calls.iter().any(|name| {
+                name.starts_with("__tarvos_error_") || name.starts_with("__tarvos_result_")
+            })
+            || Self::module_uses_exceptions(module)
+        {
+            out.push_str(ERROR_RUNTIME);
         }
         // The conversion and truthiness helpers live in one block; either a
         // parse or a truthiness test pulls in the whole runtime, and nothing
@@ -849,32 +1001,48 @@ impl RustCodegen {
         // reset per function. Sharing one set let a local declared in an earlier
         // function suppress the `let` binding of the same name in a later one,
         // producing a reference to a name that is not in scope.
+        // Functions that can raise return a `Result`, so every call site has to
+        // unwrap it. The set is computed once and handed to each emit context.
+        let mut fallible_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for f in &functions {
+            if let Stmt::Function { name, body, .. } = f {
+                if Self::function_is_fallible(body) {
+                    fallible_names.insert(name.clone());
+                }
+            }
+        }
+
         for f in &functions {
             let mut function_scope = HashSet::new();
-            Self::emit_stmt(&mut out, f, 0, &mut function_scope)?;
+            let mut ctx = EmitCtx::top_level();
+            ctx.fallible = fallible_names.clone();
+            Self::emit_stmt(&mut out, f, 0, &mut function_scope, &mut ctx)?;
             out.push('\n');
         }
 
         // Emit fn main()
         out.push_str("fn main() {\n");
-        if main_stmts.iter().any(|stmt| Self::statement_uses_try(stmt))
-            || functions.iter().any(|stmt| Self::statement_uses_try(stmt))
-        {
-            out.push_str("    std::panic::set_hook(Box::new(|_| {}));\n");
-        }
+        // Exceptions are real `Result` values, not panics, so no panic hook is
+        // installed. Catching a panic would be wrong here in three separate ways:
+        // it cannot carry the Python exception class, it cannot run `finally` on a
+        // non-local exit, and under the `panic = "abort"` release profile it does
+        // not catch at all.
+        let mut ctx = EmitCtx::top_level();
+        ctx.fallible = fallible_names.clone();
         for stmt in main_stmts {
             if let Stmt::If { body, orelse, .. } = stmt {
                 if Self::is_module_entry_guard(stmt) {
                     for guarded_stmt in body {
-                        Self::emit_stmt(&mut out, guarded_stmt, 1, &mut declared)?;
+                        Self::emit_stmt(&mut out, guarded_stmt, 1, &mut declared, &mut ctx)?;
                     }
                     for fallback_stmt in orelse {
-                        Self::emit_stmt(&mut out, fallback_stmt, 1, &mut declared)?;
+                        Self::emit_stmt(&mut out, fallback_stmt, 1, &mut declared, &mut ctx)?;
                     }
                     continue;
                 }
             }
-            Self::emit_stmt(&mut out, stmt, 1, &mut declared)?;
+            Self::emit_stmt(&mut out, stmt, 1, &mut declared, &mut ctx)?;
         }
         out.push_str("}\n");
 
@@ -1275,17 +1443,26 @@ impl RustCodegen {
         }
     }
 
-    fn statement_uses_try(stmt: &Stmt) -> bool {
+    /// Whether the program can raise or catch anything, which is what decides
+    /// whether the error runtime has to be emitted at all.
+    fn module_uses_exceptions(module: &Module) -> bool {
+        module
+            .statements
+            .iter()
+            .any(Self::statement_uses_exceptions)
+    }
+
+    fn statement_uses_exceptions(stmt: &Stmt) -> bool {
         match stmt {
-            Stmt::Try { .. } => true,
+            Stmt::Try { .. } | Stmt::Raise(_) => true,
             Stmt::If { body, orelse, .. } => {
-                body.iter().any(Self::statement_uses_try)
-                    || orelse.iter().any(Self::statement_uses_try)
+                body.iter().any(Self::statement_uses_exceptions)
+                    || orelse.iter().any(Self::statement_uses_exceptions)
             }
             Stmt::While { body, .. }
             | Stmt::For { body, .. }
             | Stmt::Function { body, .. }
-            | Stmt::With { body, .. } => body.iter().any(Self::statement_uses_try),
+            | Stmt::With { body, .. } => body.iter().any(Self::statement_uses_exceptions),
             _ => false,
         }
     }
@@ -1346,13 +1523,14 @@ impl RustCodegen {
         stmt: &Stmt,
         indent: usize,
         declared: &mut HashSet<String>,
+        ctx: &mut EmitCtx,
     ) -> Result<()> {
         let ind = "    ".repeat(indent);
 
         match stmt {
             Stmt::StructDef { .. } => {}
             Stmt::Let { name, ty: _, value } => {
-                let value_str = Self::emit_value(value)?;
+                let value_str = Self::emit_value(value, ctx)?;
                 if declared.contains(name) {
                     out.push_str(&format!("{}{} = {};\n", ind, name, value_str));
                 } else {
@@ -1361,7 +1539,7 @@ impl RustCodegen {
                 }
             }
             Stmt::Assign { name, value } => {
-                let value_str = Self::emit_value(value)?;
+                let value_str = Self::emit_value(value, ctx)?;
                 if !declared.contains(name) {
                     let init = Self::zero_for_value(value)?;
                     declared.insert(name.clone());
@@ -1375,7 +1553,7 @@ impl RustCodegen {
                         "tuple assignment requires at least one target"
                     ));
                 }
-                let value_str = Self::emit_value(value)?;
+                let value_str = Self::emit_value(value, ctx)?;
                 let temporary = format!("__tarvos_unpack_{}", targets.join("_"));
                 if targets.iter().all(|name| !declared.contains(name)) {
                     let bindings = targets
@@ -1408,7 +1586,7 @@ impl RustCodegen {
                 field,
                 value,
             } => {
-                let object = Self::emit_value(object)?;
+                let object = Self::emit_value(object, ctx)?;
                 let object = if object == "self" {
                     "self_obj".to_string()
                 } else {
@@ -1419,7 +1597,7 @@ impl RustCodegen {
                     ind,
                     object,
                     field,
-                    Self::emit_value(value)?
+                    Self::emit_value(value, ctx)?
                 ));
             }
             Stmt::IndexAssign {
@@ -1427,9 +1605,9 @@ impl RustCodegen {
                 indices,
                 value,
             } => {
-                let value_str = Self::emit_value(value)?;
+                let value_str = Self::emit_value(value, ctx)?;
                 if indices.len() == 1 && matches!(indices[0], Value::String(_)) {
-                    let index_str = Self::emit_value(&indices[0])?;
+                    let index_str = Self::emit_value(&indices[0], ctx)?;
                     out.push_str(&format!(
                         "{}{}.insert({}, {});\n",
                         ind, target, index_str, value_str
@@ -1437,7 +1615,7 @@ impl RustCodegen {
                 } else {
                     let mut chain = target.clone();
                     for (position, index) in indices.iter().enumerate() {
-                        let index_str = Self::emit_value(index)?;
+                        let index_str = Self::emit_value(index, ctx)?;
                         if matches!(index, Value::String(_)) {
                             chain = format!("{chain}[{index_str}]");
                         } else {
@@ -1457,18 +1635,27 @@ impl RustCodegen {
                 }
             }
             Stmt::ListAppend { target, value } => {
-                let value_str = Self::emit_value(value)?;
+                let value_str = Self::emit_value(value, ctx)?;
                 out.push_str(&format!("{}{}.push({});\n", ind, target, value_str));
             }
             Stmt::Break => out.push_str(&format!("{}break;\n", ind)),
             Stmt::Continue => out.push_str(&format!("{}continue;\n", ind)),
             Stmt::Raise(value) => {
-                let message = value
-                    .as_ref()
-                    .map(Self::emit_value)
-                    .transpose()?
-                    .unwrap_or_else(|| "\"Tarvos raised an exception\"".to_string());
-                out.push_str(&format!("{}panic!(\"{{}}\", {});\n", ind, message));
+                let message = Self::exception_message_of(value, ctx)?;
+                // Inside a `try`, a raise records the error and jumps to that
+                // try's dispatch. In a function that can raise, it returns the
+                // error so the caller's `try` can see it. With neither, there is no
+                // handler anywhere, so it terminates like an uncaught Python
+                // exception.
+                let kind = Self::exception_kind_of(value);
+                let raised = format!("__TarvosError::new(\"{kind}\", &{message})");
+                match (ctx.try_stack.last().cloned(), ctx.in_fallible_fn) {
+                    (Some((label, error_var)), _) => out.push_str(&format!(
+                        "{ind}{error_var} = Some({raised});\n{ind}break '{label};\n"
+                    )),
+                    (None, true) => out.push_str(&format!("{ind}return Err({raised});\n")),
+                    (None, false) => out.push_str(&format!("{ind}__tarvos_uncaught(&{raised});\n")),
+                }
             }
             Stmt::Try {
                 body,
@@ -1476,6 +1663,16 @@ impl RustCodegen {
                 orelse,
                 finalbody,
             } => {
+                // A labelled block, not a closure: a closure would put the body's
+                // `let` bindings out of scope, so a variable assigned inside the try
+                // would be missing after it. The block keeps the hoisted
+                // declarations in the enclosing scope, and `break 'label` reaches
+                // out of a nested `if` or loop exactly as `?` would in a closure.
+                ctx.try_depth += 1;
+                let label = format!("__tarvos_try{}", ctx.try_depth);
+                let error_var = format!("__tarvos_error{}", ctx.try_depth);
+                let flow_var = format!("__tarvos_flow{}", ctx.try_depth);
+
                 let mut try_vars = HashSet::new();
                 Self::collect_assignment_targets(body, &mut try_vars);
                 for handler in handlers {
@@ -1483,51 +1680,138 @@ impl RustCodegen {
                 }
                 Self::collect_assignment_targets(orelse, &mut try_vars);
                 Self::collect_assignment_targets(finalbody, &mut try_vars);
-                for name in try_vars {
-                    if !declared.contains(&name) {
-                        let init = Self::zero_for_type_by_name(&name, body, &[])?;
-                        declared.insert(name.clone());
-                        out.push_str(&format!("{}let mut {} = {};\n", ind, name, init));
-                    }
-                }
-                out.push_str(&format!("{}let __tarvos_try_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{\n", ind));
-                for nested in body {
-                    Self::emit_stmt(out, nested, indent + 1, declared)?;
-                }
-                out.push_str(&format!("{}}}));\n", ind));
-                out.push_str(&format!("{}if __tarvos_try_result.is_ok() {{\n", ind));
-                for nested in orelse {
-                    Self::emit_stmt(out, nested, indent + 1, declared)?;
-                }
-                out.push_str(&format!("{}}} else {{\n", ind));
-                if let Some(handler) = handlers.first() {
+                // `except X as e` binds the exception message, which is a `String`.
+                // It is hoisted separately from the body's own locals so it does not
+                // pick up a numeric zero initializer from the surrounding code.
+                let mut handler_names: Vec<String> = Vec::new();
+                for handler in handlers {
                     if let Some(name) = &handler.name {
-                        out.push_str(&format!(
-                            "{}    let {} = \"Tarvos exception\".to_string();\n",
-                            ind, name
-                        ));
+                        handler_names.push(name.clone());
                     }
-                    for nested in &handler.body {
-                        Self::emit_stmt(out, nested, indent + 1, declared)?;
+                }
+                for name in &try_vars {
+                    if !declared.contains(name) {
+                        let init = Self::zero_for_type_by_name(name, body, &[])?;
+                        declared.insert(name.clone());
+                        out.push_str(&format!("{ind}let mut {name} = {init};\n"));
                     }
-                } else {
+                }
+                for name in &handler_names {
+                    if !declared.contains(name) {
+                        declared.insert(name.clone());
+                        out.push_str(&format!("{ind}let mut {name} = String::new();\n"));
+                    }
+                }
+
+                // The deferred-return slot. `return` inside `try` stores its value
+                // and breaks out, so `finally` still runs before the function really
+                // returns. That is why `return` is not emitted as a plain Rust
+                // `return` inside the block.
+                let ret_type = ctx.return_type.clone().filter(|ty| ty != "()");
+                let ret_slot = ret_type
+                    .as_ref()
+                    .map(|_| format!("__tarvos_ret{}", ctx.try_depth));
+                if let (Some(slot), Some(ty)) = (&ret_slot, &ret_type) {
+                    out.push_str(&format!("{ind}let mut {slot}: Option<{ty}> = None;\n"));
+                }
+                out.push_str(&format!(
+                    "{ind}let mut {error_var}: Option<__TarvosError> = None;\n{ind}let mut {flow_var} = TryFlow::Normal;\n"
+                ));
+
+                ctx.try_stack.push((label.clone(), error_var.clone()));
+                out.push_str(&format!("{ind}'{label}: {{\n"));
+                for nested in body {
+                    Self::emit_stmt(out, nested, indent + 1, declared, ctx)?;
+                }
+                out.push_str(&format!("{ind}}}\n"));
+                // `else` runs only when the body completed normally: never after a
+                // raise, and never after a `return` that left the try.
+                if !orelse.is_empty() {
                     out.push_str(&format!(
-                        "{}    std::panic::resume_unwind(__tarvos_try_result.unwrap_err());\n",
-                        ind
+                        "{ind}if {error_var}.is_none() && {flow_var} == TryFlow::Normal {{\n"
+                    ));
+                    for nested in orelse {
+                        Self::emit_stmt(out, nested, indent + 1, declared, ctx)?;
+                    }
+                    out.push_str(&format!("{ind}}}\n"));
+                }
+
+                if !handlers.is_empty() {
+                    out.push_str(&format!(
+                        "{ind}if let Some(__tarvos_exc_ref) = &{error_var} {{\n"
+                    ));
+                    for (position, handler) in handlers.iter().enumerate() {
+                        let hin = format!("{ind}    ");
+                        let guard = match &handler.exc_type {
+                            // A bare `except:` catches everything.
+                            None => "true".to_string(),
+                            Some(name) => format!(
+                                "__tarvos_error_matches(&__tarvos_exc_ref.kind, \"{name}\")"
+                            ),
+                        };
+                        out.push_str(&format!(
+                            "{hin}{}if {guard} {{\n",
+                            if position == 0 { "" } else { "else " }
+                        ));
+                        // Consume only on a match, so a later handler still sees the
+                        // error and can be tried.
+                        out.push_str(&format!(
+                            "{hin}    let __tarvos_exc = {error_var}.take().unwrap();\n"
+                        ));
+                        if let Some(name) = &handler.name {
+                            // `except X as e` binds the message, which is what `str(e)`
+                            // yields for the errors the native backend raises.
+                            out.push_str(&format!(
+                                "{hin}    {name} = __tarvos_exc.message.clone();\n"
+                            ));
+                        }
+                        for nested in &handler.body {
+                            Self::emit_stmt(out, nested, indent + 3, declared, ctx)?;
+                        }
+                        out.push_str(&format!("{hin}}}\n"));
+                    }
+                    out.push_str(&format!("{ind}}}\n"));
+                }
+
+                // `finally` runs on every path: normal completion, a caught
+                // exception, and a deferred return.
+                for nested in finalbody {
+                    Self::emit_stmt(out, nested, indent, declared, ctx)?;
+                }
+
+                if let Some(slot) = &ret_slot {
+                    out.push_str(&format!(
+                        "{ind}if let Some(__tarvos_value) = {slot} {{\n{ind}    return __tarvos_value;\n{ind}}}\n"
                     ));
                 }
-                out.push_str(&format!("{}}}\n", ind));
-                for nested in finalbody {
-                    Self::emit_stmt(out, nested, indent, declared)?;
+
+                // An error no handler matched propagates to the enclosing try, or
+                // terminates the process the way CPython reports an uncaught one.
+                // Pop this frame first, so what remains is the *enclosing* try; a
+                // bare `pop()` here would return this try's own frame and emit a
+                // `break` to a label that is already out of scope.
+                ctx.try_stack.pop();
+                let outer = ctx.try_stack.last().cloned();
+                out.push_str(&format!(
+                    "{ind}if let Some(__tarvos_err) = {error_var} {{\n"
+                ));
+                match outer {
+                    Some((outer_label, outer_error)) => out.push_str(&format!(
+                        "{ind}    {outer_error} = Some(__tarvos_err);\n{ind}    break '{outer_label};\n{ind}}}\n"
+                    )),
+                    None => out.push_str(&format!(
+                        "{ind}    __tarvos_uncaught(&__tarvos_err);\n{ind}}}\n"
+                    )),
                 }
+                ctx.try_depth -= 1;
             }
             Stmt::With { body, .. } => {
                 for nested in body {
-                    Self::emit_stmt(out, nested, indent, declared)?;
+                    Self::emit_stmt(out, nested, indent, declared, ctx)?;
                 }
             }
             Stmt::Expr(value) => {
-                out.push_str(&format!("{}{};\n", ind, Self::emit_value(value)?));
+                out.push_str(&format!("{}{};\n", ind, Self::emit_value(value, ctx)?));
             }
             Stmt::Print(values) => {
                 // Python print() semantics:
@@ -1542,7 +1826,7 @@ impl RustCodegen {
                     let mut fmts = Vec::new();
                     let mut args = Vec::new();
                     for v in values {
-                        let (fmt, arg) = Self::emit_print_single(v)?;
+                        let (fmt, arg) = Self::emit_print_single(v, ctx)?;
                         fmts.push(fmt);
                         args.push(arg);
                     }
@@ -1566,27 +1850,27 @@ impl RustCodegen {
                     }
                 }
 
-                let test_str = Self::emit_value(test)?;
+                let test_str = Self::emit_value(test, ctx)?;
                 out.push_str(&format!("{}if {} {{\n", ind, test_str));
 
                 for s in body {
-                    Self::emit_stmt(out, s, indent + 1, declared)?;
+                    Self::emit_stmt(out, s, indent + 1, declared, ctx)?;
                 }
 
                 if !orelse.is_empty() {
                     out.push_str(&format!("{}}} else {{\n", ind));
                     for s in orelse {
-                        Self::emit_stmt(out, s, indent + 1, declared)?;
+                        Self::emit_stmt(out, s, indent + 1, declared, ctx)?;
                     }
                 }
                 out.push_str(&format!("{}}}\n", ind));
             }
             Stmt::While { test, body } => {
-                let test_str = Self::emit_value(test)?;
+                let test_str = Self::emit_value(test, ctx)?;
                 out.push_str(&format!("{}while {} {{\n", ind, test_str));
 
                 for s in body {
-                    Self::emit_stmt(out, s, indent + 1, declared)?;
+                    Self::emit_stmt(out, s, indent + 1, declared, ctx)?;
                 }
 
                 out.push_str(&format!("{}}}\n", ind));
@@ -1597,7 +1881,7 @@ impl RustCodegen {
                 iter_type,
                 body,
             } => {
-                let iter_str = Self::emit_value(iter)?;
+                let iter_str = Self::emit_value(iter, ctx)?;
                 let iter_str = match iter_type {
                     Type::String => format!("{}.chars().map(|ch| ch.to_string())", iter_str),
                     Type::Dict { .. } => format!("{}.keys().cloned()", iter_str),
@@ -1624,7 +1908,7 @@ impl RustCodegen {
                 }
 
                 for s in body {
-                    Self::emit_stmt(out, s, indent + 1, declared)?;
+                    Self::emit_stmt(out, s, indent + 1, declared, ctx)?;
                 }
 
                 out.push_str(&format!("{}}}\n", ind));
@@ -1661,7 +1945,7 @@ impl RustCodegen {
                     ));
                     out.push_str(&format!("{}    let self_obj = &mut __tarvos_obj;\n", ind));
                     for nested in body {
-                        Self::emit_stmt(out, nested, indent + 1, declared)?;
+                        Self::emit_stmt(out, nested, indent + 1, declared, ctx)?;
                     }
                     out.push_str(&format!("{}    __tarvos_obj\n{}}}\n", ind, ind));
                     return Ok(());
@@ -1671,7 +1955,15 @@ impl RustCodegen {
                 } else {
                     name.as_str()
                 };
+                // A function that can raise returns `__TarvosResult<T>`, so the
+                // error travels to the caller's `try` instead of terminating here.
+                let fallible = Self::function_is_fallible(body);
                 let return_type_str = Self::type_to_rust(return_type);
+                let declared_return = if fallible {
+                    format!("__TarvosResult<{return_type_str}>")
+                } else {
+                    return_type_str.clone()
+                };
                 let params_str = params
                     .iter()
                     .map(|(pname, pty)| {
@@ -1685,7 +1977,7 @@ impl RustCodegen {
                     .collect::<Vec<_>>()
                     .join(", ");
 
-                if return_type_str == "()" {
+                if declared_return == "()" {
                     out.push_str(&format!(
                         "{}#[inline(always)]\n{}fn {}({}) {{\n",
                         ind, ind, emitted_name, params_str
@@ -1693,27 +1985,145 @@ impl RustCodegen {
                 } else {
                     out.push_str(&format!(
                         "{}#[inline(always)]\n{}fn {}({}) -> {} {{\n",
-                        ind, ind, emitted_name, params_str, return_type_str
+                        ind, ind, emitted_name, params_str, declared_return
                     ));
                 }
 
+                // A fresh context per function: a `return` inside this body's `try`
+                // must be deferred into this function's slot, not leak into the
+                // caller's. The return type decides whether a slot is needed.
+                let saved_ctx =
+                    std::mem::replace(ctx, EmitCtx::in_function(return_type_str.clone()));
+                ctx.in_fallible_fn = fallible;
                 for s in body {
-                    Self::emit_stmt(out, s, indent + 1, declared)?;
+                    Self::emit_stmt(out, s, indent + 1, declared, ctx)?;
                 }
+                *ctx = saved_ctx;
 
                 out.push_str(&format!("{}}}\n", ind));
             }
             Stmt::Return(value) => {
-                if let Some(v) = value {
-                    let value_str = Self::emit_value(v)?;
-                    out.push_str(&format!("{}return {};\n", ind, value_str));
+                // Inside a `try`, returning has to be deferred: a plain Rust
+                // `return` would skip `finally`, which Python always runs. The
+                // value is parked in the slot and the block is left; the `try`
+                // performs `finally` and then emits the real `return`.
+                let deferred = ctx
+                    .try_stack
+                    .last()
+                    .map(|(label, _)| (label.clone(), ctx.try_depth));
+                if let Some((label, depth)) = deferred {
+                    match value {
+                        Some(v) => {
+                            let value_str = Self::emit_value(v, ctx)?;
+                            out.push_str(&format!(
+                                "{ind}__tarvos_ret{depth} = Some({value_str});\n{ind}__tarvos_flow{depth} = TryFlow::Returned;\n{ind}break '{label};\n"
+                            ));
+                        }
+                        None => {
+                            out.push_str(&format!(
+                                "{ind}__tarvos_flow{depth} = TryFlow::Returned;\n{ind}break '{label};\n"
+                            ));
+                        }
+                    }
+                } else if let Some(v) = value {
+                    let value_str = Self::emit_value(v, ctx)?;
+                    // A fallible function returns its value wrapped, so the caller
+                    // has something to match on.
+                    if ctx.in_fallible_fn {
+                        out.push_str(&format!("{ind}return Ok({value_str});\n"));
+                    } else {
+                        out.push_str(&format!("{ind}return {value_str};\n"));
+                    }
                 } else {
-                    out.push_str(&format!("{}return;\n", ind));
+                    out.push_str(&format!("{ind}return;\n"));
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// The Python exception class a `raise` target names.
+    ///
+    /// `raise` with no value re-raises, which outside an active handler has no
+    /// exception to re-raise, so it is reported as the same base `Exception` the
+    /// previous implementation used rather than inventing a distinct class.
+    fn exception_kind_of(value: &Option<Value>) -> &'static str {
+        match value {
+            Some(Value::Call { function, .. }) => match function.as_str() {
+                "ValueError" => "ValueError",
+                "TypeError" => "TypeError",
+                "KeyError" => "KeyError",
+                "IndexError" => "IndexError",
+                "ZeroDivisionError" => "ZeroDivisionError",
+                "RuntimeError" => "RuntimeError",
+                "NotImplementedError" => "NotImplementedError",
+                "StatisticsError" => "StatisticsError",
+                _ => "Exception",
+            },
+            _ => "Exception",
+        }
+    }
+
+    /// The message a `raise` carries.
+    ///
+    /// `raise ValueError("boom")` constructs an exception; the only part that
+    /// survives into the native runtime is the string, because the native error is
+    /// a class name plus a message rather than a constructed Python object.
+    fn exception_message_of(value: &Option<Value>, ctx: &EmitCtx) -> Result<String> {
+        let Some(value) = value else {
+            return Ok("\"Tarvos raised an exception\"".to_string());
+        };
+        match value {
+            Value::Call { args, .. } => match args.first() {
+                Some(argument) => Self::emit_value(argument, ctx),
+                None => Ok("\"Tarvos raised an exception\"".to_string()),
+            },
+            other => Self::emit_value(other, ctx),
+        }
+    }
+
+    /// Whether a function body can raise, which decides if it returns a `Result`.
+    ///
+    /// Two things make a function fallible: an explicit `raise`, and a call to a
+    /// runtime helper that reports failure through a `Result` rather than a panic.
+    fn function_is_fallible(body: &[Stmt]) -> bool {
+        let mut calls = HashSet::new();
+        for stmt in body {
+            Self::collect_stmt_calls(stmt, &mut calls);
+        }
+        calls
+            .iter()
+            .any(|name| name.starts_with("__tarvos_result_"))
+            || body.iter().any(Self::statement_raises)
+    }
+
+    /// Whether a statement is, or contains, an explicit `raise`.
+    fn statement_raises(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Raise(_) => true,
+            Stmt::If { body, orelse, .. } => {
+                body.iter().any(Self::statement_raises) || orelse.iter().any(Self::statement_raises)
+            }
+            Stmt::While { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::Function { body, .. }
+            | Stmt::With { body, .. } => body.iter().any(Self::statement_raises),
+            Stmt::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                body.iter().any(Self::statement_raises)
+                    || orelse.iter().any(Self::statement_raises)
+                    || finalbody.iter().any(Self::statement_raises)
+                    || handlers
+                        .iter()
+                        .any(|handler| handler.body.iter().any(Self::statement_raises))
+            }
+            _ => false,
+        }
     }
 
     fn collect_assignment_targets(stmts: &[Stmt], out: &mut HashSet<String>) {
@@ -1865,7 +2275,7 @@ impl RustCodegen {
     /// - `str`   â†’ raw content, no surrounding quotes
     /// - `int`   â†’ standard decimal via `{}`
     /// - `float` â†’ standard decimal via `{}`
-    fn emit_print_single(value: &Value) -> Result<(String, String)> {
+    fn emit_print_single(value: &Value, ctx: &EmitCtx) -> Result<(String, String)> {
         match value {
             // Literal booleans: inline the Python-capitalised string directly
             Value::Bool(b) => {
@@ -1874,7 +2284,7 @@ impl RustCodegen {
             }
             // Bool-typed expression (e.g., a comparison result): use an inline if
             Value::Binary { ty: Type::Bool, .. } => {
-                let expr = Self::emit_value(value)?;
+                let expr = Self::emit_value(value, ctx)?;
                 Ok((
                     "{}".into(),
                     format!("if {} {{ \"True\" }} else {{ \"False\" }}", expr),
@@ -1884,7 +2294,7 @@ impl RustCodegen {
                 return_type: Type::Bool,
                 ..
             } => {
-                let expr = Self::emit_value(value)?;
+                let expr = Self::emit_value(value, ctx)?;
                 Ok((
                     "{}".into(),
                     format!("if {} {{ \"True\" }} else {{ \"False\" }}", expr),
@@ -1899,7 +2309,7 @@ impl RustCodegen {
             | Value::Binary {
                 ty: Type::Int | Type::String,
                 ..
-            } => Ok(("{}".into(), Self::emit_value(value)?)),
+            } => Ok(("{}".into(), Self::emit_value(value, ctx)?)),
             Value::Call {
                 return_type: Type::Float,
                 ..
@@ -1907,7 +2317,7 @@ impl RustCodegen {
             | Value::Binary {
                 ty: Type::Float, ..
             } => {
-                let expr = Self::emit_value(value)?;
+                let expr = Self::emit_value(value, ctx)?;
                 Ok(("{}".into(), format!("(&({})).__tarvos_display()", expr)))
             }
             // Ints and strings have a Python-faithful `{}` rendering, but a
@@ -1915,17 +2325,17 @@ impl RustCodegen {
             // Python prints `4.0`. The display helper formats with `{:?}`,
             // which keeps the fractional part Python's `str()` shows.
             Value::Int(_) | Value::Int128(_) | Value::String(_) => {
-                Ok(("{}".into(), Self::emit_value(value)?))
+                Ok(("{}".into(), Self::emit_value(value, ctx)?))
             }
             Value::Float(_) => {
-                let expr = Self::emit_value(value)?;
+                let expr = Self::emit_value(value, ctx)?;
                 Ok(("{}".into(), format!("(&({})).__tarvos_display()", expr)))
             }
             // For a Name that might be a bool â€” we can't know the runtime value at codegen time
             // without tracking types through all let-bindings. For now emit {} and note this as a
             // known limitation for bool variables (Phase C: track variable types in codegen context).
             other => {
-                let expr = Self::emit_value(other)?;
+                let expr = Self::emit_value(other, ctx)?;
                 Ok(("{}".into(), format!("(&({})).__tarvos_display()", expr)))
             }
         }
@@ -2037,7 +2447,7 @@ impl RustCodegen {
         )
     }
 
-    fn emit_value(value: &Value) -> Result<String> {
+    fn emit_value(value: &Value, ctx: &EmitCtx) -> Result<String> {
         Ok(match value {
             Value::Int(v) => format!("{}_i64", v),
             Value::Int128(v) => format!("{}_u128", v),
@@ -2055,7 +2465,7 @@ impl RustCodegen {
             Value::Name(name) if name == "__name__" => "\"__main__\".to_string()".to_string(),
             Value::Name(name) => name.clone(),
             Value::Field { object, field, .. } => {
-                let object = Self::emit_value(object)?;
+                let object = Self::emit_value(object, ctx)?;
                 let object = if object == "self" {
                     "self_obj".to_string()
                 } else {
@@ -2064,7 +2474,7 @@ impl RustCodegen {
                 format!("{}.{}", object, field)
             }
             Value::Unary { op, operand, .. } => {
-                let operand = Self::emit_value(operand)?;
+                let operand = Self::emit_value(operand, ctx)?;
                 match op {
                     tarvos_ir::UnaryOp::Neg => format!("-({})", operand),
                     tarvos_ir::UnaryOp::Not => format!("!({})", operand),
@@ -2077,8 +2487,8 @@ impl RustCodegen {
                 right,
                 ty,
             } => {
-                let left_str = Self::emit_value(left)?;
-                let right_str = Self::emit_value(right)?;
+                let left_str = Self::emit_value(left, ctx)?;
+                let right_str = Self::emit_value(right, ctx)?;
                 if *op == BinaryOp::Pow {
                     return Ok(match ty {
                         Type::Int => format!(
@@ -2222,7 +2632,7 @@ impl RustCodegen {
                     .iter()
                     .zip(owned)
                     .map(|(arg, needs_clone)| {
-                        let rendered = Self::emit_value(arg)?;
+                        let rendered = Self::emit_value(arg, ctx)?;
                         Ok(if needs_clone {
                             format!("{rendered}.clone()")
                         } else {
@@ -2231,6 +2641,21 @@ impl RustCodegen {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let args_str = args_rendered.join(", ");
+
+                // A function that can raise returns a `Result`. Inside a `try` the
+                // error is handed to that try; with no handler the call terminates,
+                // which is what an uncaught exception does in Python.
+                if ctx.fallible.contains(function) {
+                    let call = format!("{function}({args_str})");
+                    return Ok(match ctx.try_stack.last().cloned() {
+                        Some((label, error_var)) => format!(
+                            "match {call} {{ Ok(__tarvos_v) => __tarvos_v, Err(__tarvos_e) => {{ {error_var} = Some(__tarvos_e); break '{label}; }} }}"
+                        ),
+                        None => format!(
+                            "{call}.unwrap_or_else(|__tarvos_e| __tarvos_uncaught(&__tarvos_e))"
+                        ),
+                    });
+                }
 
                 match function.as_str() {
                     name if name.starts_with("__tarvos_ctor_") => {
@@ -2242,14 +2667,24 @@ impl RustCodegen {
                     }
                     // A statistics function reads its sequence; the call must
                     // borrow rather than move, or the program would consume
-                    // the caller's list on the first call.
+                    // the caller's list on the first call. It also reports
+                    // `StatisticsError` through a `Result`, so the call site
+                    // unwraps it the same way a fallible function call does.
                     name if name.starts_with("tarvos_statistics_") => {
                         if args_rendered.len() != 1 {
                             return Err(anyhow::anyhow!(
                                 "{name}() takes exactly one sequence"
                             ));
                         }
-                        format!("{name}(&{})", args_rendered[0])
+                        let call = format!("{name}(&{})", args_rendered[0]);
+                        match ctx.try_stack.last().cloned() {
+                            Some((label, error_var)) => format!(
+                                "match {call} {{ Ok(__tarvos_v) => __tarvos_v, Err(__tarvos_e) => {{ {error_var} = Some(__tarvos_e); break '{label}; }} }}"
+                            ),
+                            None => format!(
+                                "{call}.unwrap_or_else(|__tarvos_e| __tarvos_uncaught(&__tarvos_e))"
+                            ),
+                        }
                     }
                     name if name.starts_with("__tarvos_mut_call_") => {
                         let function = name.trim_start_matches("__tarvos_mut_call_");
@@ -2502,7 +2937,7 @@ impl RustCodegen {
                 }
                 let elements_str = elements
                     .iter()
-                    .map(Self::emit_value)
+                    .map(|v| Self::emit_value(v, ctx))
                     .collect::<Result<Vec<_>>>()?
                     .join(", ");
                 format!("vec![{}]", elements_str)
@@ -2514,8 +2949,8 @@ impl RustCodegen {
                 condition,
                 ..
             } => {
-                let iter_str = Self::emit_value(iter)?;
-                let element_str = Self::emit_value(element)?;
+                let iter_str = Self::emit_value(iter, ctx)?;
+                let element_str = Self::emit_value(element, ctx)?;
                 // Python iterates a `str` by character and a `dict` by key, which
                 // is not what Rust's `into_iter` does for those types.
                 let sequence = match iter.as_ref() {
@@ -2532,7 +2967,7 @@ impl RustCodegen {
                     _ => iter_str,
                 };
                 let mapped = if let Some(condition) = condition {
-                    let condition_str = Self::emit_value(condition)?;
+                    let condition_str = Self::emit_value(condition, ctx)?;
                     format!(
                         "{sequence}.into_iter().filter_map(|{target}| if {condition_str} {{ Some({element_str}) }} else {{ None }})"
                     )
@@ -2544,7 +2979,7 @@ impl RustCodegen {
             Value::Tuple { elements, .. } => {
                 let elements_str = elements
                     .iter()
-                    .map(Self::emit_value)
+                    .map(|v| Self::emit_value(v, ctx))
                     .collect::<Result<Vec<_>>>()?
                     .join(", ");
                 if elements.len() == 1 {
@@ -2560,8 +2995,8 @@ impl RustCodegen {
                     .map(|(key, value)| {
                         Ok(format!(
                             "({}, {})",
-                            Self::emit_value(key)?,
-                            Self::emit_value(value)?
+                            Self::emit_value(key, ctx)?,
+                            Self::emit_value(value, ctx)?
                         ))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -2573,8 +3008,8 @@ impl RustCodegen {
                 container_type,
                 element_type,
             } => {
-                let container_str = Self::emit_value(container)?;
-                let index_str = Self::emit_value(index)?;
+                let container_str = Self::emit_value(container, ctx)?;
+                let index_str = Self::emit_value(index, ctx)?;
                 if matches!(container_type, Type::Dict { .. }) {
                     // A `HashMap` lookup already yields a reference, so reading a
                     // non-`Copy` value out of it still needs an owned copy.
@@ -2622,15 +3057,15 @@ impl RustCodegen {
                         "slice steps are not supported in native Rust codegen"
                     ));
                 }
-                let container = Self::emit_value(container)?;
+                let container = Self::emit_value(container, ctx)?;
                 let lower = lower
                     .as_ref()
-                    .map(|v| Self::emit_value(v))
+                    .map(|v| Self::emit_value(v, ctx))
                     .transpose()?
                     .unwrap_or_else(|| "0_i64".to_string());
                 let upper = upper
                     .as_ref()
-                    .map(|v| Self::emit_value(v))
+                    .map(|v| Self::emit_value(v, ctx))
                     .transpose()?
                     .unwrap_or_else(|| format!("{}.len() as i64", container));
                 format!(
@@ -2663,7 +3098,7 @@ impl RustCodegen {
                             format_string.push('{');
                             format_string.push_str(&rendered_spec);
                             format_string.push('}');
-                            let mut rendered = Self::emit_value(value)?;
+                            let mut rendered = Self::emit_value(value, ctx)?;
                             if let Some(separator) = grouped {
                                 rendered = format!(
                                     "__tarvos_group_numeric({}, '{}')",

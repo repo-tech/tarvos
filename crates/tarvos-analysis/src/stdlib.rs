@@ -63,7 +63,7 @@ pub fn native_function(module: &str, name: &str) -> Option<NativeFunction> {
         ("statistics", "mean") => ("tarvos_statistics_mean", Type::Unknown),
         ("statistics", "fmean") => ("tarvos_statistics_fmean", Type::Float),
         ("statistics", "geometric_mean") => ("tarvos_statistics_geometric_mean", Type::Float),
-        ("statistics", "harmonic_mean") => ("tarvos_statistics_harmonic_mean", Type::Float),
+        ("statistics", "harmonic_mean") => ("tarvos_statistics_harmonic_mean", Type::Unknown),
         ("statistics", "median") => ("tarvos_statistics_median", Type::Unknown),
         ("statistics", "median_low") => ("tarvos_statistics_median_low", Type::Unknown),
         ("statistics", "median_high") => ("tarvos_statistics_median_high", Type::Unknown),
