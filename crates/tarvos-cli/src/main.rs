@@ -128,8 +128,8 @@ enum Commands {
 
     /// Static analysis and complexity profiling of a Python module
     Analyze {
-        /// Input Python file (.py)
-        #[arg(value_name = "FILE.py")]
+        /// Input Python file (.py) or a project directory
+        #[arg(value_name = "INPUT")]
         input: PathBuf,
 
         /// Report functions that are candidates for native hot-path acceleration
@@ -1700,20 +1700,50 @@ pub(crate) fn export_mode(args: &[String]) -> Result<()> {
 }
 
 pub(crate) fn analyze_mode(args: &[String]) -> Result<()> {
-    let input_file = args
+    let input = args
         .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: tarvos analyze <file.py>"))?;
+        .ok_or_else(|| anyhow::anyhow!("usage: tarvos analyze <file.py|project-dir>"))?;
+    let path = PathBuf::from(input);
 
+    // A directory is analyzed module by module. Reading a directory as a file
+    // failed with an opaque "Access is denied", so `tarvos analyze ./project`
+    // did not work even though scanning and packaging a project both do.
+    if path.is_dir() {
+        let files = collect_python_files(&path)?;
+        if files.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no Python files found under {}",
+                path.display()
+            ));
+        }
+        println!("Project: {}", path.display());
+        println!("Python files: {}", files.len());
+        for file in &files {
+            analyze_single(file)?;
+        }
+        return Ok(());
+    }
+
+    if !path.is_file() {
+        return Err(anyhow::anyhow!(
+            "analyze path is neither a Python file nor a directory: {}",
+            path.display()
+        ));
+    }
+    analyze_single(&path)
+}
+
+/// Analyze one Python file and print its statistics.
+fn analyze_single(path: &Path) -> Result<()> {
     let source =
-        fs::read_to_string(input_file).with_context(|| format!("failed to read {}", input_file))?;
-
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let ast_json = export_python_ast(&source)?;
     let module = parse_python_ast(&ast_json)?;
     let stats = analyze_module(&module);
 
-    println!("Input: {}", input_file);
-    println!("{}", stats);
-
+    println!();
+    println!("Input: {}", path.display());
+    println!("{stats}");
     Ok(())
 }
 

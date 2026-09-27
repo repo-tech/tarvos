@@ -6,6 +6,80 @@ All notable changes to Tarvos are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed - Python semantics
+
+Found by differential testing (`benchmarks/difftest.py`), which runs each case
+under CPython and under a compiled native artifact and compares stdout, stderr,
+and exit code. Every item below was invisible to the existing shape-asserting
+unit tests.
+
+- `if` / `elif` / `else` chains were lowered as a series of independent
+  branches followed by an unconditional `else`, so a native binary could run
+  more than one branch for a single evaluation. For `x = 10` a three-way chain
+  printed both the matching `elif` and the `else`. The AST bridge now rebuilds
+  the chain as nested `If`s, matching CPython's own `ast`.
+- `%` was folded with Rust's truncated remainder, so `-7 % 2` compiled to `-1`
+  instead of Python's `1`. Python's modulo is floored: the result takes the sign
+  of the divisor.
+- `7 / 2` folded to `3`. Type inference had already typed the expression as
+  float, but the constant folder ignored the result type and truncated.
+  `10 / 5` printed `10` instead of `10.0`.
+- A float-typed division cast only integer *literals*, so `total / count` over
+  two call results stayed integral.
+- `xs[-1]` was compiled to `xs[(-1 as usize)]`, which wraps to `usize::MAX` and
+  aborted the process. Negative indexing now works for lists and strings, on
+  both the read and the write path, and raises `IndexError` out of range.
+  `str` could not be indexed at all before, because `str` does not implement
+  `Index<usize>`.
+- `print(4.0)` printed `4`; Python's `str(4.0)` is `4.0`.
+- `1 == 1.0` generated `1_i64 == 1.0_f64`, which is not valid Rust.
+- `list.remove(v)` was emitted with an immutable slice while its helper takes
+  `&mut Vec<T>`, so any program using `remove` failed to compile.
+- `list.pop(index)` was rejected outright. `pop()` also returned a default value
+  for an empty list instead of raising `IndexError`.
+- Passing an owned value to a user function moved it, so a second use of the
+  same variable failed to compile.
+- `and` / `or` over non-bool operands generated invalid Rust (`0_i64 || 7_i64`).
+  Python returns one of its operands, so the construct is now diagnosed
+  explicitly with the `bool()` workaround named.
+
+### Added - project compilation
+
+- Native compilation of a project with local imports. `from module import name`,
+  `from package import submodule`, and relative imports (`from . import x`) are
+  resolved against the importing file and inlined before lowering, so a project
+  uses the same parser, lowering, optimizer, and codegen as a single file. The
+  `ImportFrom` AST node now carries a relative-import level.
+- `tarvos analyze` accepts a project directory and reports per-module statistics.
+
+### Fixed - CLI
+
+- `secure_input_path`, `secure_output_path`, and `scan_project_mode` rejected any
+  path that resolved outside the current directory, so
+  `tarvos compile /opt/app/main.py` failed from anywhere else. The check was not
+  a security control: the argument is the user's own, and the boundary that
+  matters, a compiled module escaping its project with `..`, is enforced in
+  `resolve_local_module`.
+- `tarvos python` returned 1 for every failing program instead of forwarding the
+  child's exit code.
+
+### Added - validation tooling
+
+- `benchmarks/difftest.py`: CPython-versus-native differential harness.
+- `benchmarks/cli_audit.py`: exercises all 15 advertised commands in an isolated
+  temporary directory, including building and running a native artifact.
+- `benchmarks/project_acceptance.py`: builds a fixture project, packages it, and
+  compares the native executable's output with CPython.
+- `tests/corpus/`: eleven differential cases.
+
+### Known limitations
+
+- `from package import submodule` followed by `submodule.f()` is diagnosed, not
+  compiled: the import binds a module namespace and the qualified call form is
+  not yet rewritten. Use `from package.submodule import f`.
+- `import *` and imports whose target does not exist on disk are reported
+  rather than guessed at.
+
 CI/CD and release-pipeline work. No compiler behaviour changes. The
 `v1.1.0-rc.3` tag was not moved and its published release description was not
 rewritten.
