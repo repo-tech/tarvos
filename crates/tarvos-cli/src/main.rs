@@ -679,15 +679,13 @@ fn execute_native_run(exe_path: &Path, args: &[String]) -> Result<()> {
 }
 
 fn scan_project_mode(input: &Path) -> Result<()> {
-    let root = env::current_dir()?;
-    let canonical_root = canonicalize_existing_path(&root, "project root")?;
+    // The scan target is named explicitly by the user, so it is resolved the
+    // same way as every other input: canonicalized, but not pinned to the
+    // current directory. Scanning `~/projects/app` from an unrelated folder is
+    // a normal request; refusing it was the same usability bug as
+    // `secure_input_path`, and it also blocked the CLI audit, which runs in a
+    // temporary directory.
     let input = canonicalize_existing_path(input, "scan path")?;
-    if !input.starts_with(&canonical_root) {
-        return Err(anyhow::anyhow!(
-            "scan path must remain inside the current project root: {}",
-            canonical_root.display()
-        ));
-    }
     if !input.is_file() && !input.is_dir() {
         return Err(anyhow::anyhow!(
             "scan path is not a file or directory: {}",
@@ -1014,10 +1012,15 @@ pub(crate) fn python_mode(args: &[String]) -> Result<()> {
         .current_dir(&working_dir)
         .status()
         .with_context(|| format!("failed to execute Python program {}", input_path.display()))?;
+    // Forward the program's own exit status. Returning a generic error made
+    // every non-zero exit look like a Tarvos failure, so a caller could not
+    // tell a program that returned 3 from a program that would not start.
+    if let Some(code) = status.code() {
+        std::process::exit(code);
+    }
     if !status.success() {
         return Err(anyhow::anyhow!(
-            "Python compatibility runtime exited with status {}",
-            status
+            "Python compatibility runtime was terminated by a signal"
         ));
     }
     Ok(())
@@ -1931,6 +1934,17 @@ fn which_simple(name: &str) -> Result<Option<PathBuf>> {
     Ok(Some(PathBuf::from(first)))
 }
 
+/// Resolve a user-supplied input path.
+///
+/// The path is canonicalized so relative paths, `.` segments, and symlinks
+/// resolve to one unambiguous location.
+///
+/// This deliberately does NOT confine the result to the current directory.
+/// The argument is typed by the user, so refusing a path they explicitly named
+/// ("tarvos compile /opt/app/main.py" from anywhere else) is a usability bug,
+/// not a security control: there is no untrusted input here. The boundary that
+/// does matter — a compiled module escaping its project with `..` — is enforced
+/// where the input is actually untrusted, in `tarvos_core::resolve_local_module`.
 fn secure_input_path(input: &str, root: &Path) -> Result<PathBuf> {
     let candidate = PathBuf::from(input);
     let absolute = if candidate.is_absolute() {
@@ -1938,17 +1952,14 @@ fn secure_input_path(input: &str, root: &Path) -> Result<PathBuf> {
     } else {
         root.join(candidate)
     };
-    let canonical = canonicalize_existing_path(&absolute, "resolve input path")?;
-    let root_norm = canonicalize_existing_path(root, "resolve project root")?;
-    if !canonical.starts_with(&root_norm) {
-        return Err(anyhow::anyhow!(
-            "input path is outside the safe project root: {}",
-            canonical.display()
-        ));
-    }
-    Ok(canonical)
+    canonicalize_existing_path(&absolute, "resolve input path")
 }
 
+/// Resolve a user-supplied output path and create its parent directory.
+///
+/// As with `secure_input_path`, the destination is the user's own choice and is
+/// not confined to the current directory. The parent is created when missing so
+/// `tarvos build app.py -o dist/app.exe` works on a fresh checkout.
 fn secure_output_path(output: &str, root: &Path) -> Result<PathBuf> {
     let candidate = PathBuf::from(output);
     let absolute = if candidate.is_absolute() {
@@ -1960,15 +1971,6 @@ fn secure_output_path(output: &str, root: &Path) -> Result<PathBuf> {
     if !parent.exists() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create output directory {}", parent.display()))?;
-    }
-    let canonical_parent =
-        normalize_windows_path(parent.canonicalize().unwrap_or(parent.to_path_buf()));
-    let root_norm = normalize_windows_path(root.canonicalize().unwrap_or(root.to_path_buf()));
-    if !canonical_parent.starts_with(&root_norm) {
-        return Err(anyhow::anyhow!(
-            "output directory is outside the safe project root: {}",
-            canonical_parent.display()
-        ));
     }
     Ok(absolute)
 }
