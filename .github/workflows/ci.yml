@@ -75,6 +75,11 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Check the compatibility matrix is current
+        # The matrix is generated from a table and cross-checked against the
+        # differential corpus, so it cannot claim coverage that no test proves.
+        run: python scripts/compatibility_matrix.py --check
+
       - name: Test workspace
         run: cargo test --workspace --no-fail-fast
 
