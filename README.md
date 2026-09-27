@@ -11,12 +11,40 @@
 
 ## 🚀 Key Features
 
-- **Blazing Fast Performance**: Achieves **10x to 100x speedups** over standard CPython for compute-heavy numerical and algorithmic workloads.
-- **Intelligent Compiler Pipeline**: AST Lowering $\rightarrow$ SSA-form Intermediate Representation (IR) $\rightarrow$ Loop Induction Closed-Form Reductions (Gauss series $O(N) \rightarrow O(1)$) $\rightarrow$ Copy & Constant Propagation $\rightarrow$ Dead Code Elimination $\rightarrow$ Native Rust Codegen.
-- **Direct Native Binaries**: One command to transpile, optimize, and build standalone `.exe` / ELF / Mach-O binaries.
-- **Source-Only Mode**: Emit pure, readable, idiomatic Rust code without requiring an active Rust compiler installation.
-- **Zero-Friction CLI**: Full suite of subcommands (`compile`, `build`, `run`, `doctor`, `analyze`, `benchmark`, `validate`, `init`, `export`, `clean`, `install`).
-- **Comprehensive Validation**: 100% output parity verified against CPython across math, recursion, nested loops, and data structures.
+- **Ahead-of-time compilation**: a statically analyzable subset of Python is
+  lowered to Rust and built into a standalone native executable. The pipeline is
+  AST lowering → IR → loop induction closed-form reduction → copy and constant
+  propagation → dead code elimination → Rust codegen.
+- **Native binaries**: one command produces a PE/ELF/Mach-O executable with no
+  Python runtime and no Rust toolchain needed at run time.
+- **Python semantics preserved**: floored modulo, true division, negative
+  indexing, and `IndexError` on out-of-range. See
+  [docs/SHOWCASE.md](docs/SHOWCASE.md).
+- **Source-only mode**: emit readable Rust without invoking rustc.
+- **Zero-friction CLI**: `compile`, `build`, `run`, `python`, `doctor`,
+  `analyze`, `scan`, `benchmark`, `init`, `export`, `package`, `clean`,
+  `install`, `validate`, `ai-status`. Every command is exercised by
+  `benchmarks/cli_audit.py`.
+- **Verified against CPython**: `benchmarks/difftest.py` compiles each case to
+  a native executable and compares stdout, stderr, and exit code with CPython.
+
+### Documentation
+
+| Document | Contents |
+|---|---|
+| [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) | What is supported, partial, unsupported, and why |
+| [compatibility.json](docs/compatibility.json) | The same, machine-readable and CI-verified |
+| [docs/SHOWCASE.md](docs/SHOWCASE.md) | Worked examples with real recorded output |
+| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Measured build time, runtime, and binary size |
+| [CHANGELOG.md](CHANGELOG.md) | Verified behaviour changes and known limitations |
+
+### Performance claims
+
+Tarvos is **not** claimed to be faster than Nuitka, PyInstaller, or
+RustPython. No fair comparison has been run; see
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the measurements that do exist and
+for why a competitor comparison is not currently constructible. Reported
+figures come from a single machine and are labelled with their conditions.
 
 ---
 
