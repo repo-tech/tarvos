@@ -149,7 +149,15 @@ pub fn native_builtin_method(receiver: MethodReceiver, method: &str) -> Option<B
         (MethodReceiver::Str, "index") => exact("tarvos_str_index", 1, Type::Int),
         (MethodReceiver::List, "index") => exact("tarvos_list_index", 1, Type::Int),
         (MethodReceiver::List, "count") => exact("tarvos_list_count", 1, Type::Int),
-        (MethodReceiver::List, "pop") => exact("tarvos_list_pop", 0, Type::Unknown),
+        // `pop()` removes and returns the last item; `pop(i)` removes and
+        // returns the item at index i, and i may be negative. Python raises
+        // IndexError for an empty list or an out-of-range index, so both forms
+        // are modelled and both report the same failure the interpreter does.
+        (MethodReceiver::List, "pop") => BuiltinMethod {
+            rust_name: "tarvos_list_pop",
+            arity: 0..=1,
+            return_type: Type::Unknown,
+        },
         (MethodReceiver::List, "extend") => exact("tarvos_list_extend", 1, Type::None),
         (MethodReceiver::List, "insert") => exact("tarvos_list_insert", 2, Type::None),
         (MethodReceiver::List, "remove") => exact("tarvos_list_remove", 1, Type::None),
