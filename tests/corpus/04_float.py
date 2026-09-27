@@ -26,3 +26,24 @@ print(f + i)
 print(f / i)
 # `True + True` is valid Python (bool is a subclass of int) but is not part of
 # the supported numeric subset, so it is not asserted here.
+
+# Conversions. `int("3")` must parse, not cast: Rust's `as` cannot convert a
+# String to i64 at all.
+print(int("3"))
+print(int(" 42 "))
+print(int(3.9))
+print(int(True))
+print(float("3.2"))
+print(float(3))
+print(str(3))
+print(str(3.25))
+print(str(True))
+
+# Truthiness. Zero and the empty string are falsy; a non-empty string is
+# truthy. Rust's `!= 0` only works for integers.
+print(bool(0))
+print(bool(1))
+print(bool(0.0))
+print(bool(0.5))
+print(bool(""))
+print(bool("x"))

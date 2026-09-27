@@ -289,6 +289,84 @@ fn __tarvos_str_index(value: &str, index: i64) -> String {
 }
 "##;
 
+/// Runtime that backs Python's thousands separator (`f"{value:,}"`).
+///
+/// Only emitted into a generated program that actually formats a number with
+/// a separator. It used to be pushed unconditionally, so every generated file
+/// carried it, including a one-line `print("hello")`.
+const NUMERIC_GROUPING_RUNTIME: &str = r##"
+#[inline]
+fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> String {
+    let text = value.to_string();
+    let (sign, digits) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text.as_str()),
+    };
+    let (integer, fraction) = match digits.split_once('.') {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (digits, None),
+    };
+    let mut grouped = String::with_capacity(integer.len() + integer.len() / 3 + 1);
+    for (index, ch) in integer.chars().enumerate() {
+        if index > 0 && (integer.len() - index) % 3 == 0 {
+            grouped.push(separator);
+        }
+        grouped.push(ch);
+    }
+    match fraction {
+        Some(tail) => format!("{sign}{grouped}.{tail}"),
+        None => format!("{sign}{grouped}"),
+    }
+}
+"##;
+
+/// Runtime backing Python's `int()` / `float()` conversions.
+///
+/// Rust's `as` only converts between primitive types, so `"3" as i64` is not
+/// valid Rust and is a compile error. Python's `int("3")` and `float("3.2")`
+/// parse the string, and raise `ValueError` when it cannot.
+const CONVERSION_RUNTIME: &str = r##"
+#[allow(dead_code)]
+#[inline]
+fn __tarvos_parse_int(value: &str) -> i64 {
+    let trimmed = value.trim();
+    match trimmed.parse::<i64>() {
+        Ok(parsed) => parsed,
+        // Python accepts "3.0" for int() and rejects "3.5"; it also accepts
+        // surrounding whitespace, which `parse` already rejected above.
+        Err(_) => match trimmed.parse::<f64>() {
+            Ok(parsed) if parsed.fract() == 0.0 => parsed as i64,
+            _ => panic!("ValueError: invalid literal for int() with base 10: '{value}'"),
+        },
+    }
+}
+#[allow(dead_code)]
+#[inline]
+fn __tarvos_parse_float(value: &str) -> f64 {
+    let trimmed = value.trim();
+    match trimmed.parse::<f64>() {
+        Ok(parsed) => parsed,
+        Err(_) => panic!("ValueError: could not convert string to float: '{value}'"),
+    }
+}
+/// Python truthiness.
+///
+/// Rust's `!= 0` only works for integers, and comparing a `String`, `Vec`, or
+/// `HashMap` to `0` does not compile. A single named operation is used
+/// everywhere instead of an ad-hoc comparison per type.
+#[allow(dead_code)]
+#[inline]
+fn __tarvos_truthy_string(value: &str) -> bool { !value.is_empty() }
+#[allow(dead_code)]
+#[inline]
+fn __tarvos_truthy_vec<T>(items: &[T]) -> bool { !items.is_empty() }
+#[allow(dead_code)]
+#[inline]
+fn __tarvos_truthy_map<K, V>(items: &std::collections::HashMap<K, V>) -> bool {
+    !items.is_empty()
+}
+"##;
+
 /// Runtime that backs the native `list` builtin methods.
 ///
 /// Generic over the element type so one set of helpers serves `list[int]`,
@@ -377,39 +455,16 @@ impl RustCodegen {
         Self::validate_module_assignments(module)?;
         let mut out = String::new();
         out.push_str("#![allow(unused_mut, unused_variables, dead_code, unused_parens, unused_assignments, non_snake_case, non_camel_case_types)]\n\n");
-        // Python's numeric grouping (`f"{value:,}"`) has no `format!` equivalent, so the
-        // generated program carries a tiny helper that inserts the separator itself.
-        out.push_str(
-            r#"#[inline]
-fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> String {
-    let text = value.to_string();
-    let (sign, digits) = match text.strip_prefix('-') {
-        Some(rest) => ("-", rest),
-        None => ("", text.as_str()),
-    };
-    let (integer, fraction) = match digits.split_once('.') {
-        Some((head, tail)) => (head, Some(tail)),
-        None => (digits, None),
-    };
-    let mut grouped = String::with_capacity(integer.len() + integer.len() / 3 + 1);
-    for (index, ch) in integer.chars().enumerate() {
-        if index > 0 && (integer.len() - index) % 3 == 0 {
-            grouped.push(separator);
-        }
-        grouped.push(ch);
-    }
-    match fraction {
-        Some(tail) => format!("{sign}{grouped}.{tail}"),
-        None => format!("{sign}{grouped}"),
-    }
-}
-
-"#,
-        );
         // One traversal collects every runtime helper the program calls, so the
         // preludes below only cost anything when they are actually reachable.
         let runtime_calls = Self::collect_runtime_calls(module);
         let needs = |name: &str| runtime_calls.contains(name);
+        // Numeric grouping is only present in a program that formats a number
+        // with a thousands separator. Emitting it unconditionally put an unused
+        // helper into every generated file, including `print("hello")`.
+        if needs("__tarvos_group_numeric") {
+            out.push_str(NUMERIC_GROUPING_RUNTIME);
+        }
         if runtime_calls
             .iter()
             .any(|name| name.starts_with("tarvos_str_"))
@@ -428,6 +483,15 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
         }
         if needs("__tarvos_index") {
             out.push_str(INDEX_RUNTIME);
+        }
+        // The conversion and truthiness helpers live in one block; either a
+        // parse or a truthiness test pulls in the whole runtime, and nothing
+        // else in the generated program needs it.
+        if runtime_calls
+            .iter()
+            .any(|name| name.starts_with("__tarvos_parse_") || name.starts_with("__tarvos_truthy_"))
+        {
+            out.push_str(CONVERSION_RUNTIME);
         }
         if needs("tarvos_range") {
             out.push_str(RANGE_RUNTIME);
@@ -789,10 +853,25 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
         match value {
             Value::Call { function, args, .. } => {
                 names.insert(function.clone());
+                // `int("3")` and `float("3.2")` parse a string, and `bool(x)`
+                // tests truthiness. Both pull in the conversion runtime, so the
+                // prelude has to know about them before emission runs.
+                match function.as_str() {
+                    "int" => {
+                        names.insert("__tarvos_parse_int".to_string());
+                    }
+                    "float" => {
+                        names.insert("__tarvos_parse_float".to_string());
+                    }
+                    "bool" => {
+                        names.insert("__tarvos_truthy_string".to_string());
+                    }
+                    _ => {}
+                }
                 // A three-argument `range` is emitted as `tarvos_range` unless its
                 // step is a statically positive literal, and the prelude decision
-                // runs before emission. Recording the helper here — using the same
-                // predicate as the emitter — keeps the two in agreement.
+                // runs before emission. Recording the helper here â€” using the same
+                // predicate as the emitter â€” keeps the two in agreement.
                 if function == "range"
                     && args.len() == 3
                     && !Self::range_step_is_positive_literal(args.get(2))
@@ -860,7 +939,21 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
             }
             Value::FormatString { parts } => {
                 for part in parts {
-                    if let FormatPart::Value { value, .. } = part {
+                    if let FormatPart::Value {
+                        value, format_spec, ..
+                    } = part
+                    {
+                        // A thousands separator routes through
+                        // `__tarvos_group_numeric`, which the prelude only
+                        // emits when a program actually uses it. The predicate is
+                        // the same one the emitter applies, so the two cannot
+                        // disagree about whether the helper is needed.
+                        if format_spec
+                            .as_deref()
+                            .is_some_and(|spec| spec.starts_with(','))
+                        {
+                            names.insert("__tarvos_group_numeric".to_string());
+                        }
                         Self::collect_value_calls(value, names);
                     }
                 }
@@ -1125,11 +1218,11 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
             }
             Stmt::Print(values) => {
                 // Python print() semantics:
-                //   bool  → "True" / "False"   (Rust {} gives "true"/"false" — wrong)
-                //   str   → no surrounding quotes
-                //   int   → standard decimal
-                //   float → standard decimal
-                //   multi → space separated
+                //   bool  â†’ "True" / "False"   (Rust {} gives "true"/"false" â€” wrong)
+                //   str   â†’ no surrounding quotes
+                //   int   â†’ standard decimal
+                //   float â†’ standard decimal
+                //   multi â†’ space separated
                 if values.is_empty() {
                     out.push_str(&format!("{}println!();\n", ind));
                 } else {
@@ -1455,10 +1548,10 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
     /// Produces `(format_string, argument_expression)` for a Python-semantic `print()`.
     ///
     /// Python `print()` rules:
-    /// - `bool`  → `True` / `False`  (Rust `{}` gives lowercase — incorrect)
-    /// - `str`   → raw content, no surrounding quotes
-    /// - `int`   → standard decimal via `{}`
-    /// - `float` → standard decimal via `{}`
+    /// - `bool`  â†’ `True` / `False`  (Rust `{}` gives lowercase â€” incorrect)
+    /// - `str`   â†’ raw content, no surrounding quotes
+    /// - `int`   â†’ standard decimal via `{}`
+    /// - `float` â†’ standard decimal via `{}`
     fn emit_print_single(value: &Value) -> Result<(String, String)> {
         match value {
             // Literal booleans: inline the Python-capitalised string directly
@@ -1515,7 +1608,7 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
                 let expr = Self::emit_value(value)?;
                 Ok(("{}".into(), format!("(&({})).__tarvos_display()", expr)))
             }
-            // For a Name that might be a bool — we can't know the runtime value at codegen time
+            // For a Name that might be a bool â€” we can't know the runtime value at codegen time
             // without tracking types through all let-bindings. For now emit {} and note this as a
             // known limitation for bool variables (Phase C: track variable types in codegen context).
             other => {
@@ -1855,10 +1948,13 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
                         _ => return Err(anyhow::anyhow!("range() requires 1 to 3 arguments")),
                     },
                     "len" => format!("({}.len() as i64)", args_str),
-                    "str" => format!("format!(\"{{}}\", {})", args_str),
-                    "int" => format!("{} as i64", args_str),
-                    "float" => format!("{} as f64", args_str),
-                    "bool" => format!("({} != 0)", args_str),
+                    // `str(x)` must reproduce Python's `str`. Rust's `{}` prints
+                    // `true` for a bool and `4` for an integral float, where
+                    // Python prints `True` and `4.0`.
+                    "str" => Self::emit_str_conversion(&args[0], &args_rendered[0]),
+                    "int" => Self::emit_int_conversion(&args[0], &args_rendered[0]),
+                    "float" => Self::emit_float_conversion(&args[0], &args_rendered[0]),
+                    "bool" => Self::emit_truthiness(&args[0], &args_rendered[0]),
                     "tarvos_perf_counter" => {
                         "std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect(\"system clock\").as_secs_f64()".to_string()
                     }
@@ -2267,6 +2363,86 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
     /// Rust cannot move a `String` out of a `Vec` or a `HashMap` by index, so
     /// the read has to produce an owned value. Copy-like element types are left
     /// alone so numeric loops keep their zero-copy access.
+    /// Emit Python's `str(x)`.
+    ///
+    /// The rendering is type-directed because Rust's `Display` disagrees with
+    /// Python's `str` in two places: a bool prints as `true` rather than `True`,
+    /// and an integral float prints as `4` rather than `4.0`.
+    fn emit_str_conversion(argument: &Value, rendered: &str) -> String {
+        match argument {
+            Value::Bool(flag) => {
+                let literal = if *flag { "True" } else { "False" };
+                format!("\"{literal}\"")
+            }
+            // `{:?}` keeps the fractional part for a whole-number float.
+            Value::Float(_) => format!("format!(\"{{:?}}\", {rendered})"),
+            _ => format!("format!(\"{{}}\", {rendered})"),
+        }
+    }
+
+    /// Emit Python's truthiness test for a value.
+    ///
+    /// `x != 0` is only meaningful for integers. For a string or a collection
+    /// the correct test is emptiness, and comparing those to `0` does not
+    /// compile. Each shape gets the helper that matches it.
+    fn emit_truthiness(argument: &Value, rendered: &str) -> String {
+        match argument {
+            Value::String(_) | Value::FormatString { .. } => {
+                format!("__tarvos_truthy_string(&{rendered})")
+            }
+            Value::List { .. } | Value::ListComp { .. } => {
+                format!("__tarvos_truthy_vec(&{rendered})")
+            }
+            Value::Dict { .. } => format!("__tarvos_truthy_map(&{rendered})"),
+            // A bool is already a bool. An int is not: `if 0_i64` does not
+            // compile, so an integer has to be compared against zero.
+            Value::Bool(_) => rendered.to_string(),
+            Value::Int(_) | Value::Int128(_) => format!("(({rendered}) != 0)"),
+            // A float compares against 0.0, not 0: Rust will not promote an
+            // integer literal to f64, so `x != 0_i64` does not compile here.
+            Value::Float(_) => format!("(({rendered}) != 0.0_f64)"),
+            // An unknown value: fall back to the numeric comparison, which is
+            // the only one Rust can express without knowing the type.
+            _ => format!("(({rendered}) != 0_i64)"),
+        }
+    }
+
+    /// Emit Python's `int(x)`.
+    ///
+    /// The conversion is chosen from the argument's static type. A blind `as`
+    /// is wrong in both directions: `String as i64` does not compile, and
+    /// `f64 as i64` silently truncates where Python raises for a non-integral
+    /// value. A string needs real parsing, which is what the runtime helper is
+    /// for.
+    fn emit_int_conversion(argument: &Value, rendered: &str) -> String {
+        match argument {
+            Value::String(_) | Value::FormatString { .. } => {
+                format!("__tarvos_parse_int(&{rendered})")
+            }
+            Value::Float(_) => format!("({rendered} as i64)"),
+            // A bool is an int subclass in Python: int(True) is 1.
+            Value::Bool(_) => format!("(if {rendered} {{ 1_i64 }} else {{ 0_i64 }})"),
+            Value::Int(_) | Value::Int128(_) => rendered.to_string(),
+            _ => format!("({rendered} as i64)"),
+        }
+    }
+
+    /// Emit Python's `float(x)`.
+    ///
+    /// `float("3.2")` parses; `float(3)` widens. A blind `as` cannot do the
+    /// first and is not a general conversion in either direction.
+    fn emit_float_conversion(argument: &Value, rendered: &str) -> String {
+        match argument {
+            Value::String(_) | Value::FormatString { .. } => {
+                format!("__tarvos_parse_float(&{rendered})")
+            }
+            Value::Int(_) | Value::Int128(_) | Value::Float(_) => {
+                format!("({rendered} as f64)")
+            }
+            _ => format!("({rendered} as f64)"),
+        }
+    }
+
     /// Whether a call targets a user-defined function rather than a runtime
     /// helper or a builtin.
     ///
@@ -2317,7 +2493,7 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
     ///
     /// Both the prelude decision and the emitted expression consult this, so a
     /// step can never be classified one way when choosing the helper and another
-    /// way when choosing the call — that mismatch emits a program referencing an
+    /// way when choosing the call â€” that mismatch emits a program referencing an
     /// undefined function.
     fn range_step_is_positive_literal(step: Option<&Value>) -> bool {
         match step {
@@ -3094,7 +3270,7 @@ mod tests {
 
     #[test]
     fn constant_folded_print_emits_single_value() {
-        // Simulates: x = 10; y = 20; z = x+y; print(z) — after constant folding z=30
+        // Simulates: x = 10; y = 20; z = x+y; print(z) â€” after constant folding z=30
         let module = Module {
             statements: vec![Stmt::Print(vec![Value::Int(30)])],
         };

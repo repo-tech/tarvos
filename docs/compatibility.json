@@ -293,6 +293,43 @@
       ]
     },
     {
+      "category": "integers",
+      "feature": "numeric promotion int/float",
+      "status": "supported",
+      "tests": [
+        "03_integer",
+        "04_float"
+      ],
+      "note": "Promoted by the inferred result type, not by scattered casts in codegen."
+    },
+    {
+      "category": "conversions",
+      "feature": "int() and float() from str",
+      "status": "supported",
+      "tests": [
+        "04_float"
+      ],
+      "note": "Parses the string and raises ValueError when it cannot; Rust's `as` cannot convert a String at all."
+    },
+    {
+      "category": "conversions",
+      "feature": "int()/float()/str() from scalars",
+      "status": "supported",
+      "tests": [
+        "04_float"
+      ],
+      "note": "Type-directed: a bool becomes True/False, an integral float keeps its .0."
+    },
+    {
+      "category": "conversions",
+      "feature": "bool() truthiness",
+      "status": "supported",
+      "tests": [
+        "04_float"
+      ],
+      "note": "Emptiness for str/list/dict, zero for numbers; a single named operation rather than `!= 0` per type."
+    },
+    {
       "category": "imports",
       "feature": "from module import name",
       "status": "supported",
