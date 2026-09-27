@@ -7,7 +7,10 @@ pub struct NativeFunction {
 }
 
 pub fn module_supported(module: &str) -> bool {
-    matches!(module, "math" | "time" | "os" | "os.path" | "json")
+    matches!(
+        module,
+        "math" | "time" | "os" | "os.path" | "json" | "statistics"
+    )
 }
 
 pub fn native_function(module: &str, name: &str) -> Option<NativeFunction> {
@@ -47,6 +50,32 @@ pub fn native_function(module: &str, name: &str) -> Option<NativeFunction> {
         ("os.path", "isfile") => ("tarvos_os_path_isfile", Type::Bool),
         ("os.path", "isdir") => ("tarvos_os_path_isdir", Type::Bool),
         ("json", "dumps") => ("tarvos_json_dumps_static", Type::String),
+        // statistics. `mean`/`fmean` and the dispersion functions always produce
+        // a fresh float. The element-returning functions (`median`, `median_low`,
+        // `median_high`, `mode`, `multimode`) yield values taken from the input, so
+        // they are registered as Unknown: CPython returns the int 2 for
+        // `mode([1, 2, 2, 3])`, not 2.0, and the generated Rust must not coerce.
+        // `mean` reduces through Fraction and yields an int when integer input
+        // divides evenly, so it is Unknown rather than Float: `mean([10,20,30,40,50])`
+        // is 30. `fmean` is always a float. The element-returning functions
+        // (`median`, `median_low`, `median_high`, `mode`, `multimode`) likewise
+        // yield values taken from the input and must not be coerced.
+        ("statistics", "mean") => ("tarvos_statistics_mean", Type::Unknown),
+        ("statistics", "fmean") => ("tarvos_statistics_fmean", Type::Float),
+        ("statistics", "geometric_mean") => ("tarvos_statistics_geometric_mean", Type::Float),
+        ("statistics", "harmonic_mean") => ("tarvos_statistics_harmonic_mean", Type::Float),
+        ("statistics", "median") => ("tarvos_statistics_median", Type::Unknown),
+        ("statistics", "median_low") => ("tarvos_statistics_median_low", Type::Unknown),
+        ("statistics", "median_high") => ("tarvos_statistics_median_high", Type::Unknown),
+        ("statistics", "mode") => ("tarvos_statistics_mode", Type::Unknown),
+        ("statistics", "multimode") => (
+            "tarvos_statistics_multimode",
+            Type::Array(Box::new(Type::Unknown)),
+        ),
+        ("statistics", "variance") => ("tarvos_statistics_variance", Type::Float),
+        ("statistics", "pvariance") => ("tarvos_statistics_pvariance", Type::Float),
+        ("statistics", "stdev") => ("tarvos_statistics_stdev", Type::Float),
+        ("statistics", "pstdev") => ("tarvos_statistics_pstdev", Type::Float),
         _ => return None,
     };
     Some(NativeFunction {

@@ -289,6 +289,243 @@ fn __tarvos_str_index(value: &str, index: i64) -> String {
 }
 "##;
 
+/// Runtime backing Python's `statistics` module.
+///
+/// Generic over a small numeric trait so one implementation serves both an
+/// int list and a float list without duplicating every function.
+const STATISTICS_RUNTIME: &str = r##"
+#[allow(dead_code)]
+trait __TarvosNum: Copy {
+    fn __tarvos_f64(self) -> f64;
+    /// `Some` only for genuine integers, so a float median stays a float.
+    fn __tarvos_int(self) -> Option<i64> {
+        None
+    }
+}
+impl __TarvosNum for i64 {
+    fn __tarvos_f64(self) -> f64 { self as f64 }
+    fn __tarvos_int(self) -> Option<i64> { Some(self) }
+}
+impl __TarvosNum for f64 {
+    fn __tarvos_f64(self) -> f64 { self }
+}
+
+#[allow(dead_code)]
+#[inline]
+fn __tarvos_statistics_require<T>(data: &[T], what: &str) {
+    if data.is_empty() {
+        panic!("StatisticsError: no data points for {what}");
+    }
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_mean<T: __TarvosNum>(data: &[T]) -> __TarvosStat {
+    __tarvos_statistics_require(data, "mean");
+    // CPython reduces through Fraction and returns an int when the inputs are
+    // all ints and the quotient is whole: `mean([10, 20, 30, 40, 50])` is 30,
+    // not 30.0. The integer path is exact, so it cannot lose precision the way
+    // a float sum would, and i128 keeps the sum clear of overflow.
+    let integer_inputs: Option<Vec<i64>> =
+        data.iter().map(|v| v.__tarvos_int()).collect();
+    if let Some(values) = integer_inputs {
+        let sum: i128 = values.iter().map(|v| *v as i128).sum();
+        let count = values.len() as i128;
+        if sum % count == 0 {
+            return __TarvosStat::Int((sum / count) as i64);
+        }
+        return __TarvosStat::Float(sum as f64 / count as f64);
+    }
+    __TarvosStat::Float(data.iter().map(|v| v.__tarvos_f64()).sum::<f64>() / data.len() as f64)
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_fmean<T: __TarvosNum>(data: &[T]) -> f64 {
+    __tarvos_statistics_require(data, "fmean");
+    // Unlike `mean`, fmean is documented to always return a float: fmean of
+    // [10, 20, 30, 40, 50] is 30.0 even though mean of the same list is 30.
+    data.iter().map(|v| v.__tarvos_f64()).sum::<f64>() / data.len() as f64
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_geometric_mean<T: __TarvosNum>(data: &[T]) -> f64 {
+    __tarvos_statistics_require(data, "geometric_mean");
+    // CPython reduces through logarithms rather than taking the n-th root of
+    // the product. The product form is less accurate: [1.0, 4.0, 16.0] gives
+    // 3.9999999999999996 by `powf` where the log form gives exactly 4.0.
+    let mut total = 0.0_f64;
+    for value in data {
+        let value = value.__tarvos_f64();
+        if value < 0.0 {
+            panic!("StatisticsError: geometric mean requires a non-negative product");
+        }
+        if value == 0.0 {
+            return 0.0;
+        }
+        total += value.ln();
+    }
+    (total / data.len() as f64).exp()
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_harmonic_mean<T: __TarvosNum>(data: &[T]) -> f64 {
+    __tarvos_statistics_require(data, "harmonic_mean");
+    let reciprocals: f64 = data
+        .iter()
+        .map(|v| {
+            let value = v.__tarvos_f64();
+            if value == 0.0 {
+                panic!("StatisticsError: harmonic mean is undefined for zero");
+            }
+            1.0 / value
+        })
+        .sum();
+    data.len() as f64 / reciprocals
+}
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum __TarvosStat {
+    Int(i64),
+    Float(f64),
+}
+
+impl std::fmt::Display for __TarvosStat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            __TarvosStat::Int(value) => write!(f, "{value}"),
+            __TarvosStat::Float(value) => write!(f, "{value}"),
+        }
+    }
+}
+
+impl __TarvosDisplay for __TarvosStat {
+    fn __tarvos_display(&self) -> String {
+        match *self {
+            __TarvosStat::Int(value) => value.to_string(),
+            __TarvosStat::Float(value) => format!("{:?}", value),
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_median<T: __TarvosNum>(data: &[T]) -> __TarvosStat {
+    __tarvos_statistics_require(data, "median");
+    let mut values: Vec<(f64, T)> = data.iter().map(|v| (v.__tarvos_f64(), *v)).collect();
+    values.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let middle = values.len() / 2;
+    // CPython returns the middle *element* for odd-length input, so an int list
+    // yields an int: `median([1,2,3,4,5,6,7])` is 4, not 4.0. Even-length input
+    // averages the two central values and is always a float.
+    if values.len() % 2 == 1 {
+        match values[middle].1.__tarvos_int() {
+            Some(value) => __TarvosStat::Int(value),
+            None => __TarvosStat::Float(values[middle].0),
+        }
+    } else {
+        __TarvosStat::Float((values[middle - 1].0 + values[middle].0) / 2.0)
+    }
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_median_low<T: __TarvosNum>(data: &[T]) -> T {
+    __tarvos_statistics_require(data, "median_low");
+    // Sorted by numeric value while carrying the original element, so an int
+    // list yields an int result the way CPython does.
+    let mut values: Vec<(f64, T)> = data.iter().map(|v| (v.__tarvos_f64(), *v)).collect();
+    values.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    values[(values.len() - 1) / 2].1
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_median_high<T: __TarvosNum>(data: &[T]) -> T {
+    __tarvos_statistics_require(data, "median_high");
+    let mut values: Vec<(f64, T)> = data.iter().map(|v| (v.__tarvos_f64(), *v)).collect();
+    values.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    values[values.len() / 2].1
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_mode<T: __TarvosNum + PartialEq>(data: &[T]) -> T {
+    __tarvos_statistics_require(data, "mode");
+    let mut best = data[0];
+    let mut best_count = 0usize;
+    for candidate in data {
+        let count = data.iter().filter(|v| *v == candidate).count();
+        if count > best_count {
+            best_count = count;
+            best = *candidate;
+        }
+    }
+    // Returns an element of the input, not a fresh float: CPython's
+    // `mode([1, 2, 2, 3])` is the int 2, not 2.0.
+    best
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_multimode<T: __TarvosNum + PartialEq>(data: &[T]) -> Vec<T> {
+    __tarvos_statistics_require(data, "multimode");
+    let mut modes: Vec<T> = Vec::new();
+    let mut best_count = 0usize;
+    for candidate in data {
+        if modes.contains(candidate) {
+            continue;
+        }
+        let count = data.iter().filter(|v| *v == candidate).count();
+        if count > best_count {
+            best_count = count;
+            modes.clear();
+            modes.push(*candidate);
+        } else if count == best_count {
+            modes.push(*candidate);
+        }
+    }
+    // CPython returns the modes in first-appearance order.
+    modes.sort_by(|a, b| {
+        data.iter().position(|v| v == a).cmp(&data.iter().position(|v| v == b))
+    });
+    modes
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_pvariance<T: __TarvosNum>(data: &[T]) -> f64 {
+    __tarvos_statistics_require(data, "pvariance");
+    let mean = tarvos_statistics_fmean(data);
+    data.iter()
+        .map(|v| {
+            let delta = v.__tarvos_f64() - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / data.len() as f64
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_variance<T: __TarvosNum>(data: &[T]) -> f64 {
+    __tarvos_statistics_require(data, "variance");
+    if data.len() < 2 {
+        panic!("StatisticsError: variance requires at least two data points");
+    }
+    let mean = tarvos_statistics_fmean(data);
+    data.iter()
+        .map(|v| {
+            let delta = v.__tarvos_f64() - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / (data.len() - 1) as f64
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_pstdev<T: __TarvosNum>(data: &[T]) -> f64 {
+    tarvos_statistics_pvariance(data).sqrt()
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_stdev<T: __TarvosNum>(data: &[T]) -> f64 {
+    tarvos_statistics_variance(data).sqrt()
+}
+"##;
+
 /// Runtime that serializes the supported Tarvos value types to JSON.
 ///
 /// `json.dumps` on a compile-time literal is resolved during lowering. A value
@@ -549,6 +786,13 @@ impl RustCodegen {
         }
         if needs("tarvos_json_dumps_runtime") {
             out.push_str(JSON_RUNTIME);
+        }
+        // Emitted only when a program actually calls a statistics function.
+        if runtime_calls
+            .iter()
+            .any(|name| name.starts_with("tarvos_statistics_"))
+        {
+            out.push_str(STATISTICS_RUNTIME);
         }
         // The conversion and truthiness helpers live in one block; either a
         // parse or a truthiness test pulls in the whole runtime, and nothing
@@ -1995,6 +2239,17 @@ impl RustCodegen {
                     // `json.dumps(x)` on a value computed at run time.
                     "tarvos_json_dumps_runtime" => {
                         format!("(&({})).__tarvos_json()", args_str)
+                    }
+                    // A statistics function reads its sequence; the call must
+                    // borrow rather than move, or the program would consume
+                    // the caller's list on the first call.
+                    name if name.starts_with("tarvos_statistics_") => {
+                        if args_rendered.len() != 1 {
+                            return Err(anyhow::anyhow!(
+                                "{name}() takes exactly one sequence"
+                            ));
+                        }
+                        format!("{name}(&{})", args_rendered[0])
                     }
                     name if name.starts_with("__tarvos_mut_call_") => {
                         let function = name.trim_start_matches("__tarvos_mut_call_");
