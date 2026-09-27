@@ -421,6 +421,83 @@
     },
     {
       "category": "stdlib",
+      "feature": "statistics.mean / fmean",
+      "status": "supported",
+      "tests": [
+        "40_statistics"
+      ],
+      "note": "mean reduces through exact integer arithmetic and returns an int when all input is int and the quotient is whole, matching CPython; fmean always returns a float."
+    },
+    {
+      "category": "stdlib",
+      "feature": "statistics.geometric_mean / harmonic_mean",
+      "status": "supported",
+      "tests": [
+        "40_statistics"
+      ],
+      "note": "geometric_mean reduces through logarithms, matching CPython's accuracy; both raise on an empty sequence."
+    },
+    {
+      "category": "stdlib",
+      "feature": "statistics.median",
+      "status": "supported",
+      "tests": [
+        "40_statistics"
+      ],
+      "note": "Odd-length input returns the middle element with its original type, so an int list yields an int; even-length input returns a float."
+    },
+    {
+      "category": "stdlib",
+      "feature": "statistics.median_low / median_high",
+      "status": "supported",
+      "tests": [
+        "40_statistics"
+      ],
+      "note": "Return an element of the input, preserving int vs float."
+    },
+    {
+      "category": "stdlib",
+      "feature": "statistics.mode / multimode",
+      "status": "supported",
+      "tests": [
+        "40_statistics"
+      ],
+      "note": "Return input elements; multimode preserves CPython's first-appearance order."
+    },
+    {
+      "category": "stdlib",
+      "feature": "statistics.pvariance / pstdev",
+      "status": "supported",
+      "tests": [
+        "40_statistics"
+      ],
+      "note": "pstdev requires at least one data point; pvariance of a singleton is 0.0."
+    },
+    {
+      "category": "stdlib",
+      "feature": "statistics.variance / stdev",
+      "status": "supported",
+      "tests": [
+        "40_statistics"
+      ],
+      "note": "variance and stdev require at least two data points, as in CPython."
+    },
+    {
+      "category": "stdlib",
+      "feature": "statistics.median_grouped / quantiles / correlation / covariance / linear_regression",
+      "status": "unsupported",
+      "tests": [],
+      "note": "Not yet implemented; the compiler reports these as unsupported rather than emitting a stub."
+    },
+    {
+      "category": "stdlib",
+      "feature": "statistics.StatisticsError",
+      "status": "unsupported",
+      "tests": [],
+      "note": "The exception class is not importable. An empty sequence aborts with a StatisticsError message at runtime rather than raising a catchable Python exception, and try/except still falls back to the Python launcher."
+    },
+    {
+      "category": "stdlib",
       "feature": "collections / itertools / functools",
       "status": "unsupported",
       "tests": [],

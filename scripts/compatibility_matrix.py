@@ -117,6 +117,34 @@ ROWS: list[tuple[str, str, str, list[str], str]] = [
      "value type, so heterogeneous values are rejected. A HashMap cannot "
      "reproduce Python insertion order, so keys are emitted sorted."),
     ("stdlib", "os / os.path", "partial", [], ""),
+    # statistics. `40_statistics` compares 35 output lines against CPython for
+    # int, float, negative, zero, repeated, singleton, and odd/even-length data.
+    ("stdlib", "statistics.mean / fmean", "supported", ["40_statistics"],
+     "mean reduces through exact integer arithmetic and returns an int when all "
+     "input is int and the quotient is whole, matching CPython; fmean always "
+     "returns a float."),
+    ("stdlib", "statistics.geometric_mean / harmonic_mean", "supported", ["40_statistics"],
+     "geometric_mean reduces through logarithms, matching CPython's accuracy; "
+     "both raise on an empty sequence."),
+    ("stdlib", "statistics.median", "supported", ["40_statistics"],
+     "Odd-length input returns the middle element with its original type, so an "
+     "int list yields an int; even-length input returns a float."),
+    ("stdlib", "statistics.median_low / median_high", "supported", ["40_statistics"],
+     "Return an element of the input, preserving int vs float."),
+    ("stdlib", "statistics.mode / multimode", "supported", ["40_statistics"],
+     "Return input elements; multimode preserves CPython's first-appearance order."),
+    ("stdlib", "statistics.pvariance / pstdev", "supported", ["40_statistics"],
+     "pstdev requires at least one data point; pvariance of a singleton is 0.0."),
+    ("stdlib", "statistics.variance / stdev", "supported", ["40_statistics"],
+     "variance and stdev require at least two data points, as in CPython."),
+    ("stdlib", "statistics.median_grouped / quantiles / correlation / covariance / "
+     "linear_regression", "unsupported", [],
+     "Not yet implemented; the compiler reports these as unsupported rather than "
+     "emitting a stub."),
+    ("stdlib", "statistics.StatisticsError", "unsupported", [],
+     "The exception class is not importable. An empty sequence aborts with a "
+     "StatisticsError message at runtime rather than raising a catchable Python "
+     "exception, and try/except still falls back to the Python launcher."),
     ("stdlib", "collections / itertools / functools", "unsupported", [], "Not in the supported stdlib list."),
     ("stdlib", "file I/O (open)", "unsupported", [], "No filesystem runtime is emitted into generated code."),
     ("stdlib", "dataclasses / enum / typing", "unsupported", [], "Not lowered natively; annotations are parsed but not enforced."),

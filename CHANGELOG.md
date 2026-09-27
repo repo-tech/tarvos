@@ -6,6 +6,36 @@ All notable changes to Tarvos are documented here. The format follows
 
 ## [Unreleased]
 
+### Added - statistics module
+
+- `import statistics` now resolves to a real native runtime instead of being
+  rejected. Twelve APIs are supported and differentially tested against CPython
+  by `tests/corpus/40_statistics.py`: `mean`, `fmean`, `geometric_mean`,
+  `harmonic_mean`, `median`, `median_low`, `median_high`, `mode`, `multimode`,
+  `pvariance`, `pstdev`, `variance`, and `stdev`.
+- The runtime is generic over a small numeric trait, so one implementation serves
+  both int and float lists, and it borrows its input, so a caller's list is not
+  moved or mutated.
+- `median`, `median_low`, `median_high`, `mode`, and `multimode` return an
+  *element of the input* rather than a fresh float, matching CPython: `mode` of
+  `[1, 2, 2, 3]` is the int `2`, not `2.0`, and `median` of an odd-length int
+  list is an int. `multimode` preserves CPython's first-appearance ordering.
+- `geometric_mean` reduces through logarithms, which is both what CPython does
+  and the numerically better form: `[1.0, 4.0, 16.0]` gives exactly `4.0`, where
+  the n-th-root-of-product form gives `3.9999999999999996`.
+- An empty sequence aborts at run time with a `StatisticsError` message rather
+  than returning an arbitrary value, and `harmonic_mean` rejects a zero.
+
+### Known limitations added
+
+- `median_grouped`, `quantiles`, `correlation`, `covariance`, and
+  `linear_regression` are not implemented and are reported as unsupported rather
+  than emitted as a stub.
+- `statistics.StatisticsError` is not an importable name. The error is a run-time
+  abort with a `StatisticsError` message, not a catchable Python exception, and
+  `try`/`except` around a statistics call still falls back to the Python
+  compatibility launcher rather than compiling natively.
+
 ### Added - json.dumps on run-time values
 
 - `json.dumps` accepts a value the program built at run time, not only a compile-time
