@@ -386,23 +386,32 @@ impl AstBridge {
             },
             pyast::Stmt::Expr(node) => Stmt::Expr(self.expr(&node.value)),
             pyast::Stmt::If(node) => {
-                let mut orelse = Vec::new();
-                for clause in &node.elif_else_clauses {
-                    if let Some(test) = &clause.test {
-                        orelse.push(Stmt::If {
-                            test: self.expr(test),
-                            body: self.suite(&clause.body),
-                            orelse: Vec::new(),
-                        });
-                    } else {
-                        orelse.extend(self.suite(&clause.body));
+                // `elif` clauses are part of one decision, not independent
+                // statements. Ruff exposes them as a flat `elif_else_clauses`
+                // list, and pushing each tested clause into `orelse` as a
+                // sibling made every branch after the first run unconditionally
+                // once the first `if` was false: the `else` body then executed
+                // alongside the matching `elif`. The chain has to be rebuilt as
+                // nested `If`s, which is also how CPython's own `ast` nests it.
+                // `clause.test` is None for the trailing `else`.
+                let mut tail: Vec<Stmt> = Vec::new();
+                for clause in node.elif_else_clauses.iter().rev() {
+                    match &clause.test {
+                        Some(test) => {
+                            tail = vec![Stmt::If {
+                                test: self.expr(test),
+                                body: self.suite(&clause.body),
+                                orelse: tail,
+                            }];
+                        }
+                        None => tail = self.suite(&clause.body),
                     }
                 }
 
                 Stmt::If {
                     test: self.expr(&node.test),
                     body: self.suite(&node.body),
-                    orelse,
+                    orelse: tail,
                 }
             }
             pyast::Stmt::While(node) => Stmt::While {

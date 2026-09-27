@@ -469,12 +469,12 @@ impl Lowerer {
             tarvos_ast::Stmt::If { test, body, orelse } => {
                 let test_ir = self.lower_expr(test)?;
                 let body_ir: Result<Vec<_>> = body.iter().map(|s| self.lower_stmt(s)).collect();
-                let orelse_ir: Result<Vec<_>> = orelse.iter().map(|s| self.lower_stmt(s)).collect();
+                let orelse_ir = self.lower_else_branch(orelse)?;
 
                 Ok(Stmt::If {
                     test: test_ir,
                     body: body_ir?,
-                    orelse: orelse_ir?,
+                    orelse: orelse_ir,
                 })
             }
 
@@ -771,6 +771,28 @@ impl Lowerer {
                 );
             }
         }
+    }
+
+    /// Lower the `else` branch of an `if`, preserving Python's `elif` chain.
+    ///
+    /// CPython's parser represents `elif` as an `If` nested inside the previous
+    /// `If`'s `orelse`. Lowering that list as a flat block of statements turns
+    /// `if a: ... elif b: ... else: ...` into a chain of *unrelated* tests
+    /// followed by an unconditional `else`, so more than one branch could run
+    /// for a single evaluation. The nested `If` has to stay nested.
+    fn lower_else_branch(&mut self, orelse: &[tarvos_ast::Stmt]) -> Result<Vec<Stmt>> {
+        // `else: <if ...>` is the `elif` form; it must nest, not run in sequence.
+        if let [tarvos_ast::Stmt::If { test, body, orelse }] = orelse {
+            let test_ir = self.lower_expr(test)?;
+            let body_ir: Result<Vec<_>> = body.iter().map(|s| self.lower_stmt(s)).collect();
+            let orelse_ir = self.lower_else_branch(orelse)?;
+            return Ok(vec![Stmt::If {
+                test: test_ir,
+                body: body_ir?,
+                orelse: orelse_ir,
+            }]);
+        }
+        orelse.iter().map(|s| self.lower_stmt(s)).collect()
     }
 
     /// Fill in the element type of an empty list literal bound to `name`.
@@ -1517,11 +1539,29 @@ impl Lowerer {
                 let op = match operator.as_str() {
                     "and" | "And" => BinaryOp::And,
                     "or" | "Or" => BinaryOp::Or,
-                    _ => BinaryOp::And,
+                    other => bail!(
+                        "unsupported boolean operator `{other}`; Python only defines `and` and `or`"
+                    ),
                 };
                 let mut current = self.lower_expr(&values[0])?;
                 for val in &values[1..] {
                     let next = self.lower_expr(val)?;
+                    // Python's `and`/`or` return one of their *operands*, so
+                    // `0 or 7` is `7`, not `True`. Rust's `&&`/`||` are bool
+                    // operators and would either fail to compile on a non-bool
+                    // operand or silently change the result. Both operands must
+                    // be statically bool for the native form to be equivalent.
+                    for operand in [&current, &next] {
+                        let ty = self.value_type(operand)?;
+                        if !matches!(ty, Type::Bool | Type::Unknown) {
+                            bail!(
+                                "`{operator}` over {ty} operands is not supported natively, \
+                                 because Python's `{operator}` returns one of its operands \
+                                 rather than a bool; assign the value first, or use \
+                                 `--python-fallback`"
+                            );
+                        }
+                    }
                     current = Value::Binary {
                         left: Box::new(current),
                         op,
