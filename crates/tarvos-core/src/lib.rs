@@ -138,12 +138,40 @@ impl CompilePipeline {
     /// Only the requested top-level names are spliced, matching what the import
     /// actually makes visible. `visiting` guards against an import cycle, which
     /// would otherwise recurse forever.
+    ///
+    /// `module_aliases` collects the names bound to a module rather than to a
+    /// symbol. `from package import helpers` binds `helpers` to a module, so a
+    /// later `helpers.f()` has to become a plain `f()` call once the module's
+    /// definitions are spliced in.
     fn inline_local_imports(
         module: &mut tarvos_ast::Module,
         importing_file: &Path,
         root: &Path,
         visiting: &mut Vec<PathBuf>,
     ) -> Result<()> {
+        let mut aliases: Vec<String> = Vec::new();
+        let mut inlined: Vec<PathBuf> = Vec::new();
+        Self::inline_local_imports_with_aliases(
+            module,
+            importing_file,
+            root,
+            visiting,
+            &mut aliases,
+            &mut inlined,
+        )
+        .map(|_| ())
+    }
+
+    /// The alias-collecting form of [`Self::inline_local_imports`], used
+    /// recursively so a nested module can contribute its own aliases.
+    fn inline_local_imports_with_aliases(
+        module: &mut tarvos_ast::Module,
+        importing_file: &Path,
+        root: &Path,
+        visiting: &mut Vec<PathBuf>,
+        module_aliases: &mut Vec<String>,
+        inlined: &mut Vec<PathBuf>,
+    ) -> Result<Vec<()>> {
         let mut resolved: Vec<tarvos_ast::Stmt> = Vec::with_capacity(module.body.len());
         for statement in std::mem::take(&mut module.body) {
             match statement {
@@ -172,40 +200,218 @@ impl CompilePipeline {
                                 path.display()
                             ));
                         }
-                        resolved.extend(Self::inline_from_file(&path, root, &wanted, visiting)?);
+                        // A module can be reached by more than one import
+                        // (`from package.math_utils import f` and
+                        // `from package import math_utils`). Inlining it twice
+                        // would emit duplicate definitions, so each file is
+                        // spliced once per compilation.
+                        let already_inlined = inlined.contains(&canonical);
+                        if !already_inlined {
+                            inlined.push(canonical.clone());
+                        }
+                        // A single target that came from `from package import
+                        // name` is a module binding, so record the alias.
+                        if wanted.is_empty() {
+                            let stem = path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or_default()
+                                .to_owned();
+                            if stem != "__init__" && !module_aliases.contains(&stem) {
+                                module_aliases.push(stem);
+                            }
+                        }
+                        if already_inlined {
+                            continue;
+                        }
+                        let source = fs::read_to_string(&path).with_context(|| {
+                            format!("failed to read local module {}", path.display())
+                        })?;
+                        let mut parsed = CompilePipeline::parse_source(&source)?;
+                        visiting.push(canonical);
+                        let result = CompilePipeline::inline_local_imports_with_aliases(
+                            &mut parsed,
+                            &path,
+                            root,
+                            visiting,
+                            module_aliases,
+                            inlined,
+                        );
+                        visiting.pop();
+                        result?;
+                        resolved.extend(Self::select_definitions(parsed.body, &wanted));
                     }
                 }
                 other => resolved.push(other),
             }
         }
         module.body = resolved;
-        Ok(())
+        // Qualified module access is rewritten after the whole body is known, so
+        // a use that appears before the import is still handled.
+        if !module_aliases.is_empty() {
+            let body = std::mem::take(&mut module.body);
+            module.body = body
+                .into_iter()
+                .map(|statement| Self::rewrite_module_access(statement, module_aliases))
+                .collect();
+        }
+        Ok(Vec::new())
     }
 
-    /// Load `path`, inline its own local imports, and return the definitions for
-    /// `wanted` (or everything when `wanted` is empty).
-    fn inline_from_file(
-        path: &Path,
-        root: &Path,
-        wanted: &[String],
-        visiting: &mut Vec<PathBuf>,
-    ) -> Result<Vec<tarvos_ast::Stmt>> {
-        let source = fs::read_to_string(path)
-            .with_context(|| format!("failed to read local module {}", path.display()))?;
-        let mut parsed = CompilePipeline::parse_source(&source)?;
-        visiting.push(Self::canonical_or_original(path));
-        let result = CompilePipeline::inline_local_imports(&mut parsed, path, root, visiting);
-        visiting.pop();
-        result?;
-
+    /// Keep only the top-level definitions an import requested.
+    ///
+    /// An empty `wanted` means the whole module was brought in. A statement that
+    /// defines no single name is always kept: dropping it could change
+    /// behaviour.
+    fn select_definitions(body: Vec<tarvos_ast::Stmt>, wanted: &[String]) -> Vec<tarvos_ast::Stmt> {
         if wanted.is_empty() {
-            return Ok(parsed.body);
+            return body;
         }
-        Ok(parsed
-            .body
-            .into_iter()
+        body.into_iter()
             .filter(|statement| Self::statement_matches(statement, wanted))
-            .collect())
+            .collect()
+    }
+
+    /// Rewrite `module.attr` to `attr` when `module` names an inlined local
+    /// module, so a qualified call reaches the spliced-in definition.
+    fn rewrite_module_access(statement: tarvos_ast::Stmt, aliases: &[String]) -> tarvos_ast::Stmt {
+        use tarvos_ast::Stmt;
+        match statement {
+            Stmt::Expr { value } => Stmt::Expr {
+                value: Self::rewrite_expr(value, aliases),
+            },
+            Stmt::Assign { target, value } => Stmt::Assign {
+                target: Self::rewrite_expr(target, aliases),
+                value: Self::rewrite_expr(value, aliases),
+            },
+            Stmt::AugAssign {
+                target,
+                operator,
+                value,
+            } => Stmt::AugAssign {
+                target: Self::rewrite_expr(target, aliases),
+                operator,
+                value: Self::rewrite_expr(value, aliases),
+            },
+            Stmt::Return { value } => Stmt::Return {
+                value: value.map(|inner| Self::rewrite_expr(inner, aliases)),
+            },
+            Stmt::If { test, body, orelse } => Stmt::If {
+                test: Self::rewrite_expr(test, aliases),
+                body: Self::rewrite_block(body, aliases),
+                orelse: Self::rewrite_block(orelse, aliases),
+            },
+            Stmt::While { test, body } => Stmt::While {
+                test: Self::rewrite_expr(test, aliases),
+                body: Self::rewrite_block(body, aliases),
+            },
+            Stmt::For { target, iter, body } => Stmt::For {
+                target: Self::rewrite_expr(target, aliases),
+                iter: Self::rewrite_expr(iter, aliases),
+                body: Self::rewrite_block(body, aliases),
+            },
+            Stmt::ClassDef { name, bases, body } => Stmt::ClassDef {
+                name,
+                bases,
+                body: Self::rewrite_block(body, aliases),
+            },
+            Stmt::FunctionDef {
+                name,
+                args,
+                arg_annotations,
+                body,
+                returns,
+            } => Stmt::FunctionDef {
+                name,
+                args,
+                arg_annotations,
+                body: Self::rewrite_block(body, aliases),
+                returns,
+            },
+            other => other,
+        }
+    }
+
+    fn rewrite_block(block: Vec<tarvos_ast::Stmt>, aliases: &[String]) -> Vec<tarvos_ast::Stmt> {
+        block
+            .into_iter()
+            .map(|statement| Self::rewrite_module_access(statement, aliases))
+            .collect()
+    }
+
+    /// Rewrite a module-qualified expression.
+    ///
+    /// `helpers.f(x)` becomes a call of the inlined `f`. The attribute is only
+    /// removed when its object is a known module alias and its value is a plain
+    /// name, so `obj.field` on a real object is left alone.
+    fn rewrite_expr(expression: tarvos_ast::Expr, aliases: &[String]) -> tarvos_ast::Expr {
+        use tarvos_ast::Expr;
+        match expression {
+            Expr::Attribute { value, attr } => match *value {
+                Expr::Name { id } if aliases.contains(&id) => Expr::Name { id: attr },
+                other => Expr::Attribute {
+                    value: Box::new(Self::rewrite_expr(other, aliases)),
+                    attr,
+                },
+            },
+            Expr::Call {
+                function,
+                args,
+                keywords,
+            } => Expr::Call {
+                function: Box::new(Self::rewrite_expr(*function, aliases)),
+                args: args
+                    .into_iter()
+                    .map(|arg| Self::rewrite_expr(arg, aliases))
+                    .collect(),
+                keywords,
+            },
+            Expr::Binary {
+                left,
+                operator,
+                right,
+            } => Expr::Binary {
+                left: Box::new(Self::rewrite_expr(*left, aliases)),
+                operator,
+                right: Box::new(Self::rewrite_expr(*right, aliases)),
+            },
+            Expr::Compare {
+                left,
+                operators,
+                comparators,
+            } => Expr::Compare {
+                left: Box::new(Self::rewrite_expr(*left, aliases)),
+                operators,
+                comparators: comparators
+                    .into_iter()
+                    .map(|entry| Self::rewrite_expr(entry, aliases))
+                    .collect(),
+            },
+            // `module.f(...)` parses as a method call, but a module has no
+            // receiver: it is a plain call of the inlined `f`. Converting the
+            // shape here is what makes the qualified form reach the definition.
+            Expr::MethodCall {
+                object,
+                method,
+                args,
+            } => match *object {
+                Expr::Name { id } if aliases.contains(&id) => Expr::Call {
+                    function: Box::new(Expr::Name { id: method }),
+                    args,
+                    keywords: Vec::new(),
+                },
+                other => Expr::MethodCall {
+                    object: Box::new(Self::rewrite_expr(other, aliases)),
+                    method,
+                    args,
+                },
+            },
+            Expr::Subscript { value, index } => Expr::Subscript {
+                value: Box::new(Self::rewrite_expr(*value, aliases)),
+                index: Box::new(Self::rewrite_expr(*index, aliases)),
+            },
+            other => other,
+        }
     }
 
     /// Whether a top-level statement is one of the names an import requested.

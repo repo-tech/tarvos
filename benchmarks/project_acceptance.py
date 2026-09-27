@@ -20,6 +20,7 @@ EXE_SUFFIX = ".exe" if os.name == "nt" else ""
 CLI = ROOT / "target" / "debug" / f"tarvos{EXE_SUFFIX}"
 
 MAIN = """from package.math_utils import sum_all, average
+from package import math_utils
 from helpers import describe
 
 
@@ -28,6 +29,10 @@ def main():
     total = sum_all(values)
     print(describe(total))
     print(average(values))
+    # `from package import math_utils` binds a module, so the call is qualified.
+    # The compiler must rewrite it to reach the inlined definition.
+    print(math_utils.sum_all(values))
+    print(math_utils.average(values))
 
 
 main()
