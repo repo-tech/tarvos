@@ -9,10 +9,16 @@ the hand-written one.
     python scripts/extract_release_notes.py v1.1.0-rc.3 > release-body.md
 
 Exits non-zero when the tag has no section, when the section is too short to
-describe a release, or when it would emit more than one comparison link,
-because publishing an empty, generic, or duplicated body is worse than failing
-the release job. Historical sections are allowed to omit the link; the rule
-only forbids emitting it twice.
+describe a release, when it carries more than one comparison link, or when the
+section for the current workspace version is missing a required heading.
+Publishing an empty, generic, duplicated, or structurally incomplete body is
+worse than failing the release job.
+
+Structural rules apply to the section for the current workspace version only.
+Historical sections are left alone: they were published before these rules
+existed, and rewriting or re-validating shipped history is not this script's
+job. The comparison-link rule still applies to every section, because a
+duplicated link is a defect wherever it appears.
 """
 
 from __future__ import annotations
@@ -23,6 +29,28 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 COMPARE_PREFIX = "https://github.com/repo-tech/tarvos/compare/"
+
+# A release body has to answer "what is in this, what breaks, how do I verify
+# it, and how do I install it". These four headings are the minimum that makes a
+# body usable; rc.3 already has all of them plus twelve more.
+REQUIRED_SECTIONS = (
+    "## Highlights",
+    "## Breaking Changes",
+    "## Validation",
+    "## Installation",
+)
+
+
+def workspace_version() -> str | None:
+    """Read the version from the workspace Cargo.toml, or None if unreadable.
+
+    Used only to decide whether the structural rules apply. If the manifest
+    cannot be read the rules are skipped rather than guessed, so a formatting
+    change to Cargo.toml cannot block a release.
+    """
+    manifest = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+    match = re.search(r'(?m)^version = "([^"]+)"', manifest)
+    return match.group(1) if match else None
 
 
 def main(argv: list[str]) -> int:
@@ -57,6 +85,20 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
+
+    # Structural rules, for the release currently being cut only. Re-running an
+    # old tag must keep working, so a historical section is never rejected for
+    # a shape it was published without.
+    if workspace_version() == version:
+        headings = set(re.findall(r"(?m)^##\s+(.+?)\s*$", section))
+        missing = [name for name in REQUIRED_SECTIONS if name.removeprefix("## ") not in headings]
+        if missing:
+            print(
+                f"RELEASE_NOTES.md section for {tag} is missing required "
+                f"section(s): {', '.join(missing)}",
+                file=sys.stderr,
+            )
+            return 1
 
     # Emit UTF-8 bytes rather than text. The default stdout encoding on Windows
     # is the console code page, which silently mangles the em dashes in the

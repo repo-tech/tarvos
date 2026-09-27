@@ -50,6 +50,20 @@ rewritten.
 - `fail_on_unmatched_files` and `overwrite_files` were set on the distribution
   upload, so a re-run replaces assets by name instead of accumulating
   duplicates.
+- `build` depended only on `verify`, so it ran in parallel with `validate`.
+  Binaries and a published release could therefore be produced from a tree whose
+  tests, validation suite, smoke build, and CPython differential had all failed.
+  `build` and both publication jobs now require `validate` to succeed.
+- The distribution job checked that each `.sha256` file existed but never
+  recomputed it, so a stale checksum, or a binary corrupted in artifact
+  transfer, would still have been published. Every digest is now recomputed and
+  compared before upload.
+- `extract_release_notes.py` required only a minimum length. The section for the
+  current workspace version must now also carry `## Highlights`,
+  `## Breaking Changes`, `## Validation`, and `## Installation`, and every
+  section may contain at most one comparison link. The structural rule applies
+  only to the release being cut, so re-running an older tag still works and
+  published history is not re-validated.
 
 ### Changed - permissions, concurrency, and reporting
 

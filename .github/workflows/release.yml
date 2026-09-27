@@ -211,7 +211,11 @@ jobs:
 
   build:
     name: Build ${{ matrix.platform }}
-    needs: verify
+    # Validation is a gate, not a parallel report. Without it here, `build`
+    # starts at the same time as `validate`, so binaries and a published release
+    # could be produced from a tree whose tests, validation suite, smoke build,
+    # and CPython differential all failed.
+    needs: [verify, validate]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -354,7 +358,10 @@ jobs:
 
   publish-source-release:
     name: Publish the compiler release on GitHub
-    needs: [verify, build]
+    # `validate` is listed explicitly as well as through `build`. `build` already
+    # requires it, so this is redundant today, but it is the invariant the whole
+    # pipeline rests on and a later edit to `build` must not be able to drop it.
+    needs: [verify, validate, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -434,7 +441,8 @@ jobs:
 
   publish-distribution:
     name: Publish distribution artifacts
-    needs: [verify, build]
+    # Same reason as publish-source-release: validation must gate publication.
+    needs: [verify, validate, build]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -499,6 +507,14 @@ jobs:
               exit 1
             fi
           done
+          # Recompute every digest instead of trusting the file's presence. A
+          # stale or truncated .sha256 still exists, so a presence check alone
+          # would happily publish assets that no longer match their checksum.
+          # This also catches a binary corrupted in artifact transfer.
+          ( cd release-assets && sha256sum --quiet -c ./*.sha256 ) || {
+            echo "::error title=Checksum mismatch::A release asset does not match its recorded sha256; refusing to publish."
+            exit 1
+          }
           find release-assets -type f -printf '%f\n' | sort
           count="$(find release-assets -maxdepth 1 -type f | wc -l)"
           echo "asset count: $count (expected 8)"
