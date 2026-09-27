@@ -814,14 +814,26 @@ impl Optimizer {
                 let left = Self::fold_value(left)?;
                 let right = Self::fold_value(right)?;
 
+                // Fold using the statically inferred result type, not just the
+                // operand types. `7 / 2` is `Int / Int` but the declared type is
+                // Float, because Python 3 true division always produces a float.
+                // Folding it as an integer turned 3.5 into 3.
                 if let (Value::Int(lv), Value::Int(rv)) = (&left, &right) {
-                    if let Some(folded) = Self::fold_binary_const_int(*lv, *op, *rv) {
+                    if *ty == Type::Float {
+                        if let Some(folded) = Self::fold_binary_const_int_to_float(*lv, *op, *rv) {
+                            return Ok(Value::Float(folded));
+                        }
+                    } else if let Some(folded) = Self::fold_binary_const_int(*lv, *op, *rv) {
                         return Ok(Value::Int(folded));
                     }
-                    if let (Value::Int128(lv), Value::Int128(rv)) = (&left, &right) {
-                        if let Some(folded) = Self::fold_binary_const_u128(*lv, *op, *rv) {
-                            return Ok(Value::Int128(folded));
-                        }
+                }
+
+                // Checked separately: this arm can only match when the operands
+                // are `Int128`, so it must not be nested inside the `Int` arm
+                // above, where it could never be reached.
+                if let (Value::Int128(lv), Value::Int128(rv)) = (&left, &right) {
+                    if let Some(folded) = Self::fold_binary_const_u128(*lv, *op, *rv) {
+                        return Ok(Value::Int128(folded));
                     }
                 }
 
@@ -946,17 +958,23 @@ impl Optimizer {
             BinaryOp::Sub => left.checked_sub(right)?,
             BinaryOp::Mul => left.checked_mul(right)?,
             BinaryOp::Div => {
-                if right == 0 {
-                    return None;
-                }
-
-                left / right
+                // Python 3 `/` is true division and always yields a float, so an
+                // `Int / Int` expression is never an integer. The inferred result
+                // type routes this through `fold_binary_const_int_to_float`.
+                return None;
             }
             BinaryOp::Mod => {
                 if right == 0 {
                     return None;
                 }
-                left % right
+                // Python's `%` is floored, so the result takes the sign of the
+                // divisor: -7 % 2 is 1, not Rust's -1.
+                let remainder = left.checked_rem(right)?;
+                if remainder != 0 && ((remainder < 0) != (right < 0)) {
+                    remainder.checked_add(right)?
+                } else {
+                    remainder
+                }
             }
             BinaryOp::FloorDiv => {
                 if right == 0 {
@@ -1007,6 +1025,36 @@ impl Optimizer {
                 }
 
                 (left / right).floor()
+            }
+            _ => return None,
+        })
+    }
+
+    /// Fold an operation on two integer literals whose statically inferred
+    /// result type is `float`.
+    ///
+    /// This is the `7 / 2` case: the operands are `Int`, but Python 3 true
+    /// division produces a float, so folding through the integer path would
+    /// silently truncate the result.
+    fn fold_binary_const_int_to_float(left: i64, op: BinaryOp, right: i64) -> Option<f64> {
+        Some(match op {
+            BinaryOp::Div => {
+                if right == 0 {
+                    return None;
+                }
+                left as f64 / right as f64
+            }
+            BinaryOp::FloorDiv => {
+                if right == 0 {
+                    return None;
+                }
+                (left as f64 / right as f64).floor()
+            }
+            BinaryOp::Pow => {
+                // `pow` on ints is an int in Python; only a float result type
+                // reaches here when one operand was promoted, which the integer
+                // folder already covers. Leave it unfolded.
+                return None;
             }
             _ => return None,
         })
@@ -1754,6 +1802,59 @@ mod tests {
         );
     }
 
+    /// Python's `%` is floored, so the result takes the sign of the divisor.
+    /// Rust's `%` is truncated and takes the sign of the dividend, which made
+    /// `-7 % 2` fold to `-1` instead of `1`.
+    #[test]
+    fn constant_folds_modulo_with_python_sign_semantics() {
+        let cases = [
+            (7_i64, 2_i64, 1_i64),
+            (-7, 2, 1),
+            (7, -2, -1),
+            (-7, -2, -1),
+            (8, 3, 2),
+            (-8, 3, 1),
+        ];
+        for (left, right, expected) in cases {
+            let module = Module {
+                statements: vec![Stmt::Print(vec![Value::Binary {
+                    left: Box::new(Value::Int(left)),
+                    op: BinaryOp::Mod,
+                    right: Box::new(Value::Int(right)),
+                    ty: Type::Int,
+                }])],
+            };
+            let optimized = Optimizer::optimize(&module).unwrap();
+            assert!(
+                matches!(optimized.statements.as_slice(), [Stmt::Print(items)]
+                    if matches!(items[0], Value::Int(actual) if actual == expected)),
+                "{left} % {right} must fold to {expected}, got {:?}",
+                optimized.statements
+            );
+        }
+    }
+
+    /// Python 3 `/` is true division: `7 / 2` is `3.5`, never `3`. The inferred
+    /// result type is Float even though both operands are ints.
+    #[test]
+    fn constant_folds_true_division_as_a_float() {
+        let module = Module {
+            statements: vec![Stmt::Print(vec![Value::Binary {
+                left: Box::new(Value::Int(7)),
+                op: BinaryOp::Div,
+                right: Box::new(Value::Int(2)),
+                ty: Type::Float,
+            }])],
+        };
+        let optimized = Optimizer::optimize(&module).unwrap();
+        assert!(
+            matches!(optimized.statements.as_slice(), [Stmt::Print(items)]
+                if matches!(items[0], Value::Float(actual) if actual == 3.5)),
+            "7 / 2 must fold to 3.5, got {:?}",
+            optimized.statements
+        );
+    }
+
     #[test]
     fn widens_large_closed_form_reduction_without_overflow() {
         let module = Module {
@@ -1786,18 +1887,32 @@ mod tests {
 
         let optimized = Optimizer::optimize(&module).unwrap();
         let expected = 350_000_000_000_u128 * 349_999_999_999_u128 / 2;
-        assert!(matches!(
-            optimized.statements.as_slice(),
-            [
-                Stmt::Let {
-                    value: Value::Int128(0),
-                    ..
-                },
-                Stmt::Assign {
-                    value: Value::Binary { right, .. },
-                    ..
-                }
-            ] if matches!(right.as_ref(), Value::Int128(value) if *value == expected)
-        ));
+
+        // Assert the *result*, not the shape of the intermediate IR. The wide
+        // accumulator is seeded with `Int128(0)` and the closed-form sum is
+        // added, so once constant folding can actually reduce wide integers the
+        // assignment collapses to the total itself. Pinning the old
+        // `Binary { .. }` shape would only lock in a missing fold.
+        let bound_total = optimized
+            .statements
+            .iter()
+            .rev()
+            .find_map(|stmt| match stmt {
+                Stmt::Assign { name, value } if name == "total" => Some(value.clone()),
+                Stmt::Let { name, value, .. } if name == "total" => Some(value.clone()),
+                _ => None,
+            })
+            .expect("optimized module must bind `total`");
+
+        assert!(
+            matches!(bound_total, Value::Int128(value) if value == expected),
+            "wide closed-form reduction must produce the exact sum, got {bound_total:?}"
+        );
+
+        // The accumulator must still be a wide value, never a truncated i64.
+        assert!(
+            !matches!(bound_total, Value::Int(_)),
+            "a sum above i64::MAX must not be narrowed back to i64"
+        );
     }
 }
