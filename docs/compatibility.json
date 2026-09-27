@@ -379,6 +379,97 @@
       "note": "Reported rather than mis-inlined."
     },
     {
+      "category": "exceptions",
+      "feature": "try / except",
+      "status": "supported",
+      "tests": [
+        "41_exceptions"
+      ],
+      "note": "Compiles to a labelled block holding a real Result, not a caught panic. A closure was rejected because its `let` bindings would leave scope, so a variable assigned inside the try would be missing after it."
+    },
+    {
+      "category": "exceptions",
+      "feature": "except <Type>",
+      "status": "supported",
+      "tests": [
+        "41_exceptions"
+      ],
+      "note": "Matches the Python hierarchy, so `except ValueError` catches a StatisticsError. Handlers are tried in order and an unmatched one propagates to the enclosing try."
+    },
+    {
+      "category": "exceptions",
+      "feature": "except ... as <name>",
+      "status": "supported",
+      "tests": [
+        "41_exceptions"
+      ],
+      "note": "Binds the exception message, which is what str(e) yields for the error classes the native backend raises."
+    },
+    {
+      "category": "exceptions",
+      "feature": "else",
+      "status": "supported",
+      "tests": [
+        "41_exceptions"
+      ],
+      "note": "Runs only when the body completed normally, never after a raise and never after a return that left the try."
+    },
+    {
+      "category": "exceptions",
+      "feature": "finally",
+      "status": "supported",
+      "tests": [
+        "41_exceptions"
+      ],
+      "note": "Runs on every path: normal completion, a caught exception, and a return from inside the try, which is deferred so finally still runs."
+    },
+    {
+      "category": "exceptions",
+      "feature": "raise",
+      "status": "supported",
+      "tests": [
+        "41_exceptions"
+      ],
+      "note": "Propagates from a function through the caller's try. A function that can raise returns a Result and its call sites unwrap it."
+    },
+    {
+      "category": "exceptions",
+      "feature": "nested try",
+      "status": "supported",
+      "tests": [
+        "41_exceptions"
+      ],
+      "note": "An uncaught inner error propagates after the inner finally has run."
+    },
+    {
+      "category": "exceptions",
+      "feature": "bare raise / re-raise",
+      "status": "partial",
+      "tests": [],
+      "note": "`raise` with no active handler reports a base Exception rather than re-raising a specific one, because the native error carries a class and a message rather than a constructed exception object."
+    },
+    {
+      "category": "exceptions",
+      "feature": "exception attributes (args, __class__)",
+      "status": "unsupported",
+      "tests": [],
+      "note": "The native error is a class name plus a message; a raised exception is not a first-class value with attributes."
+    },
+    {
+      "category": "exceptions",
+      "feature": "str(KeyError) quoting",
+      "status": "partial",
+      "tests": [],
+      "note": "CPython's str(KeyError) is the repr of its argument. The native error does not model that per-class __str__ override, so the message is the plain string."
+    },
+    {
+      "category": "exceptions",
+      "feature": "break / continue inside try inside a loop",
+      "status": "unsupported",
+      "tests": [],
+      "note": "Not lowered. Reported rather than miscompiled, because a plain Rust break would skip finally."
+    },
+    {
       "category": "stdlib",
       "feature": "math",
       "status": "supported",
@@ -430,12 +521,12 @@
     },
     {
       "category": "stdlib",
-      "feature": "statistics.geometric_mean / harmonic_mean",
+      "feature": "statistics.harmonic_mean / geometric_mean",
       "status": "supported",
       "tests": [
         "40_statistics"
       ],
-      "note": "geometric_mean reduces through logarithms, matching CPython's accuracy; both raise on an empty sequence."
+      "note": "geometric_mean reduces through logarithms, matching CPython's accuracy. harmonic_mean returns 0 as soon as it sees a zero, as CPython does, rather than raising."
     },
     {
       "category": "stdlib",
@@ -492,9 +583,11 @@
     {
       "category": "stdlib",
       "feature": "statistics.StatisticsError",
-      "status": "unsupported",
-      "tests": [],
-      "note": "The exception class is not importable. An empty sequence aborts with a StatisticsError message at runtime rather than raising a catchable Python exception, and try/except still falls back to the Python launcher."
+      "status": "supported",
+      "tests": [
+        "41_exceptions"
+      ],
+      "note": "Catchable. Every statistics call reports an empty sequence, a too-small sample, and a negative geometric product through a Result carrying the StatisticsError class, and `except ValueError` catches it because StatisticsError is a ValueError subclass in CPython."
     },
     {
       "category": "stdlib",

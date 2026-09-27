@@ -6,6 +6,36 @@ All notable changes to Tarvos are documented here. The format follows
 
 ## [Unreleased]
 
+### Added - native exception handling
+
+- `try` / `except` / `else` / `finally` and `raise` now compile to real native
+  Rust. Previously a `try` was rejected as a dynamic construct and the program
+  silently fell back to the Python compatibility launcher.
+- Exceptions are `Result` values, not panics. The previous lowering used
+  `std::panic::catch_unwind`, which was wrong three ways: a panic cannot carry a
+  Python exception class, it cannot run `finally` on a non-local exit, and under
+  the `panic = "abort"` release profile it does not catch at all.
+- A `try` lowers to a **labelled block** rather than a closure. A closure was
+  rejected because its `let` bindings leave scope, so a variable assigned inside
+  the try would have been missing after it.
+- `return` inside a `try` is deferred into a slot and the real `return` is emitted
+  after `finally`, which is what Python does.
+- Handlers are matched against the Python exception hierarchy, so
+  `except ValueError` catches a `StatisticsError`, exactly as in CPython.
+  Previously only the *first* handler was ever emitted and the bound name was the
+  literal string `"Tarvos exception"`.
+- A function that can raise returns `__TarvosResult<T>`; call sites unwrap it, so
+  an error raised in a function reaches the caller's `try` instead of terminating
+  at the point of the raise.
+- `statistics.StatisticsError` is now **catchable**. Every statistics call
+  reports an empty sequence, a too-small sample, and a negative geometric product
+  through a `Result` rather than a `panic!`.
+
+### Fixed - statistics
+
+- `harmonic_mean` returned an error for a zero input. CPython returns `0` as soon
+  as it sees a zero; the native runtime now matches.
+
 ### Added - statistics module
 
 - `import statistics` now resolves to a real native runtime instead of being

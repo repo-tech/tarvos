@@ -107,6 +107,45 @@ ROWS: list[tuple[str, str, str, list[str], str]] = [
     ("imports", "import module (bare)", "partial", [], "Stdlib only: math, time, os, os.path, json."),
     ("imports", "dynamic import (importlib)", "unsupported", [], "The module cannot be resolved statically."),
     ("imports", "circular imports", "unsupported", [], "Reported rather than mis-inlined."),
+    # --- exceptions ---------------------------------------------------------
+    # `41_exceptions` compares caught/uncaught, typed and bare handlers, `else`,
+    # `finally`, nesting, propagation, and superclass matching against CPython.
+    ("exceptions", "try / except", "supported", ["41_exceptions"],
+     "Compiles to a labelled block holding a real Result, not a caught panic. A "
+     "closure was rejected because its `let` bindings would leave scope, so a "
+     "variable assigned inside the try would be missing after it."),
+    ("exceptions", "except <Type>", "supported", ["41_exceptions"],
+     "Matches the Python hierarchy, so `except ValueError` catches a "
+     "StatisticsError. Handlers are tried in order and an unmatched one "
+     "propagates to the enclosing try."),
+    ("exceptions", "except ... as <name>", "supported", ["41_exceptions"],
+     "Binds the exception message, which is what str(e) yields for the error "
+     "classes the native backend raises."),
+    ("exceptions", "else", "supported", ["41_exceptions"],
+     "Runs only when the body completed normally, never after a raise and never "
+     "after a return that left the try."),
+    ("exceptions", "finally", "supported", ["41_exceptions"],
+     "Runs on every path: normal completion, a caught exception, and a return "
+     "from inside the try, which is deferred so finally still runs."),
+    ("exceptions", "raise", "supported", ["41_exceptions"],
+     "Propagates from a function through the caller's try. A function that can "
+     "raise returns a Result and its call sites unwrap it."),
+    ("exceptions", "nested try", "supported", ["41_exceptions"],
+     "An uncaught inner error propagates after the inner finally has run."),
+    ("exceptions", "bare raise / re-raise", "partial", [],
+     "`raise` with no active handler reports a base Exception rather than "
+     "re-raising a specific one, because the native error carries a class and a "
+     "message rather than a constructed exception object."),
+    ("exceptions", "exception attributes (args, __class__)", "unsupported", [],
+     "The native error is a class name plus a message; a raised exception is not "
+     "a first-class value with attributes."),
+    ("exceptions", "str(KeyError) quoting", "partial", [],
+     "CPython's str(KeyError) is the repr of its argument. The native error does "
+     "not model that per-class __str__ override, so the message is the plain "
+     "string."),
+    ("exceptions", "break / continue inside try inside a loop", "unsupported", [],
+     "Not lowered. Reported rather than miscompiled, because a plain Rust break "
+     "would skip finally."),
     # --- stdlib ------------------------------------------------------------
     ("stdlib", "math", "supported", [], ""),
     ("stdlib", "time", "supported", [], ""),
@@ -123,9 +162,10 @@ ROWS: list[tuple[str, str, str, list[str], str]] = [
      "mean reduces through exact integer arithmetic and returns an int when all "
      "input is int and the quotient is whole, matching CPython; fmean always "
      "returns a float."),
-    ("stdlib", "statistics.geometric_mean / harmonic_mean", "supported", ["40_statistics"],
-     "geometric_mean reduces through logarithms, matching CPython's accuracy; "
-     "both raise on an empty sequence."),
+    ("stdlib", "statistics.harmonic_mean / geometric_mean", "supported", ["40_statistics"],
+     "geometric_mean reduces through logarithms, matching CPython's accuracy. "
+     "harmonic_mean returns 0 as soon as it sees a zero, as CPython does, rather "
+     "than raising."),
     ("stdlib", "statistics.median", "supported", ["40_statistics"],
      "Odd-length input returns the middle element with its original type, so an "
      "int list yields an int; even-length input returns a float."),
@@ -141,10 +181,11 @@ ROWS: list[tuple[str, str, str, list[str], str]] = [
      "linear_regression", "unsupported", [],
      "Not yet implemented; the compiler reports these as unsupported rather than "
      "emitting a stub."),
-    ("stdlib", "statistics.StatisticsError", "unsupported", [],
-     "The exception class is not importable. An empty sequence aborts with a "
-     "StatisticsError message at runtime rather than raising a catchable Python "
-     "exception, and try/except still falls back to the Python launcher."),
+    ("stdlib", "statistics.StatisticsError", "supported", ["41_exceptions"],
+     "Catchable. Every statistics call reports an empty sequence, a too-small "
+     "sample, and a negative geometric product through a Result carrying the "
+     "StatisticsError class, and `except ValueError` catches it because "
+     "StatisticsError is a ValueError subclass in CPython."),
     ("stdlib", "collections / itertools / functools", "unsupported", [], "Not in the supported stdlib list."),
     ("stdlib", "file I/O (open)", "unsupported", [], "No filesystem runtime is emitted into generated code."),
     ("stdlib", "dataclasses / enum / typing", "unsupported", [], "Not lowered natively; annotations are parsed but not enforced."),
