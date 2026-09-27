@@ -129,6 +129,9 @@ impl Emitter {
     fn stmt(&mut self, stmt: &Stmt) -> Result<(), CodegenError> {
         match stmt {
             Stmt::Import { .. } => Ok(()),
+            // Imports carry no runtime effect here; the module resolver has
+            // already inlined the imported definitions by this point.
+            Stmt::ImportFrom { .. } => Ok(()),
             Stmt::Function { .. } => Err(CodegenError::new("nested functions are unsupported")),
             Stmt::Assign { targets, value } => self.assign(targets, value),
             Stmt::Expr(Expr::Call { function, args }) if matches!(function.as_ref(), Expr::Name(name) if name == "print") =>

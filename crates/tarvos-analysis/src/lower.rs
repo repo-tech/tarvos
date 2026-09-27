@@ -1,4 +1,4 @@
-use crate::stdlib::{dict_method_mutates, list_method_mutates, MethodReceiver};
+﻿use crate::stdlib::{dict_method_mutates, list_method_mutates, MethodReceiver};
 use crate::{module_supported, native_builtin_method, native_constant, native_function};
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
@@ -142,7 +142,7 @@ impl Lowerer {
                 }
                 Ok(Stmt::Expr(Value::Bool(true)))
             }
-            tarvos_ast::Stmt::ImportFrom { module, names } => {
+            tarvos_ast::Stmt::ImportFrom { module, names, .. } => {
                 if !module_supported(module) {
                     bail!(
                         "from '{}' import ... is not supported by the native backend yet; \
@@ -272,7 +272,7 @@ impl Lowerer {
                 operator,
                 value,
             } => {
-                // Desugar: x op= e  →  x = x op e
+                // Desugar: x op= e  â†’  x = x op e
                 //
                 // Routing through `Stmt::Assign` means name targets and subscript
                 // chains (`grid[i][j] += e`) share one lowering path.
@@ -307,7 +307,7 @@ impl Lowerer {
                         value: value_ir,
                     })
                 } else {
-                    // Just a declaration hint — register the type, emit nothing meaningful
+                    // Just a declaration hint â€” register the type, emit nothing meaningful
                     self.type_context.declare(id.clone(), ty.clone());
                     Ok(Stmt::Expr(Value::Bool(true)))
                 }
@@ -319,7 +319,7 @@ impl Lowerer {
             }
 
             tarvos_ast::Stmt::Delete { .. } => {
-                // del statement — silently ignore (Rust has no explicit free)
+                // del statement â€” silently ignore (Rust has no explicit free)
                 Ok(Stmt::Expr(Value::Bool(true)))
             }
 
@@ -1668,7 +1668,7 @@ impl Lowerer {
     }
 
     /// Split a subscript assignment target into its base variable and index chain:
-    /// `grid[i][j]` → `("grid", [i, j])`.
+    /// `grid[i][j]` â†’ `("grid", [i, j])`.
     fn split_subscript_target(
         target: &tarvos_ast::Expr,
     ) -> Result<(String, Vec<tarvos_ast::Expr>)> {
@@ -1946,7 +1946,7 @@ impl Lowerer {
         }
         let arg_ir = self.lower_expr(&args[0])?;
         // A tuple-typed `Name` (e.g. `t = (1, 2, 3); list(t)`) cannot be
-        // cloned as a `Vec` — Rust tuples have no `.clone()`-to-`Vec` shape —
+        // cloned as a `Vec` â€” Rust tuples have no `.clone()`-to-`Vec` shape â€”
         // so it is desugared to field reads (`[t.0, t.1, ...]`) here, where the
         // arity is still known.
         if let Value::Name(name) = &arg_ir {

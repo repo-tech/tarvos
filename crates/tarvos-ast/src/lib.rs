@@ -16,6 +16,10 @@ pub enum Stmt {
     ImportFrom {
         module: String,
         names: Vec<ImportName>,
+        /// Number of leading dots: 0 is absolute, 1 is `from . import x`.
+        /// Defaults to 0 so an AST that predates this field still parses.
+        #[serde(default)]
+        level: u32,
     },
 
     #[serde(rename = "assign")]

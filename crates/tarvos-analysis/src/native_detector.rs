@@ -278,7 +278,9 @@ fn collect_imports(module: &Module) -> LibraryBindings {
     for stmt in &module.body {
         let names = match stmt {
             Stmt::Import { names } => names,
-            Stmt::ImportFrom { module, names } if module == "numpy" || module == "pandas" => names,
+            Stmt::ImportFrom { module, names, .. } if module == "numpy" || module == "pandas" => {
+                names
+            }
             _ => continue,
         };
         let module_name = match stmt {

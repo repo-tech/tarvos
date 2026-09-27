@@ -1772,15 +1772,21 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
                 if *ty == Type::String && *op == BinaryOp::Add {
                     format!("format!(\"{{}}{{}}\", {}, {})", left_str, right_str)
                 } else if *ty == Type::Float {
-                    let left_str = if matches!(left.as_ref(), Value::Int(_)) {
-                        format!("({} as f64)", left_str)
-                    } else {
+                    // Promote every operand that is not already a float. The
+                    // previous check only cast integer *literals*, so an
+                    // expression like `total / count` (two call results) kept
+                    // integer types and the division stayed integral, which is
+                    // both a type error against a float return and wrong for
+                    // Python's true division.
+                    let left_str = if Self::value_is_float(left) {
                         left_str
-                    };
-                    let right_str = if matches!(right.as_ref(), Value::Int(_)) {
-                        format!("({} as f64)", right_str)
                     } else {
+                        format!("({} as f64)", left_str)
+                    };
+                    let right_str = if Self::value_is_float(right) {
                         right_str
+                    } else {
+                        format!("({} as f64)", right_str)
                     };
                     format!("({} {} {})", left_str, op_str, right_str)
                 } else {
@@ -1792,9 +1798,31 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
                 args,
                 return_type,
             } => {
+                // A user function takes its parameters by value, so passing an
+                // owned binding (a Vec or String) would move it and make a later
+                // use of the same variable a compile error. Clone those
+                // arguments.
+                //
+                // This is restricted to user functions on purpose. The runtime
+                // helpers take `&mut` receivers and mutate in place, so cloning
+                // their receiver would silently discard the mutation and leave
+                // the original list unchanged.
+                let owned = if Self::is_user_function(function) {
+                    Self::owned_bindings(args)
+                } else {
+                    vec![false; args.len()]
+                };
                 let args_rendered = args
                     .iter()
-                    .map(Self::emit_value)
+                    .zip(owned)
+                    .map(|(arg, needs_clone)| {
+                        let rendered = Self::emit_value(arg)?;
+                        Ok(if needs_clone {
+                            format!("{rendered}.clone()")
+                        } else {
+                            rendered
+                        })
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 let args_str = args_rendered.join(", ");
 
@@ -2239,6 +2267,38 @@ fn __tarvos_group_numeric(value: impl std::fmt::Display, separator: char) -> Str
     /// Rust cannot move a `String` out of a `Vec` or a `HashMap` by index, so
     /// the read has to produce an owned value. Copy-like element types are left
     /// alone so numeric loops keep their zero-copy access.
+    /// Whether a call targets a user-defined function rather than a runtime
+    /// helper or a builtin.
+    ///
+    /// Only user functions take their parameters by value, so only they can
+    /// move a caller's binding.
+    fn is_user_function(function: &str) -> bool {
+        // Both the `__tarvos_*` lowering helpers and the `tarvos_*` runtime
+        // helpers take references or mutate in place; only a user function takes
+        // its parameters by value.
+        if function.starts_with("tarvos_") || function.starts_with("__tarvos_") {
+            return false;
+        }
+        !matches!(
+            function,
+            "print" | "len" | "str" | "int" | "float" | "bool" | "range" | "sorted"
+        )
+    }
+
+    /// Which call arguments are owned values that a by-value parameter would
+    /// move out of the caller's binding.
+    ///
+    /// A bare name is the only risky shape: an owned *literal* is a temporary, so
+    /// moving it is harmless, and scalars are `Copy`. The IR does not carry a
+    /// type for a bare `Name`, so this errs toward cloning. An unnecessary
+    /// `.clone()` on a `Copy` type is still valid Rust, whereas omitting one on an
+    /// owned type is a hard compile error.
+    fn owned_bindings(args: &[Value]) -> Vec<bool> {
+        args.iter()
+            .map(|arg| matches!(arg, Value::Name(_)))
+            .collect()
+    }
+
     fn clone_if_owned(expression: String, element_type: &Type) -> String {
         match element_type {
             Type::Int | Type::Float | Type::Bool | Type::None | Type::Unknown => expression,

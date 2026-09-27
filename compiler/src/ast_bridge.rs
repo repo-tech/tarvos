@@ -17,6 +17,17 @@ pub enum Stmt {
         module: String,
         alias: String,
     },
+    /// `from <module> import a, b`
+    ///
+    /// A relative import (`level > 0`, e.g. `from . import x`) is deliberately
+    /// rejected: resolving it needs the importing file's package context, which
+    /// this bridge does not have. Reporting it is better than guessing a module
+    /// name and generating a call to something that does not exist.
+    ImportFrom {
+        module: String,
+        names: Vec<String>,
+        level: u32,
+    },
     Function {
         name: String,
         params: Vec<String>,
@@ -337,6 +348,45 @@ impl AstBridge {
                     .map(|name| name.as_str().to_owned())
                     .unwrap_or_else(|| module.split('.').next().unwrap_or(&module).to_owned());
                 Stmt::Import { module, alias }
+            }
+            pyast::Stmt::ImportFrom(node) => {
+                // A star import cannot be resolved to a known set of names.
+                if node.names.iter().any(|alias| alias.name.as_str() == "*") {
+                    self.diagnostics.push(Diagnostic {
+                        message: "`from module import *` is not supported natively: \
+                                  the set of exported names is not statically known"
+                            .to_owned(),
+                    });
+                    return Stmt::Unsupported {
+                        kind: "ImportFrom(star)".to_owned(),
+                    };
+                }
+                // A bare `from import x` has no module and cannot be resolved.
+                let module = match node.module.as_ref() {
+                    Some(name) => name.as_str().to_owned(),
+                    None => {
+                        self.diagnostics.push(Diagnostic {
+                            message: "`from import ...` without a module is not supported natively"
+                                .to_owned(),
+                        });
+                        return Stmt::Unsupported {
+                            kind: "ImportFrom(no module)".to_owned(),
+                        };
+                    }
+                };
+                let names = node
+                    .names
+                    .iter()
+                    .map(|alias| match alias.asname.as_deref() {
+                        Some(asname) => format!("{} as {asname}", alias.name.as_str()),
+                        None => alias.name.as_str().to_owned(),
+                    })
+                    .collect();
+                Stmt::ImportFrom {
+                    module,
+                    names,
+                    level: node.level,
+                }
             }
             pyast::Stmt::FunctionDef(node) => Stmt::Function {
                 name: node.name.as_str().to_owned(),

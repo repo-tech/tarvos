@@ -37,13 +37,197 @@ impl CompilePipeline {
     pub fn transpile_file(input_path: &Path) -> Result<String> {
         let source = fs::read_to_string(input_path)
             .with_context(|| format!("failed to read {}", input_path.display()))?;
-        let module = Self::parse_source(&source)?;
+        let mut module = Self::parse_source(&source)?;
+        // Local project modules are inlined before lowering, so the shared
+        // semantic pipeline sees one flat module exactly as it does for a single
+        // file. Without this, `from helpers import f` reached the lowering stage
+        // as an unknown module and was rejected outright.
+        let root = input_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let mut visiting = vec![Self::canonical_or_original(input_path)];
+        Self::inline_local_imports(&mut module, input_path, &root, &mut visiting)?;
         let ir = lower_module(&module)?;
         let optimized = Optimizer::optimize(&ir)?;
         RustCodegen::generate(&optimized)
             .with_context(|| format!("failed to generate Rust for {}", input_path.display()))
     }
 
+    fn canonical_or_original(path: &Path) -> PathBuf {
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    /// Resolve a local import into the files that define the requested names.
+    ///
+    /// Returns `None` when nothing on disk matches, which leaves the import for
+    /// the lowering stage to report as an unsupported module. An empty
+    /// `wanted` list means "inline this file's own definitions", which is what
+    /// `from package import submodule` resolves to.
+    fn resolve_local_import(
+        importing_file: &Path,
+        root: &Path,
+        module: &str,
+        names: &[String],
+        level: u32,
+    ) -> Option<Vec<(PathBuf, Vec<String>)>> {
+        // A relative import is anchored to the importing module's own package.
+        //
+        // For a plain module `pkg/sub/mod.py`, `.` is `pkg/sub/`, so one leading
+        // dot does not climb. For a package body `pkg/__init__.py`, the module
+        // IS `pkg`, so `.` is `pkg/` too and the first dot is already consumed
+        // by the file being a package initialiser. Climb `level - 1` times in
+        // that case, which is the only reading that matches Python.
+        let mut parent = importing_file
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.to_path_buf());
+        let is_package_init = importing_file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "__init__.py");
+        let climbs = level.saturating_sub(u32::from(is_package_init));
+        for _ in 0..climbs {
+            // More leading dots than there are directories to climb.
+            parent = parent.parent()?.to_path_buf();
+        }
+        let parent = parent.as_path();
+
+        if module.is_empty() && level == 0 {
+            return None;
+        }
+
+        // `from a.b import c`: try the longest dotted path first, matching
+        // Python's resolution order.
+        let parts: Vec<&str> = module.split('.').collect();
+        for take in (1..=parts.len()).rev() {
+            let relative: PathBuf = parts[..take].iter().collect();
+            let file = parent.join(relative).with_extension("py");
+            if file.is_file() {
+                let wanted: Vec<String> = names.to_vec();
+                return Some(vec![(file, wanted)]);
+            }
+        }
+
+        // `from package import name`, where `package/` is a directory. Python
+        // runs the package's `__init__.py` and then looks for a submodule named
+        // `name`, so both files can contribute to the same import.
+        let directory = parent.join(module.replace('.', std::path::MAIN_SEPARATOR_STR));
+        if !directory.is_dir() {
+            return None;
+        }
+        let mut resolved: Vec<(PathBuf, Vec<String>)> = Vec::new();
+        let init = directory.join("__init__.py");
+        if init.is_file() {
+            // Everything the package body defines is potentially visible.
+            resolved.push((init, Vec::new()));
+        }
+        for name in names {
+            let submodule = directory.join(name).with_extension("py");
+            if submodule.is_file() {
+                resolved.push((submodule, Vec::new()));
+            }
+        }
+        (!resolved.is_empty()).then_some(resolved)
+    }
+
+    /// Replace local import statements with the definitions they bring in.
+    ///
+    /// Only the requested top-level names are spliced, matching what the import
+    /// actually makes visible. `visiting` guards against an import cycle, which
+    /// would otherwise recurse forever.
+    fn inline_local_imports(
+        module: &mut tarvos_ast::Module,
+        importing_file: &Path,
+        root: &Path,
+        visiting: &mut Vec<PathBuf>,
+    ) -> Result<()> {
+        let mut resolved: Vec<tarvos_ast::Stmt> = Vec::with_capacity(module.body.len());
+        for statement in std::mem::take(&mut module.body) {
+            match statement {
+                tarvos_ast::Stmt::ImportFrom {
+                    module: name,
+                    names,
+                    level,
+                } => {
+                    let requested: Vec<String> =
+                        names.iter().map(|entry| entry.name.clone()).collect();
+                    let Some(targets) =
+                        Self::resolve_local_import(importing_file, root, &name, &requested, level)
+                    else {
+                        resolved.push(tarvos_ast::Stmt::ImportFrom {
+                            module: name,
+                            names,
+                            level,
+                        });
+                        continue;
+                    };
+                    for (path, wanted) in targets {
+                        let canonical = Self::canonical_or_original(&path);
+                        if visiting.contains(&canonical) {
+                            return Err(anyhow::anyhow!(
+                                "circular local import detected at {}",
+                                path.display()
+                            ));
+                        }
+                        resolved.extend(Self::inline_from_file(&path, root, &wanted, visiting)?);
+                    }
+                }
+                other => resolved.push(other),
+            }
+        }
+        module.body = resolved;
+        Ok(())
+    }
+
+    /// Load `path`, inline its own local imports, and return the definitions for
+    /// `wanted` (or everything when `wanted` is empty).
+    fn inline_from_file(
+        path: &Path,
+        root: &Path,
+        wanted: &[String],
+        visiting: &mut Vec<PathBuf>,
+    ) -> Result<Vec<tarvos_ast::Stmt>> {
+        let source = fs::read_to_string(path)
+            .with_context(|| format!("failed to read local module {}", path.display()))?;
+        let mut parsed = CompilePipeline::parse_source(&source)?;
+        visiting.push(Self::canonical_or_original(path));
+        let result = CompilePipeline::inline_local_imports(&mut parsed, path, root, visiting);
+        visiting.pop();
+        result?;
+
+        if wanted.is_empty() {
+            return Ok(parsed.body);
+        }
+        Ok(parsed
+            .body
+            .into_iter()
+            .filter(|statement| Self::statement_matches(statement, wanted))
+            .collect())
+    }
+
+    /// Whether a top-level statement is one of the names an import requested.
+    ///
+    /// A statement that defines no single name is always kept: dropping it could
+    /// change behaviour, and keeping it is safe because these are module-level
+    /// definitions the program may depend on.
+    fn statement_matches(statement: &tarvos_ast::Stmt, wanted: &[String]) -> bool {
+        let name = match statement {
+            tarvos_ast::Stmt::FunctionDef { name, .. } => Some(name.as_str()),
+            tarvos_ast::Stmt::ClassDef { name, .. } => Some(name.as_str()),
+            tarvos_ast::Stmt::Assign {
+                target: tarvos_ast::Expr::Name { id },
+                ..
+            } => Some(id.as_str()),
+            _ => None,
+        };
+        match name {
+            Some(name) => wanted.iter().any(|entry| entry == name),
+            None => true,
+        }
+    }
     pub fn transpile_file_embedded(input_path: &Path) -> Result<String> {
         let ast_json = Self::export_project_ast(input_path)?;
         let module = normalize_module(parse_python_ast(&ast_json)?);
@@ -369,6 +553,30 @@ fn convert_ruff_stmt(statement: ruff::Stmt) -> tarvos_ast::Stmt {
                 name: module,
                 asname: (!alias.is_empty()).then_some(alias),
             }],
+        },
+        // `from module import a, b` maps onto the same `import_from` shape the
+        // CPython exporter produces, so the downstream module resolver has one
+        // representation regardless of which front end parsed the source.
+        ruff::Stmt::ImportFrom {
+            module,
+            names,
+            level,
+        } => Stmt::ImportFrom {
+            module,
+            level,
+            names: names
+                .into_iter()
+                .map(|entry| match entry.split_once(" as ") {
+                    Some((name, asname)) => tarvos_ast::ImportName {
+                        name: name.to_owned(),
+                        asname: Some(asname.to_owned()),
+                    },
+                    None => tarvos_ast::ImportName {
+                        name: entry,
+                        asname: None,
+                    },
+                })
+                .collect(),
         },
         ruff::Stmt::Function {
             name,
