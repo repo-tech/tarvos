@@ -146,6 +146,11 @@ ROWS: list[tuple[str, str, str, list[str], str]] = [
     ("exceptions", "break / continue inside try inside a loop", "unsupported", [],
      "Not lowered. Reported rather than miscompiled, because a plain Rust break "
      "would skip finally."),
+    ("language", "keyword arguments", "unsupported", [],
+     "Reported, not dropped. The frontend discards keyword arguments, so "
+     "`f(x, n=2)` used to compile as `f(x)` and quietly compute something else. "
+     "The bridge now emits a diagnostic, so such a program takes the explicit "
+     "compatibility path rather than producing a wrong native binary."),
     # --- stdlib ------------------------------------------------------------
     ("stdlib", "math", "supported", [], ""),
     ("stdlib", "time", "supported", [], ""),

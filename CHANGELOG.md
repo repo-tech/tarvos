@@ -6,6 +6,15 @@ All notable changes to Tarvos are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed - keyword arguments were silently dropped
+
+- The frontend discarded keyword arguments, so `f(x, n=2)` compiled as `f(x)` and
+  produced a native binary that quietly computed something else. This surfaced
+  while completing `quantiles`, whose `n` and `method` are keyword-only in CPython.
+- The bridge now emits a diagnostic, so such a program takes the explicit
+  compatibility path with a stated reason instead of a silently wrong result.
+  Native lowering of keyword arguments itself is future-release work.
+
 ### Added - remaining statistics APIs
 
 - `median_grouped`, `quantiles`, `covariance`, `correlation`, and

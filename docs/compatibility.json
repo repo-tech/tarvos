@@ -470,6 +470,13 @@
       "note": "Not lowered. Reported rather than miscompiled, because a plain Rust break would skip finally."
     },
     {
+      "category": "language",
+      "feature": "keyword arguments",
+      "status": "unsupported",
+      "tests": [],
+      "note": "Reported, not dropped. The frontend discards keyword arguments, so `f(x, n=2)` used to compile as `f(x)` and quietly compute something else. The bridge now emits a diagnostic, so such a program takes the explicit compatibility path rather than producing a wrong native binary."
+    },
+    {
       "category": "stdlib",
       "feature": "math",
       "status": "supported",
