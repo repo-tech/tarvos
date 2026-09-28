@@ -1,4 +1,14 @@
+# Pinned deliberately, not "stable".
+#
+# A floating channel made CI non-reproducible: a new stable Rust can change
+# rustfmt output or add Clippy lints, which turns every commit red at once even
+# though the source did not change. Pinning means the toolchain that runs CI is
+# the toolchain the gates were verified against locally.
+#
+# This must stay in sync with the `Set up Rust toolchain` step in
+# .github/workflows/ci.yml and release.yml. `scripts/check_toolchain_pin.py`
+# enforces that they agree.
 [toolchain]
-channel = "stable"
+channel = "1.98.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
