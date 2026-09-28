@@ -1,20 +1,52 @@
-﻿# Tarvos âš¡
+# Tarvos ⚡
 
 [![CI](https://github.com/repo-tech/Tarvos/actions/workflows/ci.yml/badge.svg)](https://github.com/repo-tech/Tarvos/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/badge/version-1.1.0--rc.4-blue.svg)](https://github.com/repo-tech/Tarvos/releases)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
 
-**Tarvos** is an ultra-fast, optimizing ahead-of-time (AOT) compiler that transpiles a statically analyzable subset of Python directly into high-performance, native Rust code and stand-alone machine binaries.
+**Tarvos** compiles a statically analyzable subset of Python straight to native
+Rust and produces a standalone executable. No Python runtime, no Rust toolchain,
+and no interpreter is needed to *run* the result.
+
+```bash
+tarvos run hello.py        # compile and run natively
+tarvos build hello.py      # emit a standalone .exe / ELF / Mach-O binary
+tarvos compile hello.py    # emit readable Rust source, no rustc needed
+```
+
+## Works today
+
+These are verified by the differential suite (`benchmarks/difftest.py`), which
+compiles each case to a native executable and compares stdout, stderr, and exit
+code against CPython.
+
+| Area | Status |
+| --- | --- |
+| Numeric and boolean semantics | `int`, `float`, `bool`, floored `//` and `%`, true `/`, bitwise and shifts |
+| Strings | literals, escapes, `f-strings`, indexing, negative indexing, slicing, repetition, membership |
+| Lists | literals, `append`, `extend`, `insert`, `remove`, `pop`, `sort`, `reverse`, slicing |
+| Tuples and dicts | literals, unpacking, `keys`/`values`/`items`, `get`, `update` |
+| Functions | defaults, annotations, recursion, nested functions, closures |
+| Control flow | `if`/`elif`/`else`, `while`, `for`, `break`, `continue`, comprehension with a filter |
+| **`try`/`except`/`else`/`finally`, `raise`** | native, with real Python exception-hierarchy matching |
+| **`statistics`** | 18 APIs, including a catchable `StatisticsError` |
+| `math`, `time`, `os.path` | mapped to Rust's standard library |
+| Multi-file projects | `import module` and `from module import name` beneath the entry file's root |
+
+**Not implemented yet:** `random`, HTTP/`requests`, `re`, `datetime`, classes,
+generators, decorators, `async`/`await`, and the wider standard library. These
+are reported as unsupported rather than stubbed. `docs/COMPATIBILITY.md` is the
+authoritative, machine-generated list, and CI fails if it drifts from the code.
 
 ---
 
-## ðŸš€ Key Features
+## 🚀 Key Features
 
 - **Ahead-of-time compilation**: a statically analyzable subset of Python is
   lowered to Rust and built into a standalone native executable. The pipeline is
-  AST lowering â†’ IR â†’ loop induction closed-form reduction â†’ copy and constant
-  propagation â†’ dead code elimination â†’ Rust codegen.
+  AST lowering → IR → loop induction closed-form reduction → copy and constant
+  propagation → dead code elimination → Rust codegen.
 - **Native binaries**: one command produces a PE/ELF/Mach-O executable with no
   Python runtime and no Rust toolchain needed at run time.
 - **Python semantics preserved**: floored modulo, true division, negative
@@ -48,7 +80,7 @@ figures come from a single machine and are labelled with their conditions.
 
 ---
 
-## ðŸ“¦ Installation
+## 📦 Installation
 
 ### Windows (PowerShell)
 To identify loop-heavy functions that are candidates for the upcoming native
@@ -63,37 +95,43 @@ tarvos analyze .\app.py --hot-functions
 .\install.ps1
 ```
 
-For a private fork, set `TARVOS_GITHUB_TOKEN` to a fine-grained token with
-repository Contents read access before running the installer. The installer
-stores the executable in `%USERPROFILE%\.tarvos\bin` and updates only the
-current user's `PATH`. To replace an existing installation, use
+No token is needed: the repository is public, so the installer downloads the
+release binary directly. The installer stores the executable in
+`%USERPROFILE%\.tarvos\bin` and updates only the current user's `PATH`, so it does
+not require administrator rights. To replace an existing installation, use
 `.\install.ps1 -Force`.
+
+If you rate-limit, or you are installing from a mirror, set
+`TARVOS_GITHUB_TOKEN` to a fine-grained token with repository **Contents: read**
+access first.
 
 ### Linux & macOS (Bash)
 ```bash
-# Run the cross-platform installer
 curl -sSf https://raw.githubusercontent.com/repo-tech/Tarvos/main/install.sh | bash
 ```
 
 ### Via Cargo
+
+Building from source needs a Rust toolchain; see `rust-toolchain.toml` for the
+version this project is pinned to.
+
 ```bash
 cargo install --locked --path crates/tarvos-cli --force
 ```
 
 ### Via the Python wrapper
-```powershell
+```bash
 python -m pip install .
-$env:TARVOS_GITHUB_TOKEN = "github_pat_..."
 tarvos --version
 ```
 
-The Python wrapper lazily downloads the matching private-release binary on its
-first invocation and verifies its SHA-256 checksum. Set `TARVOS_VERSION` to a
-specific release tag when required.
+The Python wrapper downloads the matching release binary on first invocation and
+verifies its SHA-256 checksum. Set `TARVOS_VERSION` to pin a specific release
+tag, or `TARVOS_GITHUB_TOKEN` when downloading from a private mirror.
 
 ---
 
-## âš¡ Quick Start & CLI Cheatsheet
+## ⚡ Quick Start & CLI Cheatsheet
 
 ### 1. Run Python with Native Speed
 ```bash
@@ -142,7 +180,7 @@ tarvos clean
 
 ---
 
-## ðŸ“Š Benchmark Fairness & Performance
+## 📊 Benchmark Fairness & Performance
 
 Tarvos targets numerical kernels, loop induction, and algorithmic recursion. Below are typical speedups over CPython 3.12:
 
@@ -161,7 +199,7 @@ toolchain/runner metadata. See [the benchmark methodology](docs/BENCHMARKING.md)
 
 ---
 
-## ðŸ› ï¸ Supported Python Subset
+## 🛠️ Supported Python Subset
 
 - **Data Types**: `int` (i64), `float` (f64), `bool`, `str` (String), `list` (`Vec<T>`), tuples.
 - **Arithmetic, Bitwise & Logic**: `+`, `-`, `*`, `/`, `//`, `%`, `**`, `&`, `|`, `^`, `<<`, `>>`, `~`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `and`, `or`.
@@ -187,25 +225,25 @@ integer semantics.
 
 ---
 
-## ðŸ—ï¸ Architecture & Compiler Stages
+## 🏗️ Architecture & Compiler Stages
 
 ```
-â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”       â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”       â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
-â”‚  Python Source  â”‚ â”€â”€â”€â”€> â”‚  Native AST Exporter   â”‚ â”€â”€â”€â”€> â”‚    Tarvos AST    â”‚
-â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜       â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜       â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
-                                                                       â”‚
-                                                                       â–¼
-â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”       â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”       â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
-â”‚  Native Binary  â”‚ <â”€â”€â”€â”€ â”‚  Rust Codegen Engine   â”‚ <â”€â”€â”€â”€ â”‚   Optimized IR SSA   â”‚
-â”‚ (.exe / binary) â”‚       â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜       â”‚  â€¢ Loop Induction    â”‚
-â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜                                        â”‚  â€¢ Constant Folding  â”‚
-                                                           â”‚  â€¢ Dead Code Elim    â”‚
-                                                           â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+┌─────────────────┐       ┌────────────────────────┐       ┌──────────────────────┐
+│  Python Source  │ ────> │  Native AST Exporter   │ ────> │    Tarvos AST    │
+└─────────────────┘       └────────────────────────┘       └──────────────────────┘
+                                                                       │
+                                                                       ▼
+┌─────────────────┐       ┌────────────────────────┐       ┌──────────────────────┐
+│  Native Binary  │ <──── │  Rust Codegen Engine   │ <──── │   Optimized IR SSA   │
+│ (.exe / binary) │       └────────────────────────┘       │  • Loop Induction    │
+└─────────────────┘                                        │  • Constant Folding  │
+                                                           │  • Dead Code Elim    │
+                                                           └──────────────────────┘
 ```
 
 ---
 
-## ðŸ§ª Testing & Continuous Integration
+## 🧪 Testing & Continuous Integration
 
 Every commit is verified against a matrix of platforms:
 - **Windows** (`x86_64-pc-windows-msvc`, `x86_64-pc-windows-gnu`)
@@ -220,7 +258,7 @@ tarvos validate
 
 ---
 
-## ðŸ“„ License
+## 📄 License
 
 ## Python compatibility direction
 
