@@ -1,3 +1,172 @@
+# Tarvos 1.1.0-rc.4
+
+## Summary
+
+`1.1.0-rc.4` is a release candidate whose headline is that **exceptions and the
+`statistics` module are now genuinely native**. In `1.1.0-rc.3` a Python program
+containing `try` was rejected as a dynamic construct and silently fell back to the
+Python compatibility launcher, and `import statistics` did not resolve at all. In
+this release both compile to real Rust and run as native executables with no
+Python present.
+
+This is a **pre-release**. The supported-subset contract has not widened beyond
+what is listed under [Python Compatibility](#python-compatibility); read that
+section before assuming a feature is available.
+
+## Highlights
+
+- Native `try` / `except` / `else` / `finally` and `raise`, with real exception
+  propagation out of functions and through nested `try` blocks.
+- `except` matches the real Python exception hierarchy, so `except ValueError`
+  catches a `StatisticsError`, which is a `ValueError` subclass in CPython.
+- `statistics.StatisticsError` is catchable rather than a fatal abort.
+- The `statistics` module is complete for its documented surface: `mean`,
+  `fmean`, `geometric_mean`, `harmonic_mean`, `median`, `median_low`,
+  `median_high`, `median_grouped`, `mode`, `multimode`, `quantiles`, `pvariance`,
+  `pstdev`, `variance`, `stdev`, `covariance`, `correlation`, and
+  `linear_regression`.
+- Correctness fixes found by differential testing rather than assumed, including
+  a silent drop of keyword arguments that produced wrong native binaries.
+
+## Compiler
+
+### Exceptions are `Result` values, not panics
+
+The previous lowering wrapped a `try` body in `std::panic::catch_unwind`. That was
+wrong in three independent ways: a panic cannot carry a Python exception class, it
+cannot run `finally` on a non-local exit, and under the `panic = "abort"` release
+profile it does not catch at all. Exceptions are now ordinary `Result` values
+carrying a class name and a message.
+
+A `try` lowers to a labelled block rather than a closure. A closure was rejected
+because its `let` bindings leave scope, so a variable assigned inside the `try`
+would have been missing after it.
+
+`return` inside a `try` is deferred into a slot and the real `return` is emitted
+after `finally`, matching Python. A function that can raise returns a `Result` and
+its call sites unwrap it, so an error raised in a function reaches the caller's
+`try` instead of terminating at the point of the raise.
+
+Previously only the *first* handler was ever emitted and the bound name was the
+literal string `"Tarvos exception"`. Handlers are now matched in order against
+the real class name.
+
+## Python Compatibility
+
+The supported Python subset is unchanged in shape and is documented
+machine-readably in `docs/COMPATIBILITY.md`, which is generated and checked by CI.
+At this tag: **95 features — 52 supported, 18 partial, 24 unsupported, 1 planned**.
+
+Known limitations that are deliberately not papered over:
+
+- `quantiles` supports only the default `n=4, method="exclusive"`. CPython
+  declares both keyword-only, and keyword arguments are not lowered natively yet.
+- `linear_regression` returns `(slope, intercept)` rather than a
+  `LinearRegression` named tuple, so `result.slope` is not available.
+- An uncaught native exception prints `Class: message` on stderr and exits 1. It
+  does not print a Python traceback, because a native binary does not carry the
+  source-level frame information a traceback needs.
+- `break` and `continue` inside a `try` inside a loop are reported rather than
+  lowered, because a plain Rust `break` would skip `finally`.
+- `random`, HTTP/`requests`, `re`, `datetime`, and the wider standard library are
+  not implemented. They are marked unsupported, not stubbed.
+
+## Correctness
+
+Fixed in this release, each found by comparing against CPython rather than by
+inspection:
+
+- Keyword arguments were silently discarded by the front end, so `f(x, n=2)`
+  compiled as `f(x)` and produced a native binary that quietly computed something
+  else. They are now reported and the program takes the explicit compatibility
+  path instead of producing a wrong answer.
+- `harmonic_mean` returned an error for a zero input. CPython returns `0`.
+- `mean`, `mode`, `median`, `median_low`, and `median_high` now preserve CPython's
+  int-versus-float result kind, so `mode([1, 2, 2, 3])` is the int `2`, not `2.0`.
+- `geometric_mean` reduces through logarithms. The n-th-root-of-product form gave
+  `3.9999999999999996` where CPython gives exactly `4.0`.
+- `median_grouped` follows the CPython 3.13 algorithm. The older "nudge the two
+  central values" formulation disagrees whenever the median value repeats.
+- `quantiles` reproduces CPython's exact integer rescaling, which deliberately
+  extrapolates outside the observed range: `quantiles([1.0, 2.0])` is
+  `[0.75, 1.5, 2.25]`.
+
+## CI
+
+- The Rust toolchain is pinned to `1.98.0` instead of floating on `stable`, which
+  could turn every commit red on a toolchain release with no source change.
+- Cargo and `target/` are cached with first-party `actions/cache`; there was no
+  caching at all before.
+- The Rust gates run through `scripts/ci_gates.py`, the same entry point used
+  locally, so a local pass and a CI pass cannot drift apart.
+- `scripts/check_toolchain_pin.py` fails if the toolchain is declared
+  inconsistently anywhere, or starts floating again.
+- Job names are static, because GitHub renders a `${{ matrix.os }}` expression in
+  `name` literally and produces an unreadable failure notification.
+## Breaking Changes
+
+None. No supported construct changed behaviour in a way that requires source
+changes, and the supported-subset contract is unchanged from `1.1.0-rc.3`.
+
+Two behaviours that were previously *wrong* are now corrected, and a program that
+relied on the wrong answer would change:
+
+- Keyword arguments are no longer silently discarded. A call such as
+  `f(x, n=2)` used to compile as `f(x)`. Such a program now takes the explicit
+  compatibility path instead of producing a native binary that quietly computed
+  something else.
+- An uncaught exception is now reported as `Class: message` on stderr with exit
+  code 1. It previously aborted through the runtime's panic path.
+
+## Installation
+
+Full platform coverage: https://github.com/repo-tech/tarvos/releases
+
+From a source checkout:
+
+```bash
+cargo build --release -p tarvos-cli
+```
+
+The Windows installer is built by the release workflow from the tagged commit and
+attached to the release. Linux and macOS artifacts are published by the same
+workflow; if a platform artifact is missing from a release, that platform was not
+built and its absence is recorded here rather than implied to be supported.
+
+
+- A failing gate emits a workflow annotation, which is visible to anyone who can
+  read the repository, instead of only appearing in a log that requires write
+Platform status: Windows x86_64 verified locally. Linux and macOS are exercised by
+the CI matrix; their result for this tag is the CI run, not this document.
+
+Full changelog: https://github.com/repo-tech/tarvos/compare/v1.1.0-rc.3...v1.1.0-rc.4
+
+
+  access to fetch.
+
+## Validation
+
+Run against this tag on Windows x86_64:
+
+| Gate | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `cargo check --workspace --all-targets` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass |
+| `cargo test --workspace --no-fail-fast` | 116 passed, 0 failed |
+| Differential suite (CPython vs native) | 14/14 |
+| CLI audit | 20/20 |
+| Project acceptance | 6/6 |
+| Compatibility matrix check | current |
+| Generated Rust audit | 0 `unsafe`, 0 `transmute`, 0 `catch_unwind`, 0 `panic!` |
+
+Platform status: Windows x86_64 verified locally. Linux and macOS are exercised by
+the CI matrix; their result for this tag is the CI run, not this document.
+
+---
+
+
+
 # Tarvos 1.1.0-rc.3
 
 ## Summary
