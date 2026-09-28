@@ -47,15 +47,37 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt, clippy
 
+      # CPython is the *oracle* for the differential suite, so its version is a
+      # correctness boundary, not a preference. It is pinned to 3.12 deliberately:
+      # a few statistics results differ between 3.12 and 3.13 (a single-element
+      # median_grouped/quantiles input raises on 3.12 and returns a value on
+      # 3.13), so a floating "latest" Python would make the suite non-deterministic.
+      # Any change here must be accompanied by re-verifying tests/corpus.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
+
+      - name: Cache Cargo and build output
+        # First-party only. A third-party cache action would add a new
+        # external trust boundary while the current failure is still
+        # unexplained. The key carries the OS, the pinned toolchain, and
+        # Cargo.lock, so a toolchain bump or dependency change cannot
+        # silently reuse a stale build.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-1.98.0-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-1.98.0-
       - name: Report context
         shell: bash
         run: |
@@ -66,22 +88,32 @@ jobs:
           echo "rustc   : $(rustc --version)"
           echo "python  : $(python --version 2>&1)"
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Verify the pinned toolchain is consistent
+        # A floating or mismatched toolchain fails later and less clearly, so it
+        # is checked first and named explicitly.
+        run: python scripts/check_toolchain_pin.py
 
-      - name: Check workspace
-        run: cargo check --workspace --all-targets
-
-      - name: Lint workspace
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      # One script, not four duplicated steps: this is the same entry point a
+      # developer runs locally, so "passes locally" and "passes in CI" cannot
+      # drift apart. The script stops at the first failing gate and names it.
+      - name: Compiler gates (fmt / check / clippy / test)
+        run: python scripts/ci_gates.py
 
       - name: Check the compatibility matrix is current
         # The matrix is generated from a table and cross-checked against the
         # differential corpus, so it cannot claim coverage that no test proves.
         run: python scripts/compatibility_matrix.py --check
 
-      - name: Test workspace
-        run: cargo test --workspace --no-fail-fast
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-diagnostics-${{ matrix.os }}
+          path: |
+            rust-toolchain.toml
+            .build-tmp
+          if-no-files-found: ignore
+          retention-days: 7
 
   native:
     name: native parity (${{ matrix.os }})
@@ -97,13 +129,35 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
 
+      # CPython is the *oracle* for the differential suite, so its version is a
+      # correctness boundary, not a preference. It is pinned to 3.12 deliberately:
+      # a few statistics results differ between 3.12 and 3.13 (a single-element
+      # median_grouped/quantiles input raises on 3.12 and returns a value on
+      # 3.13), so a floating "latest" Python would make the suite non-deterministic.
+      # Any change here must be accompanied by re-verifying tests/corpus.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
+
+      - name: Cache Cargo and build output
+        # First-party only. A third-party cache action would add a new
+        # external trust boundary while the current failure is still
+        # unexplained. The key carries the OS, the pinned toolchain, and
+        # Cargo.lock, so a toolchain bump or dependency change cannot
+        # silently reuse a stale build.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-1.98.0-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-1.98.0-
       - name: Build the CLI
         run: cargo build -p tarvos-cli
 
@@ -149,12 +203,17 @@ jobs:
           "$tarvos" compile .build-tmp/verify/main.py -o .build-tmp/verify/main.rs
           grep -q "fn main" .build-tmp/verify/main.rs
 
+      # `always()` so a differential failure still leaves the generated Rust
+      # behind. A compiler regression is only diagnosable from the Rust it
+      # produced, and that file is the first thing lost when a step fails.
       - name: Upload native validation log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: native-parity-${{ matrix.os }}
-          path: .build-tmp/verify/main.rs
+          path: |
+            .build-tmp/verify/main.rs
+            .build-tmp/difftest
           if-no-files-found: ignore
           retention-days: 7
 
@@ -198,7 +257,7 @@ jobs:
           echo "cargo  : $(cargo --version)"
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: ${{ matrix.target }}
 

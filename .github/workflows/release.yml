@@ -142,7 +142,20 @@ jobs:
           python-version: "3.12"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
+
+      - name: Cache Cargo and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-1.98.0-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-1.98.0-
+      - name: Verify the pinned toolchain is consistent
+        run: python scripts/check_toolchain_pin.py
 
       - name: Report validation context
         run: |
@@ -194,8 +207,18 @@ jobs:
           python-version: "3.12"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
 
+      - name: Cache Cargo and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-1.98.0-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-1.98.0-
       # Measurement, not a gate. The numbers are attached to the run as
       # evidence for the release notes; publication does not wait on them, so a
       # slow or busy runner cannot block a release. Nothing is suppressed: a
@@ -253,9 +276,19 @@ jobs:
           # match the tagged source.
           ref: ${{ inputs.release_tag || github.ref }}
 
-      - name: Set up stable Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.0
 
+      - name: Cache Cargo and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-1.98.0-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-1.98.0-
       - name: Report build context
         shell: bash
         run: |
