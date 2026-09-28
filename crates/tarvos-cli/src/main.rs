@@ -561,7 +561,9 @@ fn package_project_mode(
     if !status.success() {
         return Err(anyhow::anyhow!(
             "packaged Rust project failed to build; inspect {}",
-            output.join("src\\main.rs").display()
+            // A literal backslash would be one path element named
+            // `src\main.rs` on Unix, so the separator has to come from `join`.
+            output.join("src").join("main.rs").display()
         ));
     }
     let built = output
