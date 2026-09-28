@@ -1,7 +1,7 @@
-# Tarvos ⚡
+﻿# Tarvos âš¡
 
 [![CI](https://github.com/repo-tech/Tarvos/actions/workflows/ci.yml/badge.svg)](https://github.com/repo-tech/Tarvos/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/version-1.1.0--rc.3-blue.svg)](https://github.com/repo-tech/Tarvos/releases)
+[![Release](https://img.shields.io/badge/version-1.1.0--rc.4-blue.svg)](https://github.com/repo-tech/Tarvos/releases)
 [![License: AGPL-3.0](https://shields.io)](https://gnu.org)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
 
@@ -9,12 +9,12 @@
 
 ---
 
-## 🚀 Key Features
+## ðŸš€ Key Features
 
 - **Ahead-of-time compilation**: a statically analyzable subset of Python is
   lowered to Rust and built into a standalone native executable. The pipeline is
-  AST lowering → IR → loop induction closed-form reduction → copy and constant
-  propagation → dead code elimination → Rust codegen.
+  AST lowering â†’ IR â†’ loop induction closed-form reduction â†’ copy and constant
+  propagation â†’ dead code elimination â†’ Rust codegen.
 - **Native binaries**: one command produces a PE/ELF/Mach-O executable with no
   Python runtime and no Rust toolchain needed at run time.
 - **Python semantics preserved**: floored modulo, true division, negative
@@ -48,7 +48,7 @@ figures come from a single machine and are labelled with their conditions.
 
 ---
 
-## 📦 Installation
+## ðŸ“¦ Installation
 
 ### Windows (PowerShell)
 To identify loop-heavy functions that are candidates for the upcoming native
@@ -59,7 +59,7 @@ tarvos analyze .\app.py --hot-functions
 ```
 
 ```powershell
-# Install the v1.1.0-rc.3 release candidate without administrator rights.
+# Install the v1.1.0-rc.4 release candidate without administrator rights.
 .\install.ps1
 ```
 
@@ -93,7 +93,7 @@ specific release tag when required.
 
 ---
 
-## ⚡ Quick Start & CLI Cheatsheet
+## âš¡ Quick Start & CLI Cheatsheet
 
 ### 1. Run Python with Native Speed
 ```bash
@@ -142,7 +142,7 @@ tarvos clean
 
 ---
 
-## 📊 Benchmark Fairness & Performance
+## ðŸ“Š Benchmark Fairness & Performance
 
 Tarvos targets numerical kernels, loop induction, and algorithmic recursion. Below are typical speedups over CPython 3.12:
 
@@ -161,7 +161,7 @@ toolchain/runner metadata. See [the benchmark methodology](docs/BENCHMARKING.md)
 
 ---
 
-## 🛠️ Supported Python Subset
+## ðŸ› ï¸ Supported Python Subset
 
 - **Data Types**: `int` (i64), `float` (f64), `bool`, `str` (String), `list` (`Vec<T>`), tuples.
 - **Arithmetic, Bitwise & Logic**: `+`, `-`, `*`, `/`, `//`, `%`, `**`, `&`, `|`, `^`, `<<`, `>>`, `~`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `and`, `or`.
@@ -187,25 +187,25 @@ integer semantics.
 
 ---
 
-## 🏗️ Architecture & Compiler Stages
+## ðŸ—ï¸ Architecture & Compiler Stages
 
 ```
-┌─────────────────┐       ┌────────────────────────┐       ┌──────────────────────┐
-│  Python Source  │ ────> │  Native AST Exporter   │ ────> │    Tarvos AST    │
-└─────────────────┘       └────────────────────────┘       └──────────────────────┘
-                                                                       │
-                                                                       ▼
-┌─────────────────┐       ┌────────────────────────┐       ┌──────────────────────┐
-│  Native Binary  │ <──── │  Rust Codegen Engine   │ <──── │   Optimized IR SSA   │
-│ (.exe / binary) │       └────────────────────────┘       │  • Loop Induction    │
-└─────────────────┘                                        │  • Constant Folding  │
-                                                           │  • Dead Code Elim    │
-                                                           └──────────────────────┘
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”       â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”       â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚  Python Source  â”‚ â”€â”€â”€â”€> â”‚  Native AST Exporter   â”‚ â”€â”€â”€â”€> â”‚    Tarvos AST    â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜       â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜       â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                                                                       â”‚
+                                                                       â–¼
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”       â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”       â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚  Native Binary  â”‚ <â”€â”€â”€â”€ â”‚  Rust Codegen Engine   â”‚ <â”€â”€â”€â”€ â”‚   Optimized IR SSA   â”‚
+â”‚ (.exe / binary) â”‚       â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜       â”‚  â€¢ Loop Induction    â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜                                        â”‚  â€¢ Constant Folding  â”‚
+                                                           â”‚  â€¢ Dead Code Elim    â”‚
+                                                           â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
 ```
 
 ---
 
-## 🧪 Testing & Continuous Integration
+## ðŸ§ª Testing & Continuous Integration
 
 Every commit is verified against a matrix of platforms:
 - **Windows** (`x86_64-pc-windows-msvc`, `x86_64-pc-windows-gnu`)
@@ -220,7 +220,7 @@ tarvos validate
 
 ---
 
-## 📄 License
+## ðŸ“„ License
 
 ## Python compatibility direction
 

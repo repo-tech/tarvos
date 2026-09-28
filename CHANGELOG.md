@@ -4,6 +4,75 @@ All notable changes to Tarvos are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0-rc.4] - 2026-09-27
+
+This release candidate carries 43 commits of compiler work on top of
+`v1.1.0-rc.3`. The headline change is that **exceptions and the `statistics`
+module are now real native features rather than compatibility fallbacks**.
+
+### Added - native exception handling
+
+- `try` / `except` / `else` / `finally` and `raise` compile to real native Rust.
+  A `try` used to be rejected as a dynamic construct and the program silently fell
+  back to the Python compatibility launcher.
+- Exceptions are `Result` values, not panics. The previous lowering used
+  `std::panic::catch_unwind`, which was wrong three ways: a panic cannot carry a
+  Python exception class, it cannot run `finally` on a non-local exit, and under
+  the `panic = "abort"` release profile it does not catch at all.
+- A `try` lowers to a labelled block rather than a closure, because a closure
+  would put the body's `let` bindings out of scope and a variable assigned inside
+  the try would vanish after it.
+- `return` inside a `try` is deferred so `finally` still runs. A function that can
+  raise returns a `Result` and its call sites unwrap it, so an error raised in a
+  function reaches the caller's `try`.
+- Handlers match the Python exception hierarchy, so `except ValueError` catches a
+  `StatisticsError`. Previously only the first handler was emitted and the bound
+  name was the literal string `"Tarvos exception"`.
+- `statistics.StatisticsError` is catchable.
+
+### Added - statistics API completion
+
+- `median_grouped`, `quantiles`, `covariance`, `correlation`, and
+  `linear_regression` are implemented and differentially tested.
+- `median_grouped` follows the CPython 3.13 algorithm. The older "nudge the two
+  central values" formulation disagrees whenever the median value repeats.
+- `quantiles` reproduces CPython's exact integer rescaling, which deliberately
+  extrapolates outside the observed range: `quantiles([1.0, 2.0])` is
+  `[0.75, 1.5, 2.25]`.
+- `covariance`, `correlation`, and `linear_regression` validate pair length,
+  minimum sample size, and constant input.
+
+### Fixed
+
+- Keyword arguments were silently dropped by the frontend, so `f(x, n=2)`
+  compiled as `f(x)` and produced a native binary that quietly computed
+  something else. They are now reported.
+- `harmonic_mean` returned an error for a zero input. CPython returns `0`.
+- `mean`, `mode`, `median`, and `median_low`/`median_high` now preserve CPython's
+  int-versus-float result kind, so `mode([1, 2, 2, 3])` is the int `2`.
+- `geometric_mean` reduces through logarithms, matching CPython's accuracy.
+
+### CI reliability
+
+- The Rust toolchain is pinned to `1.98.0`; `stable` floated.
+- Cargo and `target/` are cached with first-party `actions/cache`; there was no
+  caching at all before.
+- The Rust gates run through `scripts/ci_gates.py`, the same entry point used
+  locally, so local and CI results cannot drift.
+- `scripts/check_toolchain_pin.py` fails if the toolchain is declared
+  inconsistently or starts floating again.
+- Failure diagnostics are uploaded so a failing run is diagnosable from itself.
+
+### Known limitations
+
+- `quantiles` supports only the default `n=4, method="exclusive"`, because CPython
+  declares both keyword-only and keyword arguments are not lowered natively yet.
+- `linear_regression` returns `(slope, intercept)` rather than a named tuple.
+- An uncaught native exception prints `Class: message` and exits 1; it does not
+  print a Python traceback.
+- Random, HTTP/requests, regex, datetime, and the broader standard library are
+  not implemented. See `docs/COMPATIBILITY.md`.
+
 ## [Unreleased]
 
 ### CI reliability
