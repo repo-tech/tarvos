@@ -7,9 +7,9 @@ use tarvos_types::Type;
 ///
 /// `print` uses `str` at the top level but `repr` for anything nested, which is
 /// why `print("ab")` prints `ab` while `print(["ab"])` prints `['ab']`. Rust's
-/// `Debug` cannot express that split, so repr is spelled out here.
-const DISPLAY_RUNTIME: &str = r##"
-#[allow(dead_code)]
+/// Python string `repr` escaping, emitted only when a `String` `Repr` is
+/// reachable from the program.
+const STR_REPR_ESCAPE: &str = r##"#[allow(dead_code)]
 fn __tarvos_str_repr(value: &str) -> String {
     // Python prefers single quotes and only switches when the value contains one
     // but no double quote.
@@ -30,20 +30,17 @@ fn __tarvos_str_repr(value: &str) -> String {
     out
 }
 
-#[allow(dead_code)]
-trait __TarvosRepr { fn __tarvos_repr(&self) -> String; }
+"##;
 
-impl __TarvosRepr for i64 { fn __tarvos_repr(&self) -> String { self.to_string() } }
-impl __TarvosRepr for f64 { fn __tarvos_repr(&self) -> String { format!("{:?}", self) } }
-impl __TarvosRepr for bool { fn __tarvos_repr(&self) -> String { if *self { "True" } else { "False" }.to_string() } }
-impl __TarvosRepr for String { fn __tarvos_repr(&self) -> String { __tarvos_str_repr(self) } }
-impl<T: __TarvosRepr> __TarvosRepr for Vec<T> {
+const VEC_REPR_IMPL: &str = r##"impl<T: __TarvosRepr> __TarvosRepr for Vec<T> {
     fn __tarvos_repr(&self) -> String {
         let items = self.iter().map(|item| item.__tarvos_repr()).collect::<Vec<String>>();
         format!("[{}]", items.join(", "))
     }
 }
-impl<K: __TarvosRepr, V: __TarvosRepr> __TarvosRepr for std::collections::HashMap<K, V> {
+"##;
+
+const MAP_REPR_IMPL: &str = r##"impl<K: __TarvosRepr, V: __TarvosRepr> __TarvosRepr for std::collections::HashMap<K, V> {
     fn __tarvos_repr(&self) -> String {
         // Python's repr sorts dict keys; sorting the rendered pairs keeps the
         // output stable without requiring the key type to be `Ord`.
@@ -55,17 +52,172 @@ impl<K: __TarvosRepr, V: __TarvosRepr> __TarvosRepr for std::collections::HashMa
         format!("{{{}}}", entries.join(", "))
     }
 }
-
-#[allow(dead_code)]
-trait __TarvosDisplay { fn __tarvos_display(&self) -> String; }
-
-impl __TarvosDisplay for i64 { fn __tarvos_display(&self) -> String { self.to_string() } }
-impl __TarvosDisplay for f64 { fn __tarvos_display(&self) -> String { format!("{:?}", self) } }
-impl __TarvosDisplay for bool { fn __tarvos_display(&self) -> String { if *self { "True" } else { "False" }.to_string() } }
-impl __TarvosDisplay for String { fn __tarvos_display(&self) -> String { self.clone() } }
-impl<T: __TarvosRepr> __TarvosDisplay for Vec<T> { fn __tarvos_display(&self) -> String { self.__tarvos_repr() } }
-impl<K: __TarvosRepr, V: __TarvosRepr> __TarvosDisplay for std::collections::HashMap<K, V> { fn __tarvos_display(&self) -> String { self.__tarvos_repr() } }
 "##;
+
+const VEC_DISPLAY_IMPL: &str =
+    "impl<T: __TarvosRepr> __TarvosDisplay for Vec<T> { fn __tarvos_display(&self) -> String { self.__tarvos_repr() } }\n";
+
+const MAP_DISPLAY_IMPL: &str = "impl<K: __TarvosRepr, V: __TarvosRepr> __TarvosDisplay for std::collections::HashMap<K, V> { fn __tarvos_display(&self) -> String { self.__tarvos_repr() } }\n";
+
+/// `Debug` cannot express that split, so repr is spelled out here.
+/// Which native types a program can actually hand to `print` / `str`.
+///
+/// The display runtime used to be emitted as one block: a single `print` of an
+/// integer dragged in the string escaper, the `Repr` trait, six `Repr` impls,
+/// the `Display` trait, and six `Display` impls. Measured on
+/// `print(len(xs), range(5))` that was 59 of 69 lines - 85% of the generated
+/// file was unreachable. The impls are now emitted per type, and a program that
+/// prints only integers carries nothing but the integer impls.
+#[derive(Default)]
+struct DisplayNeeds {
+    repr_i64: bool,
+    repr_f64: bool,
+    repr_bool: bool,
+    repr_string: bool,
+    repr_collection: bool,
+
+    display_i64: bool,
+    display_f64: bool,
+    display_bool: bool,
+    display_string: bool,
+    display_collection: bool,
+    /// `range()` is lowered to a Rust `Range`, not a `Vec`, so it needs its own
+    /// impl. Emitting the old runtime without one made `print(range(5))`
+    /// generate code that does not compile: E0599, no `__tarvos_display` for
+    /// `&std::ops::Range<i64>`.
+    repr_range: bool,
+    display_range: bool,
+}
+
+/// `range()` lowers to a Rust `Range`. CPython prints `range(0, 5)` and omits the
+/// step when it is 1, so the impl has to reproduce both forms.
+const RANGE_REPR_FN: &str = r##"#[allow(dead_code)]
+fn __tarvos_range_str(start: i64, stop: i64, step: i64) -> String {
+    if step == 1 {
+        format!("range({}, {})", start, stop)
+    } else {
+        format!("range({}, {}, {})", start, stop, step)
+    }
+}
+"##;
+
+const RANGE_REPR_IMPL: &str = r##"impl __TarvosRepr for std::ops::Range<i64> {
+    fn __tarvos_repr(&self) -> String {
+        __tarvos_range_str(self.start, self.end, 1)
+    }
+}
+impl __TarvosRepr for std::ops::Range<i128> {
+    fn __tarvos_repr(&self) -> String {
+        // `Range` carries no step field, so the step is always 1 here.
+        format!("range({}, {})", self.start, self.end)
+    }
+}
+"##;
+
+const RANGE_DISPLAY_IMPL: &str = r##"impl __TarvosDisplay for std::ops::Range<i64> {
+    fn __tarvos_display(&self) -> String {
+        __tarvos_range_str(self.start, self.end, 1)
+    }
+}
+impl __TarvosDisplay for std::ops::Range<i128> {
+    fn __tarvos_display(&self) -> String {
+        format!("range({}, {})", self.start, self.end)
+    }
+}
+"##;
+
+impl DisplayNeeds {
+    /// Every impl. Used as the conservative fallback when a value's type cannot
+    /// be determined, so narrowing the analysis can never turn previously
+    /// compiling output into a build failure.
+    fn require_all(&mut self) {
+        *self = Self {
+            repr_i64: true,
+            repr_f64: true,
+            repr_bool: true,
+            repr_string: true,
+            repr_collection: true,
+            display_i64: true,
+            display_f64: true,
+            display_bool: true,
+            display_string: true,
+            display_collection: true,
+            repr_range: true,
+            display_range: true,
+        };
+    }
+}
+
+impl DisplayNeeds {
+    /// Emit only the impls a program can reach. Trait declarations come first so
+    /// an impl never precedes the trait it implements, and the string escaper is
+    /// emitted only when a `String` `Repr` is actually reachable.
+    fn render(&self) -> String {
+        let mut out = String::new();
+        let repr_trait = self.repr_i64
+            || self.repr_f64
+            || self.repr_bool
+            || self.repr_string
+            || self.repr_collection
+            || self.repr_range;
+        if repr_trait {
+            out.push_str("#[allow(dead_code)]\ntrait __TarvosRepr { fn __tarvos_repr(&self) -> String; }\n\n");
+        }
+        if self.repr_string {
+            out.push_str(STR_REPR_ESCAPE);
+        }
+        if self.repr_i64 {
+            out.push_str("impl __TarvosRepr for i64 { fn __tarvos_repr(&self) -> String { self.to_string() } }\n");
+        }
+        if self.repr_f64 {
+            out.push_str("impl __TarvosRepr for f64 { fn __tarvos_repr(&self) -> String { format!(\"{:?}\", self) } }\n");
+        }
+        if self.repr_bool {
+            out.push_str("impl __TarvosRepr for bool { fn __tarvos_repr(&self) -> String { if *self { \"True\" } else { \"False\" }.to_string() } }\n");
+        }
+        if self.repr_string {
+            out.push_str("impl __TarvosRepr for String { fn __tarvos_repr(&self) -> String { __tarvos_str_repr(self) } }\n");
+        }
+        if self.repr_collection {
+            out.push_str(VEC_REPR_IMPL);
+            out.push_str(MAP_REPR_IMPL);
+        }
+        let display_trait = self.display_i64
+            || self.display_f64
+            || self.display_bool
+            || self.display_string
+            || self.display_collection;
+        if display_trait {
+            out.push_str("#[allow(dead_code)]\ntrait __TarvosDisplay { fn __tarvos_display(&self) -> String; }\n\n");
+        }
+        if self.display_i64 {
+            out.push_str("impl __TarvosDisplay for i64 { fn __tarvos_display(&self) -> String { self.to_string() } }\n");
+        }
+        if self.display_f64 {
+            out.push_str("impl __TarvosDisplay for f64 { fn __tarvos_display(&self) -> String { format!(\"{:?}\", self) } }\n");
+        }
+        if self.display_bool {
+            out.push_str("impl __TarvosDisplay for bool { fn __tarvos_display(&self) -> String { if *self { \"True\" } else { \"False\" }.to_string() } }\n");
+        }
+        if self.display_string {
+            out.push_str("impl __TarvosDisplay for String { fn __tarvos_display(&self) -> String { self.clone() } }\n");
+        }
+        if self.display_collection {
+            out.push_str(VEC_DISPLAY_IMPL);
+            out.push_str(MAP_DISPLAY_IMPL);
+        }
+        if self.repr_range || self.display_range {
+            out.push_str(RANGE_REPR_FN);
+        }
+        if self.repr_range {
+            out.push_str(RANGE_REPR_IMPL);
+        }
+        if self.display_range {
+            out.push_str(RANGE_DISPLAY_IMPL);
+        }
+        out
+    }
+}
 
 /// State threaded through statement emission.
 ///
@@ -1130,12 +1282,10 @@ impl RustCodegen {
         if needs("tarvos_range") {
             out.push_str(RANGE_RUNTIME);
         }
-        if module
-            .statements
-            .iter()
-            .any(Self::statement_needs_display_helper)
-        {
-            out.push_str(DISPLAY_RUNTIME);
+        let display_needs = Self::collect_display_needs(module);
+        let display_src = display_needs.render();
+        if !display_src.is_empty() {
+            out.push_str(&display_src);
         }
         if module.statements.iter().any(Self::statement_uses_hash_map) {
             out.push_str("use std::collections::HashMap;\n\n");
@@ -2538,85 +2688,377 @@ impl RustCodegen {
         }
     }
 
-    fn statement_needs_display_helper(stmt: &Stmt) -> bool {
+    /// Union of every display impl reachable from any statement in the module.
+    fn collect_display_needs(module: &Module) -> DisplayNeeds {
+        let names = Self::collect_name_types(module);
+        let mut needs = DisplayNeeds::default();
+        for stmt in &module.statements {
+            Self::statement_require_display(stmt, &mut needs, &names);
+        }
+        needs
+    }
+
+    /// Best-effort `name -> type` map so a printed local resolves to one impl
+    /// set instead of forcing the conservative fallback.
+    fn collect_name_types(module: &Module) -> HashMap<String, Type> {
+        let mut names: HashMap<String, Type> = HashMap::new();
+        // Two passes: a `for` can read a name bound later in the module, so
+        // collect the direct bindings first and resolve loop targets after.
+        for stmt in &module.statements {
+            match stmt {
+                Stmt::Let { name, value, .. } | Stmt::Assign { name, value, .. } => {
+                    if let Some(ty) = Self::infer_type(value) {
+                        names.insert(name.clone(), ty);
+                    }
+                }
+                Stmt::For { target, iter, .. } => {
+                    if let Some(ty) = Self::iter_element_type(iter, &names) {
+                        names.insert(target.clone(), ty);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for stmt in &module.statements {
+            if let Stmt::For { target, iter, .. } = stmt {
+                if let Some(ty) = Self::iter_element_type(iter, &names) {
+                    names.insert(target.clone(), ty);
+                }
+            }
+        }
+        names
+    }
+
+    fn iter_element_type(iter: &Value, names: &HashMap<String, Type>) -> Option<Type> {
+        match iter {
+            Value::List { element_type, .. } | Value::ListComp { element_type, .. } => {
+                Some(element_type.clone())
+            }
+            // A list bound to a name resolves through the same map, otherwise
+            // every `for` over a named list would fall back to all impls.
+            Value::Name(name) => match names.get(name) {
+                Some(Type::Array(inner)) => Some(*inner.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn infer_type_ref(ty: &Type) -> Option<Type> {
+        Some(ty.clone())
+    }
+
+    fn infer_type(value: &Value) -> Option<Type> {
+        Some(match value {
+            Value::Int(_) | Value::Int128(_) => Type::Int,
+            Value::Float(_) => Type::Float,
+            Value::Bool(_) => Type::Bool,
+            Value::String(_) => Type::String,
+            Value::List { element_type, .. } | Value::ListComp { element_type, .. } => {
+                Type::Array(Box::new(element_type.clone()))
+            }
+            Value::Tuple { element_types, .. } => Type::Tuple(element_types.clone()),
+            Value::Dict {
+                key_type,
+                value_type,
+                ..
+            } => Type::Dict {
+                key: Box::new(key_type.clone()),
+                value: Box::new(value_type.clone()),
+            },
+            Value::Binary { ty, .. } | Value::Unary { ty, .. } => ty.clone(),
+            Value::Index { element_type, .. } => element_type.clone(),
+            // `range()` becomes a Rust `Range` and is handled by the caller.
+            _ => return None,
+        })
+    }
+
+    fn statement_require_display(
+        stmt: &Stmt,
+        needs: &mut DisplayNeeds,
+        names: &HashMap<String, Type>,
+    ) {
         match stmt {
-            Stmt::Print(values) => values.iter().any(Self::value_needs_display_helper),
-            Stmt::If { test, body, orelse } => {
-                Self::value_needs_display_helper(test)
-                    || body.iter().any(Self::statement_needs_display_helper)
-                    || orelse.iter().any(Self::statement_needs_display_helper)
+            Stmt::Print(values) => {
+                for value in values {
+                    Self::require_display(value, needs, names);
+                }
             }
-            Stmt::While { test, body } => {
-                Self::value_needs_display_helper(test)
-                    || body.iter().any(Self::statement_needs_display_helper)
+            Stmt::If { body, orelse, .. } => {
+                for stmt in body {
+                    Self::statement_require_display(stmt, needs, names);
+                }
+                for stmt in orelse {
+                    Self::statement_require_display(stmt, needs, names);
+                }
             }
-            Stmt::For { iter, body, .. } => {
-                Self::value_needs_display_helper(iter)
-                    || body.iter().any(Self::statement_needs_display_helper)
+            Stmt::While { body, .. } => {
+                for stmt in body {
+                    Self::statement_require_display(stmt, needs, names);
+                }
             }
-            Stmt::Function { body, .. } => body.iter().any(Self::statement_needs_display_helper),
+            Stmt::For { body, .. } => {
+                for stmt in body {
+                    Self::statement_require_display(stmt, needs, names);
+                }
+            }
+            Stmt::Function { body, .. } => {
+                for stmt in body {
+                    Self::statement_require_display(stmt, needs, names);
+                }
+            }
             Stmt::Try {
                 body,
                 handlers,
                 orelse,
                 finalbody,
             } => {
-                body.iter().any(Self::statement_needs_display_helper)
-                    || handlers.iter().any(|handler| {
-                        handler
-                            .body
-                            .iter()
-                            .any(Self::statement_needs_display_helper)
-                    })
-                    || orelse.iter().any(Self::statement_needs_display_helper)
-                    || finalbody.iter().any(Self::statement_needs_display_helper)
+                for stmt in body {
+                    Self::statement_require_display(stmt, needs, names);
+                }
+                for handler in handlers {
+                    for stmt in &handler.body {
+                        Self::statement_require_display(stmt, needs, names);
+                    }
+                }
+                for stmt in orelse {
+                    Self::statement_require_display(stmt, needs, names);
+                }
+                for stmt in finalbody {
+                    Self::statement_require_display(stmt, needs, names);
+                }
             }
-            Stmt::Let { value, .. }
-            | Stmt::Assign { value, .. }
-            | Stmt::Destructure { value, .. }
-            | Stmt::Expr(value) => Self::value_needs_display_helper(value),
-            Stmt::FieldAssign { object, value, .. } => {
-                Self::value_needs_display_helper(object) || Self::value_needs_display_helper(value)
+            Stmt::With { body, .. } => {
+                for stmt in body {
+                    Self::statement_require_display(stmt, needs, names);
+                }
             }
-            Stmt::IndexAssign { indices, value, .. } => {
-                indices.iter().any(Self::value_needs_display_helper)
-                    || Self::value_needs_display_helper(value)
+            // A binding is only stringified when it is an f-string; any other
+            // assignment is emitted as the value itself.
+            Stmt::Let { value, .. } | Stmt::Assign { value, .. } => {
+                Self::require_if_formatted(value, needs, names)
             }
-            Stmt::ListAppend { value, .. } | Stmt::Raise(Some(value)) => {
-                Self::value_needs_display_helper(value)
-            }
-            Stmt::With { body, .. } => body.iter().any(Self::statement_needs_display_helper),
+            Stmt::Expr(value) => Self::require_if_formatted(value, needs, names),
+            // `raise` renders its argument into the exception message.
+            Stmt::Raise(Some(value)) => Self::require_display(value, needs, names),
+            Stmt::FieldAssign { .. }
+            | Stmt::IndexAssign { .. }
+            | Stmt::Destructure { .. }
+            | Stmt::ListAppend { .. }
+            | Stmt::Return(Some(_)) => {}
             Stmt::StructDef { .. }
             | Stmt::Break
             | Stmt::Continue
             | Stmt::Raise(None)
-            | Stmt::Return(None) => false,
-            Stmt::Return(Some(value)) => Self::value_needs_display_helper(value),
+            | Stmt::Return(None) => {}
         }
     }
 
-    fn value_needs_display_helper(value: &Value) -> bool {
-        // Only values without a Python-faithful `{}` rendering need the display
-        // helper; the scalar types and scalar-typed expressions render directly.
-        // `Float` and float-typed expressions are deliberately NOT in the
-        // direct-rendering list. Rust's `{}` prints an integral float as `4`,
-        // while Python's `str(4.0)` is `4.0`. The helper formats with `{:?}`,
-        // which keeps the fractional part.
-        !matches!(
-            value,
-            Value::Bool(_)
-                | Value::Int(_)
-                | Value::Int128(_)
-                | Value::String(_)
-                | Value::Call {
-                    return_type: Type::Bool | Type::Int | Type::String,
-                    ..
+    /// An f-string is the only non-`print` construct that stringifies a value.
+    fn require_if_formatted(
+        value: &Value,
+        needs: &mut DisplayNeeds,
+        names: &HashMap<String, Type>,
+    ) {
+        if Self::contains_format(value) {
+            Self::require_display(value, needs, names);
+        }
+    }
+
+    fn contains_format(value: &Value) -> bool {
+        match value {
+            Value::FormatString { .. } => true,
+            Value::Binary { left, right, .. } => {
+                Self::contains_format(left) || Self::contains_format(right)
+            }
+            Value::Unary { operand, .. } => Self::contains_format(operand),
+            _ => false,
+        }
+    }
+
+    /// Record which display/repr impls a single value can reach.
+    ///
+    /// An unresolvable value falls back to every impl. That keeps this pass
+    /// strictly narrowing: it can only remove code that was already emitted,
+    /// never drop an impl the generated program still needs.
+    fn require_display(value: &Value, needs: &mut DisplayNeeds, names: &HashMap<String, Type>) {
+        match value {
+            // Scalars with a Python-faithful `{}` rendering never call the helper.
+            Value::Int(_) | Value::Int128(_) | Value::String(_) | Value::Bool(_) => {}
+            Value::Float(_) => {
+                // Rust's `{}` prints an integral float as `4`; Python's `str(4.0)`
+                // is `4.0`, so this genuinely needs the `{:?}` helper.
+                needs.display_f64 = true;
+                needs.repr_f64 = true;
+            }
+            Value::List {
+                elements,
+                element_type,
+            } => {
+                needs.display_collection = true;
+                needs.repr_collection = true;
+                Self::require_type_repr(element_type, needs);
+                for element in elements {
+                    Self::require_display(element, needs, names);
                 }
-                | Value::Binary {
-                    ty: Type::Bool | Type::Int | Type::String,
-                    ..
+            }
+            Value::ListComp { element_type, .. } => {
+                needs.display_collection = true;
+                needs.repr_collection = true;
+                Self::require_type_repr(element_type, needs);
+            }
+            Value::Tuple {
+                element_types,
+                elements,
+            } => {
+                needs.display_collection = true;
+                needs.repr_collection = true;
+                for ty in element_types {
+                    Self::require_type_repr(ty, needs);
                 }
-        )
+                for element in elements {
+                    Self::require_display(element, needs, names);
+                }
+            }
+            Value::Dict {
+                key_type,
+                value_type,
+                ..
+            } => {
+                needs.display_collection = true;
+                needs.repr_collection = true;
+                Self::require_type_repr(key_type, needs);
+                Self::require_type_repr(value_type, needs);
+            }
+            Value::Call {
+                function,
+                return_type,
+                args,
+            } => {
+                // `range()` is lowered to a Rust `Range`, so it needs the range
+                // impls even though its Python type is Int.
+                if function == "range" {
+                    needs.display_range = true;
+                    needs.repr_range = true;
+                } else {
+                    Self::require_type_display(return_type, needs);
+                }
+                // Arguments are passed to the callee, not rendered by the call
+                // site, so `len(xs)` must not pull in the list display impls.
+                // `str`/`repr` are the builtins that genuinely stringify.
+                if function == "str" || function == "repr" {
+                    for arg in args {
+                        Self::require_display(arg, needs, names);
+                    }
+                }
+            }
+            Value::Binary {
+                left, right, ty, ..
+            } => {
+                Self::require_type_display(ty, needs);
+                Self::require_display(left, needs, names);
+                Self::require_display(right, needs, names);
+            }
+            Value::Unary { operand, ty, .. } => {
+                Self::require_type_display(ty, needs);
+                Self::require_display(operand, needs, names);
+            }
+            Value::Index {
+                element_type,
+                container,
+                index,
+                ..
+            } => {
+                Self::require_type_display(element_type, needs);
+                Self::require_display(container, needs, names);
+                Self::require_display(index, needs, names);
+            }
+            Value::FormatString { parts } => {
+                for part in parts {
+                    if let FormatPart::Value { value, .. } = part {
+                        Self::require_display(value, needs, names);
+                    }
+                }
+            }
+            Value::Name(name) => match names.get(name).and_then(Self::infer_type_ref) {
+                Some(ty) => Self::require_type_display(&ty, needs),
+                // The type is only known to the semantic layer, so emitting
+                // everything is the only safe answer.
+                None => needs.require_all(),
+            },
+            // A field or slice type is not resolvable here, so fall back to
+            // every impl rather than risk dropping one the program needs.
+            Value::Field { .. } | Value::Slice { .. } => needs.require_all(),
+        }
+    }
+
+    /// Impls needed for a value of known type reaching `__tarvos_display`.
+    fn require_type_display(ty: &Type, needs: &mut DisplayNeeds) {
+        match ty {
+            Type::Int => needs.display_i64 = true,
+            Type::Float => {
+                needs.display_f64 = true;
+                needs.repr_f64 = true;
+            }
+            Type::Bool => {
+                needs.display_bool = true;
+                needs.repr_bool = true;
+            }
+            Type::String => {
+                needs.display_string = true;
+                needs.repr_string = true;
+            }
+            // The `Vec`/`HashMap` impls are generic over their element type and
+            // the bound is checked at instantiation, so a `Vec<i64>` display
+            // also needs `Repr for i64`. Recursing here is what keeps the
+            // emitted set compilable.
+            Type::Array(inner) => {
+                needs.display_collection = true;
+                needs.repr_collection = true;
+                Self::require_type_repr(inner, needs);
+            }
+            Type::Tuple(elements) => {
+                needs.display_collection = true;
+                needs.repr_collection = true;
+                for ty in elements {
+                    Self::require_type_repr(ty, needs);
+                }
+            }
+            Type::Dict { key, value } => {
+                needs.display_collection = true;
+                needs.repr_collection = true;
+                Self::require_type_repr(key, needs);
+                Self::require_type_repr(value, needs);
+            }
+            _ => needs.require_all(),
+        }
+    }
+
+    /// A generic `Vec`/`HashMap` impl is only usable if its element type also
+    /// has a `Repr` impl, because the bound is checked at instantiation.
+    fn require_type_repr(ty: &Type, needs: &mut DisplayNeeds) {
+        match ty {
+            Type::Int => needs.repr_i64 = true,
+            Type::Float => needs.repr_f64 = true,
+            Type::Bool => needs.repr_bool = true,
+            Type::String => needs.repr_string = true,
+            Type::Array(inner) => {
+                needs.repr_collection = true;
+                Self::require_type_repr(inner, needs);
+            }
+            Type::Tuple(elements) => {
+                needs.repr_collection = true;
+                for ty in elements {
+                    Self::require_type_repr(ty, needs);
+                }
+            }
+            Type::Dict { key, value } => {
+                needs.repr_collection = true;
+                Self::require_type_repr(key, needs);
+                Self::require_type_repr(value, needs);
+            }
+            _ => needs.require_all(),
+        }
     }
 
     fn emit_value(value: &Value, ctx: &EmitCtx) -> Result<String> {
@@ -3938,6 +4380,91 @@ mod tests {
     use super::*;
     use tarvos_ir::{BinaryOp, Module, Stmt, Value};
     use tarvos_types::Type;
+
+    /// Regression: `range()` lowers to a Rust `Range`, and the display runtime
+    /// had no impl for it, so `print(range(5))` generated code that did not
+    /// compile (E0599). Assert the impl is actually emitted.
+    #[test]
+    fn print_range_emits_a_range_display_impl() {
+        let module = Module {
+            statements: vec![Stmt::Print(vec![Value::Call {
+                function: "range".to_string(),
+                args: vec![Value::Int(5)],
+                return_type: Type::Int,
+            }])],
+        };
+        let code = RustCodegen::generate(&module).unwrap();
+        assert!(
+            code.contains("impl __TarvosDisplay for std::ops::Range<i64>"),
+            "print(range(..)) must emit a Range Display impl:\n{code}"
+        );
+        // The trait has to be declared too, or the impl does not resolve.
+        assert!(
+            code.contains("trait __TarvosRepr"),
+            "a Range Repr impl requires the trait declaration:\n{code}"
+        );
+    }
+
+    /// Regression: printing only an integer used to pull in the whole display
+    /// runtime - the string escaper, six Repr impls, six Display impls. That was
+    /// 85% dead code in the generated file.
+    #[test]
+    fn printing_an_int_does_not_emit_string_or_collection_helpers() {
+        let module = Module {
+            statements: vec![Stmt::Print(vec![Value::Int(7)])],
+        };
+        let code = RustCodegen::generate(&module).unwrap();
+        // A literal integer renders through Rust's own `{}`, so the optimal
+        // output carries no display impl at all.
+        assert!(
+            !code.contains("__TarvosDisplay"),
+            "an integer literal needs no display impl:\n{code}"
+        );
+        assert!(
+            !code.contains("__tarvos_str_repr"),
+            "an integer print must not emit the string escaper:\n{code}"
+        );
+        assert!(
+            !code.contains("for Vec<T>"),
+            "an integer print must not emit the collection impls:\n{code}"
+        );
+        assert!(
+            !code.contains("for f64"),
+            "an integer print must not emit the float impls:\n{code}"
+        );
+    }
+
+    /// A generic `Vec` impl is only usable when its element type also has a
+    /// `Repr` impl, because the bound is checked at instantiation. Printing a
+    /// `Vec<i64>` without `Repr for i64` produced E0599.
+    #[test]
+    fn printing_a_vec_of_ints_emits_the_element_repr_impl() {
+        let module = Module {
+            statements: vec![Stmt::Print(vec![Value::List {
+                elements: vec![Value::Int(1), Value::Int(2)],
+                element_type: Type::Int,
+            }])],
+        };
+        let code = RustCodegen::generate(&module).unwrap();
+        assert!(code.contains("__TarvosRepr for Vec<T>"));
+        assert!(
+            code.contains("impl __TarvosRepr for i64"),
+            "a Vec<i64> Repr needs Repr for i64 to satisfy its bound:\n{code}"
+        );
+    }
+
+    /// An unresolvable value must fall back to every impl rather than risk
+    /// dropping one the program needs.
+    #[test]
+    fn printing_an_untyped_name_emits_every_impl() {
+        let module = Module {
+            statements: vec![Stmt::Print(vec![Value::Name("mystery".to_string())])],
+        };
+        let code = RustCodegen::generate(&module).unwrap();
+        assert!(code.contains("for Vec<T>"));
+        assert!(code.contains("for String"));
+        assert!(code.contains("for bool"));
+    }
 
     #[test]
     fn print_float_uses_python_display_not_rust_display() {
