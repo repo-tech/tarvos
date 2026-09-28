@@ -17,12 +17,12 @@ BUILD_TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 PRESETS = {
     "dev": {
-        "rustflags": "-C opt-level=2 -C codegen-units=1 debuginfo=0",
-        "cranelift": True,
+        "rustflags": "",
+        "cranelift": False,
     },
     "release": {
-        "rustflags": "-C opt-level=2 -C codegen-units=1 debuginfo=0",
-        "cranelift": True,
+        "rustflags": "-C opt-level=2 -C codegen-units=1",
+        "cranelift": False,
     },
     "cranelift": {
         "rustflags": "-C codegen-units=1 -C debuginfo=0",
@@ -168,13 +168,25 @@ def apply_preset(preset_name: str):
     return preset
 
 
+def cranelift_requested():
+    return os.environ.get("TARVOS_USE_CRANELIFT", "").lower() in {"1", "true", "yes"}
+
+
 def windows_gnu_toolchain():
     if os.name != "nt":
         return None
     rustc_bin = resolve_tool_path("rustc")
     if not rustc_bin:
         return None
-    for tc in ("+stable-x86_64-pc-windows-gnu", "+nightly-x86_64-pc-windows-gnu"):
+    # `-Zcodegen-backend=cranelift` is a nightly-only option. Picking `+stable`
+    # first and then appending that flag made every cranelift preset fail with
+    # "the option 'Z' is only accepted on the nightly compiler". The probe order
+    # has to follow the flags we are actually going to pass.
+    if cranelift_requested():
+        candidates = ("+nightly-x86_64-pc-windows-gnu",)
+    else:
+        candidates = ("+stable-x86_64-pc-windows-gnu", "+nightly-x86_64-pc-windows-gnu")
+    for tc in candidates:
         try:
             r = safe_run([rustc_bin, tc, "--version"], capture_output=True, text=True, env=sanitize_environment())
             if r.returncode == 0:
@@ -200,7 +212,17 @@ def rustc_command(extra_flags=None):
     tc = windows_gnu_toolchain()
     if tc:
         cmd.append(tc)
-    if os.environ.get("TARVOS_USE_CRANELIFT", "").lower() in {"1", "true", "yes"}:
+    if cranelift_requested():
+        if tc is None or "nightly" not in tc:
+            # Passing a -Z flag to a stable rustc fails with an opaque
+            # "the option 'Z' is only accepted on the nightly compiler". Say
+            # what is actually wrong instead.
+            raise RuntimeError(
+                "the cranelift preset needs a nightly toolchain "
+                f"({tc or 'no rustc toolchain found'} was selected); "
+                "install one with `rustup toolchain install nightly` "
+                "or run the `dev`/`release` preset instead"
+            )
         cmd += ["-Zcodegen-backend=cranelift"]
     return cmd + flags
 
@@ -264,7 +286,7 @@ def benchmark_rust_file(rs_file, binary_name="bench_out", repeats=5):
         "-C",
         "codegen-units=1",
     ]
-    if os.environ.get("TARVOS_USE_CRANELIFT", "").lower() in {"1", "true", "yes"}:
+    if cranelift_requested():
         rustflags.append("-Zcodegen-backend=cranelift")
 
     with tempfile.TemporaryDirectory(prefix=f"ep_rust_{uuid.uuid4().hex[:8]}_", dir=str(BUILD_TMP_ROOT)) as tmpdir:
