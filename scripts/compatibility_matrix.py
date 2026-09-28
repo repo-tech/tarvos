@@ -178,9 +178,24 @@ ROWS: list[tuple[str, str, str, list[str], str]] = [
     ("stdlib", "statistics.variance / stdev", "supported", ["40_statistics"],
      "variance and stdev require at least two data points, as in CPython."),
     ("stdlib", "statistics.median_grouped / quantiles / correlation / covariance / "
-     "linear_regression", "unsupported", [],
-     "Not yet implemented; the compiler reports these as unsupported rather than "
-     "emitting a stub."),
+     "linear_regression", "partial", ["42_statistics_paired"],
+     "median_grouped follows the CPython 3.13 formulation: it finds the value at "
+     "the midpoint, counts the points at or below it, then interpolates across "
+     "the class interval. The older 'nudge the two central values' algorithm "
+     "disagrees whenever the median value is repeated. quantiles implements "
+     "CPython's exact integer rescaling (j = i*m//n, delta = i*m - j*n), which "
+     "deliberately extrapolates outside the observed range. correlation, "
+     "covariance, and linear_regression validate pair length, minimum sample "
+     "size, and constant input."),
+    ("stdlib", "statistics.quantiles n= / method=", "unsupported", [],
+     "CPython declares n and method keyword-only, and the native backend does "
+     "not yet lower keyword arguments, so only the default n=4, "
+     "method='exclusive' form is reachable natively."),
+    ("stdlib", "statistics.linear_regression result attributes", "partial",
+     ["42_statistics_paired"],
+     "Returns (slope, intercept) as a 2-tuple. CPython returns a "
+     "LinearRegression named tuple, so `result.slope` is not yet available; use "
+     "result[0] and result[1]."),
     ("stdlib", "statistics.StatisticsError", "supported", ["41_exceptions"],
      "Catchable. Every statistics call reports an empty sequence, a too-small "
      "sample, and a negative geometric product through a Result carrying the "

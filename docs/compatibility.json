@@ -576,9 +576,27 @@
     {
       "category": "stdlib",
       "feature": "statistics.median_grouped / quantiles / correlation / covariance / linear_regression",
+      "status": "partial",
+      "tests": [
+        "42_statistics_paired"
+      ],
+      "note": "median_grouped follows the CPython 3.13 formulation: it finds the value at the midpoint, counts the points at or below it, then interpolates across the class interval. The older 'nudge the two central values' algorithm disagrees whenever the median value is repeated. quantiles implements CPython's exact integer rescaling (j = i*m//n, delta = i*m - j*n), which deliberately extrapolates outside the observed range. correlation, covariance, and linear_regression validate pair length, minimum sample size, and constant input."
+    },
+    {
+      "category": "stdlib",
+      "feature": "statistics.quantiles n= / method=",
       "status": "unsupported",
       "tests": [],
-      "note": "Not yet implemented; the compiler reports these as unsupported rather than emitting a stub."
+      "note": "CPython declares n and method keyword-only, and the native backend does not yet lower keyword arguments, so only the default n=4, method='exclusive' form is reachable natively."
+    },
+    {
+      "category": "stdlib",
+      "feature": "statistics.linear_regression result attributes",
+      "status": "partial",
+      "tests": [
+        "42_statistics_paired"
+      ],
+      "note": "Returns (slope, intercept) as a 2-tuple. CPython returns a LinearRegression named tuple, so `result.slope` is not yet available; use result[0] and result[1]."
     },
     {
       "category": "stdlib",

@@ -6,6 +6,40 @@ All notable changes to Tarvos are documented here. The format follows
 
 ## [Unreleased]
 
+### Added - remaining statistics APIs
+
+- `median_grouped`, `quantiles`, `covariance`, `correlation`, and
+  `linear_regression` are implemented and differentially tested by
+  `tests/corpus/42_statistics_paired.py`.
+- `median_grouped` follows the **CPython 3.13** algorithm: find the value at the
+  midpoint, count the points at or below it, then interpolate across the class
+  interval. The older "nudge the two central values" algorithm disagrees whenever
+  the median value is repeated, so using it would have produced wrong answers.
+- `quantiles` reproduces CPython's exact integer rescaling (`j = i*m // n`,
+  `delta = i*m - j*n`). A floating-point equivalent drifts, and a naive clamp of
+  `j` into `1..ld-1` changes the answer because CPython's cut points genuinely
+  extrapolate outside the observed range: `quantiles([1.0, 2.0])` is
+  `[0.75, 1.5, 2.25]`, not values inside `[1, 2]`.
+- A single-element sequence is handled the way CPython handles it (the value is
+  repeated per cut) instead of panicking on an out-of-range index.
+- `covariance`, `correlation`, and `linear_regression` validate pair length,
+  minimum sample size, and constant input, reporting `StatisticsError`.
+- Statistics call sites now check arity and only borrow the *sequence* arguments,
+  so a scalar such as `interval` is no longer borrowed and a wrong-arity call
+  produces a Tarvos diagnostic rather than an opaque Rust error.
+
+### Known limitations added
+
+- `quantiles` accepts only the default `n=4, method="exclusive"`. CPython declares
+  `n` and `method` keyword-only and the native backend does not lower keyword
+  arguments yet.
+- `linear_regression` returns `(slope, intercept)`. CPython returns a
+  `LinearRegression` named tuple, so `result.slope` is not available; use
+  `result[0]` and `result[1]`.
+- An uncaught native exception prints `Class: message` on stderr and exits 1. It
+  does not print a Python traceback, which would require source-level frame
+  information a native binary does not carry.
+
 ### Added - native exception handling
 
 - `try` / `except` / `else` / `finally` and `raise` now compile to real native
