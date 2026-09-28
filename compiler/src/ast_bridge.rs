@@ -756,15 +756,31 @@ impl AstBridge {
                     values: terms,
                 }
             }
-            pyast::Expr::Call(v) => Expr::Call {
-                function: Box::new(self.expr(&v.func)),
-                args: v
-                    .arguments
-                    .args
-                    .iter()
-                    .map(|value| self.expr(value))
-                    .collect(),
-            },
+            pyast::Expr::Call(v) => {
+                // A keyword argument is currently dropped by the bridge, which is
+                // worse than an error: `quantiles(data, n=2)` would silently
+                // compile as `quantiles(data)`. Reporting it routes the program
+                // down the explicit compatibility path instead of producing a
+                // native binary that quietly computes something else.
+                if !v.arguments.keywords.is_empty() {
+                    self.diagnostics.push(Diagnostic {
+                        message: format!(
+                            "keyword arguments are not yet lowered natively \
+                             (call has {} keyword argument(s))",
+                            v.arguments.keywords.len()
+                        ),
+                    });
+                }
+                Expr::Call {
+                    function: Box::new(self.expr(&v.func)),
+                    args: v
+                        .arguments
+                        .args
+                        .iter()
+                        .map(|value| self.expr(value))
+                        .collect(),
+                }
+            }
             pyast::Expr::Attribute(v) => Expr::Attribute {
                 object: Box::new(self.expr(&v.value)),
                 attribute: v.attr.as_str().to_owned(),
