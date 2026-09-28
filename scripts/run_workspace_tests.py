@@ -19,6 +19,10 @@ import sys
 # `test <name> ... FAILED` and the `---- <name> stdout ----` headers both name the
 # failing test, but the first form is the one cargo prints for every failure.
 FAILED = re.compile(r"^test (.+?) \.\.\. FAILED\s*$", re.MULTILINE)
+# cargo prints the assertion message under a per-test stdout header. Without
+# this the annotation can name the failing test but not say what it printed,
+# which on a platform-specific failure is the only thing that matters.
+STDOUT_SECTION = re.compile(r"^---- (.+?) stdout ----\n(.*?)(?=^\s*$)", re.MULTILINE | re.DOTALL)
 
 
 def main() -> int:
@@ -39,11 +43,22 @@ def main() -> int:
         sys.stdout.flush()
     code = process.wait()
 
-    failed = FAILED.findall("".join(captured))
+    body = "".join(captured)
+    failed = FAILED.findall(body)
     if failed:
+        # The assertion text is what distinguishes a platform bug from a real
+        # regression, so it travels with the test name.
+        detail = {name: text.strip() for name, text in STDOUT_SECTION.findall(body)}
         print(f"\n{len(failed)} failing test(s):", flush=True)
         for name in failed:
-            sys.stdout.write(f"\n::error title=Test failed::{name}\n")
+            extra = detail.get(name, "")
+            if len(extra) > 900:
+                extra = extra[:900] + " ...(truncated)"
+            message = name if not extra else f"{name}\\n{extra}"
+            # A real newline inside an annotation truncates it, so it is escaped.
+            sys.stdout.write(
+                "\n::error title=Test failed::" + message.replace("\n", "%0A") + "\n"
+            )
     else:
         # A non-zero exit with no parsed name means the harness itself failed
         # (build error, missing binary) rather than a test asserting false.

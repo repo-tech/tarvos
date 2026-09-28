@@ -147,10 +147,13 @@ jobs:
       - name: Cache Cargo and build output
         uses: actions/cache@v4
         with:
+          # Only Cargo's download cache. `target/` is deliberately NOT cached:
+          # the key below has no source component, so a restored target tree
+          # would let a test run against a binary built from an older commit.
+          # For a compiler, that is a correctness hazard, not a speed-up.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: ${{ runner.os }}-rust-1.98.0-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-1.98.0-
@@ -212,10 +215,13 @@ jobs:
       - name: Cache Cargo and build output
         uses: actions/cache@v4
         with:
+          # Only Cargo's download cache. `target/` is deliberately NOT cached:
+          # the key below has no source component, so a restored target tree
+          # would let a test run against a binary built from an older commit.
+          # For a compiler, that is a correctness hazard, not a speed-up.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: ${{ runner.os }}-rust-1.98.0-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-1.98.0-
@@ -282,10 +288,13 @@ jobs:
       - name: Cache Cargo and build output
         uses: actions/cache@v4
         with:
+          # Only Cargo's download cache. `target/` is deliberately NOT cached:
+          # the key below has no source component, so a restored target tree
+          # would let a test run against a binary built from an older commit.
+          # For a compiler, that is a correctness hazard, not a speed-up.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: ${{ runner.os }}-rust-1.98.0-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-1.98.0-
