@@ -1458,11 +1458,55 @@ fn compile_rust_binary_opt(output_path: &Path, rust_source: &str, fast_dev: bool
     Ok(())
 }
 
+/// The channel this project asks for.
+///
+/// A hard-coded `stable` ignores `rust-toolchain.toml` and `RUSTUP_TOOLCHAIN`,
+/// so the CLI would try to install a different compiler than the one the project
+/// is written and tested against. It also fails outright wherever rustup cannot
+/// self-update, such as a CI runner that ships a pinned toolchain.
+fn project_toolchain_channel() -> Option<String> {
+    if let Ok(channel) = env::var("RUSTUP_TOOLCHAIN") {
+        let channel = channel.trim().to_string();
+        if !channel.is_empty() {
+            return Some(channel);
+        }
+    }
+    // `rustup show active-toolchain` already honours rust-toolchain.toml and the
+    // RUSTUP_TOOLCHAIN override, so it is the single source of truth.
+    for tool in ["rustup", "rustup.exe"] {
+        let path = which_simple(tool).ok().flatten().unwrap_or_else(|| PathBuf::from(tool));
+        if !path.exists() {
+            continue;
+        }
+        let Ok(output) = Command::new(&path).args(["show", "active-toolchain"]).output() else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let first = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if !first.is_empty() {
+            return Some(first);
+        }
+    }
+    None
+}
+
 fn ensure_rust_toolchain() -> Result<PathBuf> {
     if let Some(path) = find_rustc_command() {
         return Ok(path);
     }
 
+    // Install the channel the project actually wants rather than assuming
+    // `stable`, so a pinned toolchain is not silently replaced by another.
+    let channel = project_toolchain_channel().unwrap_or_else(|| "stable".to_string());
     for candidate in [PathBuf::from("rustup"), PathBuf::from("rustup.exe")] {
         let tool = if candidate.is_absolute() {
             candidate
@@ -1473,7 +1517,7 @@ fn ensure_rust_toolchain() -> Result<PathBuf> {
             continue;
         }
         let install = Command::new(&tool)
-            .args(["toolchain", "install", "stable", "--profile", "minimal"])
+            .args(["toolchain", "install", &channel, "--profile", "minimal"])
             .status()
             .with_context(|| {
                 format!(
@@ -1490,7 +1534,9 @@ fn ensure_rust_toolchain() -> Result<PathBuf> {
     }
 
     Err(anyhow::anyhow!(
-        "Rust is not installed and could not be auto-bootstrapped. Source-only mode is still available via `tarvos compile <file.py> output.rs`."
+        "Rust is not installed and the '{channel}' toolchain could not be \
+         bootstrapped. Install Rust, or point RUSTC at a compiler. Source-only \
+         mode is still available via `tarvos compile <file.py> output.rs`."
     ))
 }
 

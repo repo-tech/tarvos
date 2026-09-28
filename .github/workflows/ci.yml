@@ -41,6 +41,12 @@ jobs:
     name: Compiler gates
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    env:
+      # Tests compile Rust through the Tarvos CLI from a temporary directory
+      # outside the checkout, where rust-toolchain.toml is not visible. Without
+      # this the CLI's rustup lookup resolves whatever the runner default is,
+      # which on macOS runners is a channel the runner cannot self-update.
+      RUSTUP_TOOLCHAIN: 1.98.0
     strategy:
       fail-fast: false
       matrix:
@@ -141,6 +147,8 @@ jobs:
           retention-days: 7
 
   native:
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.0
     # A static job name. GitHub renders a matrix expression in `name` literally,
     # so the run list shows "native parity (${{ matrix.os }})" instead of a
     # usable job name, and a failure notification becomes an unreadable string.
