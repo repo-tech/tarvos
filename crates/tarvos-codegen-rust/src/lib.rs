@@ -563,6 +563,178 @@ fn tarvos_statistics_variance<T: __TarvosNum>(data: &[T]) -> __TarvosResult<f64>
     Ok(total / (data.len() - 1) as f64)
 }
 
+/// Estimate a median for data binned around midpoints of fixed-width intervals.
+///
+/// This follows the CPython 3.13 formulation: find the value at the midpoint,
+/// count how many points fall at or below it, then interpolate across the class
+/// interval. It is *not* the older "nudge the two central values" algorithm, and
+/// the two disagree whenever the median value is repeated.
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_median_grouped<T: __TarvosNum>(data: &[T], interval: f64) -> __TarvosResult<f64> {
+    if data.is_empty() {
+        return Err(__TarvosError::new("StatisticsError", "no median for empty data"));
+    }
+    let mut values: Vec<f64> = data.iter().map(|v| v.__tarvos_f64()).collect();
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = values.len();
+    let x = values[n / 2];
+    // cf counts points strictly below x; f counts points equal to x.
+    let cf = values.iter().filter(|v| **v < x).count();
+    let f = values.iter().filter(|v| **v == x).count();
+    let lower = x - interval / 2.0;
+    Ok(lower + interval * (n as f64 / 2.0 - cf as f64) / f as f64)
+}
+
+/// `quantiles(data)` with CPython's defaults: n=4, method="exclusive".
+///
+/// CPython declares `n` and `method` keyword-only, and the native backend does
+/// not lower keyword arguments, so the defaulted form is the only one reachable
+/// natively. `_exclusive` / `_inclusive` are kept separate so a future
+/// keyword-argument path can select between them without reshaping the maths.
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_quantiles<T: __TarvosNum>(data: &[T]) -> __TarvosResult<Vec<f64>> {
+    tarvos_statistics_quantiles_exclusive(data, 4)
+}
+
+/// Exclusive-method quantiles (`method="exclusive"`, CPython's default).
+///
+/// This follows CPython's integer rescaling exactly: `j = i*m // n`, then
+/// `delta = i*m - j*n`, then a weighted blend divided by `n`. Doing the division
+/// in floating point instead drifts, and clamping `j` into 1..ld-1 the way a
+/// naive implementation does changes the answer, because CPython's cut points
+/// genuinely extrapolate outside the observed range.
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_quantiles_exclusive<T: __TarvosNum>(data: &[T], n: i64) -> __TarvosResult<Vec<f64>> {
+    if data.is_empty() {
+        return Err(__TarvosError::new("StatisticsError", "must have at least one data point"));
+    }
+    let mut values: Vec<f64> = data.iter().map(|v| v.__tarvos_f64()).collect();
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let ld = values.len();
+    // A single observation has no interval to interpolate across, so CPython
+    // simply repeats it once per cut.
+    if ld == 1 {
+        return Ok(vec![values[0]; (n - 1).max(0) as usize]);
+    }
+    let m = ld as i64 + 1;
+    let mut out = Vec::with_capacity((n - 1).max(0) as usize);
+    for i in 1..n {
+        let mut j = i * m / n;
+        if j < 1 {
+            j = 1;
+        } else if j > ld as i64 - 1 {
+            j = ld as i64 - 1;
+        }
+        let delta = i * m - j * n;
+        out.push(
+            (values[(j - 1) as usize] * (n - delta) as f64 + values[j as usize] * delta as f64)
+                / n as f64,
+        );
+    }
+    Ok(out)
+}
+
+/// Inclusive-method quantiles (`method="inclusive"`): the minimum counts as the
+/// 0th percentile and the maximum as the 100th.
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_quantiles_inclusive<T: __TarvosNum>(data: &[T], n: i64) -> __TarvosResult<Vec<f64>> {
+    if data.is_empty() {
+        return Err(__TarvosError::new("StatisticsError", "must have at least one data point"));
+    }
+    let mut values: Vec<f64> = data.iter().map(|v| v.__tarvos_f64()).collect();
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let ld = values.len();
+    if ld == 1 {
+        return Ok(vec![values[0]; (n - 1).max(0) as usize]);
+    }
+    let m = ld as i64 - 1;
+    let mut out = Vec::with_capacity((n - 1).max(0) as usize);
+    for i in 1..n {
+        let j = i * m / n;
+        let delta = i * m - j * n;
+        out.push(
+            (values[j as usize] * (n - delta) as f64 + values[(j + 1) as usize] * delta as f64)
+                / n as f64,
+        );
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_paired(
+    x: &[f64],
+    y: &[f64],
+    what: &str,
+) -> __TarvosResult<Vec<(f64, f64)>> {
+    if x.len() != y.len() {
+        return Err(__TarvosError::new(
+            "StatisticsError",
+            &format!("{what} requires that both inputs have same number of data points"),
+        ));
+    }
+    if x.len() < 2 {
+        return Err(__TarvosError::new(
+            "StatisticsError",
+            &format!("{what} requires at least two data points"),
+        ));
+    }
+    let pairs: Vec<(f64, f64)> = x.iter().copied().zip(y.iter().copied()).collect();
+    let mx = pairs.iter().map(|p| p.0).sum::<f64>() / pairs.len() as f64;
+    let my = pairs.iter().map(|p| p.1).sum::<f64>() / pairs.len() as f64;
+    Ok(pairs.iter().map(|p| (p.0 - mx, p.1 - my)).collect())
+}
+
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_covariance(x: &[f64], y: &[f64]) -> __TarvosResult<f64> {
+    let centred = tarvos_statistics_paired(x, y, "covariance")?;
+    Ok(centred.iter().map(|p| p.0 * p.1).sum::<f64>() / (centred.len() - 1) as f64)
+}
+
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_correlation(x: &[f64], y: &[f64]) -> __TarvosResult<f64> {
+    let covariance = tarvos_statistics_covariance(x, y)?;
+    let mx = x.iter().sum::<f64>() / x.len() as f64;
+    let my = y.iter().sum::<f64>() / y.len() as f64;
+    let vx = x.iter().map(|v| (v - mx) * (v - mx)).sum::<f64>() / (x.len() - 1) as f64;
+    let vy = y.iter().map(|v| (v - my) * (v - my)).sum::<f64>() / (y.len() - 1) as f64;
+    let denominator = (vx * vy).sqrt();
+    if denominator == 0.0 {
+        return Err(__TarvosError::new(
+            "StatisticsError",
+            "at least one of the inputs is constant",
+        ));
+    }
+    Ok(covariance / denominator)
+}
+
+#[allow(dead_code)]
+#[inline]
+fn tarvos_statistics_linear_regression(
+    x: &[f64],
+    y: &[f64],
+) -> __TarvosResult<(f64, f64)> {
+    let centred = tarvos_statistics_paired(x, y, "linear regression")?;
+    let mx = x.iter().sum::<f64>() / x.len() as f64;
+    let my = y.iter().sum::<f64>() / y.len() as f64;
+    let sxx: f64 = x.iter().map(|v| (v - mx) * (v - mx)).sum();
+    if sxx == 0.0 {
+        return Err(__TarvosError::new(
+            "StatisticsError",
+            "linear regression requires at least two distinct x values",
+        ));
+    }
+    let sxy: f64 = centred.iter().map(|p| p.0 * p.1).sum();
+    let slope = sxy / sxx;
+    Ok((slope, my - slope * mx))
+}
+
 #[allow(dead_code)]
 #[inline]
 fn tarvos_statistics_pstdev<T: __TarvosNum>(data: &[T]) -> __TarvosResult<f64> {
@@ -2665,18 +2837,54 @@ impl RustCodegen {
                     "tarvos_json_dumps_runtime" => {
                         format!("(&({})).__tarvos_json()", args_str)
                     }
-                    // A statistics function reads its sequence; the call must
-                    // borrow rather than move, or the program would consume
-                    // the caller's list on the first call. It also reports
-                    // `StatisticsError` through a `Result`, so the call site
-                    // unwraps it the same way a fallible function call does.
+                    // A statistics function reads its sequences; the call must
+                    // borrow rather than move, or the program would consume the
+                    // caller's list on the first call. It also reports errors
+                    // through a `Result`, so the call site unwraps it the same way a
+                    // fallible function call does.
                     name if name.starts_with("tarvos_statistics_") => {
-                        if args_rendered.len() != 1 {
+                        // CPython's trailing arguments are optional and the native
+                        // functions take them positionally, so the defaults are
+                        // injected here. Only the *sequence* arguments are borrowed;
+                        // a scalar argument such as `interval` must not be.
+                        //
+                        // Arity is checked rather than padded blindly, because a short
+                        // call that reached Rust unchecked would surface as an opaque
+                        // arity error instead of a Tarvos diagnostic.
+                        let (leading_sequences, defaults): (usize, &[&str]) = match name {
+                            "tarvos_statistics_median_grouped" => (1, &["1.0_f64"]),
+                            "tarvos_statistics_quantiles" => (1, &[]),
+                            "tarvos_statistics_covariance"
+                            | "tarvos_statistics_correlation"
+                            | "tarvos_statistics_linear_regression" => (2, &[]),
+                            _ => (1, &[]),
+                        };
+                        let maximum = leading_sequences + defaults.len();
+                        if args_rendered.len() < leading_sequences
+                            || args_rendered.len() > maximum
+                        {
                             return Err(anyhow::anyhow!(
-                                "{name}() takes exactly one sequence"
+                                "{name}() takes {leading_sequences}..={maximum} argument(s); \
+                                 keyword arguments are not lowered by the native backend yet"
                             ));
                         }
-                        let call = format!("{name}(&{})", args_rendered[0]);
+                        let mut rendered: Vec<String> = args_rendered
+                            .iter()
+                            .enumerate()
+                            .map(|(position, a)| {
+                                if position < leading_sequences {
+                                    format!("&{a}")
+                                } else {
+                                    a.clone()
+                                }
+                            })
+                            .collect();
+                        for (position, default) in defaults.iter().enumerate() {
+                            if rendered.len() <= leading_sequences + position {
+                                rendered.push((*default).to_string());
+                            }
+                        }
+                        let call = format!("{name}({})", rendered.join(", "));
                         match ctx.try_stack.last().cloned() {
                             Some((label, error_var)) => format!(
                                 "match {call} {{ Ok(__tarvos_v) => __tarvos_v, Err(__tarvos_e) => {{ {error_var} = Some(__tarvos_e); break '{label}; }} }}"

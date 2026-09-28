@@ -76,6 +76,23 @@ pub fn native_function(module: &str, name: &str) -> Option<NativeFunction> {
         ("statistics", "pvariance") => ("tarvos_statistics_pvariance", Type::Float),
         ("statistics", "stdev") => ("tarvos_statistics_stdev", Type::Float),
         ("statistics", "pstdev") => ("tarvos_statistics_pstdev", Type::Float),
+        // Two-input functions take paired sequences and report a length mismatch
+        // as a StatisticsError, so they carry the same result type as the rest.
+        ("statistics", "median_grouped") => ("tarvos_statistics_median_grouped", Type::Float),
+        ("statistics", "quantiles") => (
+            "tarvos_statistics_quantiles",
+            Type::Array(Box::new(Type::Float)),
+        ),
+        ("statistics", "covariance") => ("tarvos_statistics_covariance", Type::Float),
+        ("statistics", "correlation") => ("tarvos_statistics_correlation", Type::Float),
+        // Returns `(slope, intercept)`. CPython returns a `LinearRegression`
+        // named tuple; a plain 2-tuple keeps positional access native. Reading
+        // `.slope` / `.intercept` is a named-attribute access the native backend
+        // does not model, so it is documented rather than faked.
+        ("statistics", "linear_regression") => (
+            "tarvos_statistics_linear_regression",
+            Type::Tuple(vec![Type::Float, Type::Float]),
+        ),
         _ => return None,
     };
     Some(NativeFunction {
