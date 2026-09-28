@@ -33,6 +33,10 @@ GATES: list[tuple[str, list[str], bool]] = [
     ("check", ["cargo", "check", "--workspace", "--all-targets"], False),
     ("clippy", ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"], False),
     ("test", ["cargo", "test", "--workspace", "--no-fail-fast"], True),
+    # The installer ships to users verbatim, and its last bug (`--tl1v1.2`
+    # instead of `--tlsv1.2`) reached release before any test looked at it.
+    ("installer", [sys.executable, "scripts/test_installer.py"], False),
+    ("compatibility", [sys.executable, "scripts/compatibility_matrix.py", "--check"], False),
 ]
 
 
