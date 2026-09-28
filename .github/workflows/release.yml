@@ -233,7 +233,7 @@ jobs:
           path: benchmarks/results/runtime_matrix.json
 
   build:
-    name: Build ${{ matrix.platform }}
+    name: Build release binary
     # Validation is a gate, not a parallel report. Without it here, `build`
     # starts at the same time as `validate`, so binaries and a published release
     # could be produced from a tree whose tests, validation suite, smoke build,

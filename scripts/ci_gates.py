@@ -57,6 +57,16 @@ def main() -> int:
         if result.returncode != 0:
             failures.append(name)
             print(f"FAIL  {name} ({elapsed:.1f}s, exit {result.returncode})", flush=True)
+            # Emit a workflow annotation as well as log text. A log is only
+            # readable with write access to the repository, but an annotation is
+            # visible on the check run to anyone who can read the repo. That
+            # difference is the whole point: a failing gate stays diagnosable
+            # when the log cannot be fetched.
+            print(
+                f"::error title=Gate failed: {name}::"
+                f"`{' '.join(command)}` exited {result.returncode} after {elapsed:.1f}s.",
+                flush=True,
+            )
             # Stop at the first failing gate. Continuing would bury the real
             # failure under the noise of every gate that depends on it.
             break

@@ -35,7 +35,10 @@ concurrency:
 
 jobs:
   quality:
-    name: fmt / check / clippy / test (${{ matrix.os }})
+    # Static name for the same reason as the native job: a matrix expression in
+    # `name` is rendered literally, which makes the run list and any failure
+    # notification unreadable. The platform is printed by the Report context step.
+    name: Compiler gates
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
@@ -116,7 +119,11 @@ jobs:
           retention-days: 7
 
   native:
-    name: native parity (${{ matrix.os }})
+    # A static job name. GitHub renders a matrix expression in `name` literally,
+    # so the run list shows "native parity (${{ matrix.os }})" instead of a
+    # usable job name, and a failure notification becomes an unreadable string.
+    # The platform is still shown in the step output.
+    name: Native parity
     needs: quality
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
