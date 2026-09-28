@@ -28,6 +28,14 @@ fn normalize_module(mut module: ast::Module) -> ast::Module {
 
 pub struct CompilePipeline;
 
+/// Output of the IR-to-Rust half of the pipeline, which the incremental cache
+/// reuses.
+#[derive(Debug, Clone)]
+pub struct Staged {
+    pub ir: String,
+    pub rust: String,
+}
+
 const EMBEDDED_AST_EXPORTER: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../python/ast_export.py"
@@ -50,9 +58,31 @@ impl CompilePipeline {
         let mut visiting = vec![Self::canonical_or_original(input_path)];
         Self::inline_local_imports(&mut module, input_path, &root, &mut visiting)?;
         let ir = lower_module(&module)?;
-        let optimized = Optimizer::optimize(&ir)?;
-        RustCodegen::generate(&optimized)
-            .with_context(|| format!("failed to generate Rust for {}", input_path.display()))
+        Ok(Self::finish_from_ir(&ir, input_path)?.rust)
+    }
+
+    /// Resume the pipeline from a cached IR, skipping parse, import inlining
+    /// and lowering.
+    ///
+    /// The IR is deserialized into the same typed `Module` the pipeline would
+    /// have produced. That is only sound because the cache key carries the
+    /// compiler epoch, so a payload written by a different build is never read.
+    pub fn generate_from_cached_ir(ir_json: &str, input_path: &Path) -> Result<String> {
+        let ir: tarvos_ir::Module = serde_json::from_str(ir_json)
+            .context("failed to decode cached IR")?;
+        Ok(Self::finish_from_ir(&ir, input_path)?.rust)
+    }
+
+    /// The IR digest a cache entry must be keyed on.
+    pub fn encode_ir(ir: &tarvos_ir::Module) -> Result<String> {
+        serde_json::to_string(ir).context("failed to encode IR")
+    }
+
+    fn finish_from_ir(ir: &tarvos_ir::Module, input_path: &Path) -> Result<Staged> {
+        let optimized = Optimizer::optimize(ir)?;
+        let rust = RustCodegen::generate(&optimized)
+            .with_context(|| format!("failed to generate Rust for {}", input_path.display()))?;
+        Ok(Staged { ir: Self::encode_ir(ir)?, rust })
     }
 
     fn canonical_or_original(path: &Path) -> PathBuf {
