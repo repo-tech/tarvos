@@ -22,7 +22,10 @@ FAILED = re.compile(r"^test (.+?) \.\.\. FAILED\s*$", re.MULTILINE)
 # cargo prints the assertion message under a per-test stdout header. Without
 # this the annotation can name the failing test but not say what it printed,
 # which on a platform-specific failure is the only thing that matters.
-STDOUT_SECTION = re.compile(r"^---- (.+?) stdout ----\n(.*?)(?=^\s*$)", re.MULTILINE | re.DOTALL)
+STDOUT_SECTION = re.compile(
+    r"^---- (.+?) stdout ----\n(.*?)(?=^---- |^failures:|^test result:|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
 
 
 def main() -> int:
