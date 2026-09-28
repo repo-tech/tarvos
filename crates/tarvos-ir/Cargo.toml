@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 anyhow = "1"
 tarvos-types = { path = "../tarvos-types" }
 tarvos-ast = { path = "../tarvos-ast" }

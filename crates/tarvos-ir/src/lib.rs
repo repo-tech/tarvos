@@ -1,14 +1,16 @@
+use serde::{Deserialize, Serialize};
+
 use std::collections::HashMap;
 use tarvos_types::Type;
 
 /// Tarvos IR Module - contains all statements
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Module {
     pub statements: Vec<Stmt>,
 }
 
 /// IR Statement - simplified representation suitable for optimization
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Stmt {
     StructDef {
         name: String,
@@ -92,21 +94,21 @@ pub enum Stmt {
     Expr(Value),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExceptHandler {
     pub name: Option<String>,
     pub exc_type: Option<String>,
     pub body: Vec<Stmt>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WithItem {
     pub context_expr: Value,
     pub target: Option<String>,
 }
 
 /// IR Value - atomic expression (no side effects)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
     // Constants
     Int(i64),
@@ -170,7 +172,7 @@ pub enum Value {
     },
 
     // Subscript read: container[index]
-    // e.g. arr[i]  →  arr[i as usize]  in Rust
+    // e.g. arr[i]  â†’  arr[i as usize]  in Rust
     Index {
         container: Box<Value>,
         index: Box<Value>,
@@ -191,7 +193,7 @@ pub enum Value {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FormatPart {
     Literal(String),
     Value {
@@ -201,7 +203,7 @@ pub enum FormatPart {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum UnaryOp {
     Neg,
     Not,
@@ -209,7 +211,7 @@ pub enum UnaryOp {
     Invert,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum BinaryOp {
     Add,
     Sub,
@@ -261,7 +263,7 @@ impl BinaryOp {
 }
 
 /// Type inference context
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TypeContext {
     pub symbols: HashMap<String, Type>,
 }
