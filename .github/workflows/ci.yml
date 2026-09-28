@@ -112,8 +112,14 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The wrapper runs the identical command and additionally emits one
+      # workflow annotation per failing test. `cargo test` only writes failures
+      # to the job log, which needs write access to fetch; an annotation is
+      # visible to anyone who can read the repository, which is what makes a
+      # platform-specific failure actionable instead of mysterious. The gate
+      # still fails on the real exit code, so it cannot mask a failure.
       - name: Test workspace
-        run: cargo test --workspace --no-fail-fast
+        run: python scripts/run_workspace_tests.py
 
       - name: Check the compatibility matrix is current
         # The matrix is generated from a table and cross-checked against the
