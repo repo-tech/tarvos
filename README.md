@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/repo-tech/Tarvos/actions/workflows/ci.yml/badge.svg)](https://github.com/repo-tech/Tarvos/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/badge/version-1.1.0--rc.3-blue.svg)](https://github.com/repo-tech/Tarvos/releases)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![License: AGPL v3](https://shields.io)](https://gnu.org)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
 
 **Tarvos** is an ultra-fast, optimizing ahead-of-time (AOT) compiler that transpiles a statically analyzable subset of Python directly into high-performance, native Rust code and stand-alone machine binaries.
@@ -250,4 +250,4 @@ native subset rejects the program.
 Native syntax and unsupported-AST diagnostics include the source line and
 column. Use `--python-fallback` when CPython compatibility is required.
 
-Tarvos is open-source software licensed under the [MIT License](LICENSE).
+Tarvos is open-source software licensed under the [AGPL-3.0](LICENSE).
