@@ -96,11 +96,24 @@ jobs:
         # is checked first and named explicitly.
         run: python scripts/check_toolchain_pin.py
 
-      # One script, not four duplicated steps: this is the same entry point a
-      # developer runs locally, so "passes locally" and "passes in CI" cannot
-      # drift apart. The script stops at the first failing gate and names it.
-      - name: Compiler gates (fmt / check / clippy / test)
-        run: python scripts/ci_gates.py
+      # Deliberately four separate steps rather than one bundled `ci_gates.py`
+      # invocation. The commands are identical to the script a developer runs
+      # locally, so there is no behavioural drift, but a step conclusion is
+      # visible in the run list and the check-run API without needing log access,
+      # while a single bundled step only says "something failed". A CI log that
+      # names the failing gate is the difference between a five-minute fix and
+      # an archaeology exercise.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace --no-fail-fast
 
       - name: Check the compatibility matrix is current
         # The matrix is generated from a table and cross-checked against the
