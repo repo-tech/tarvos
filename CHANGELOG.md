@@ -6,6 +6,27 @@ All notable changes to Tarvos are documented here. The format follows
 
 ## [Unreleased]
 
+### CI reliability
+
+- The Rust toolchain is now pinned to `1.98.0`. `rust-toolchain.toml` and both
+  workflows previously said `stable`, which floats: a new stable release can
+  change rustfmt output or add Clippy lints and turn every commit red at once
+  even though no source changed. `scripts/check_toolchain_pin.py` now fails if
+  the three declarations disagree, or if the channel starts floating again.
+- Cargo and `target/` are cached with first-party `actions/cache`, keyed on OS,
+  toolchain, and `Cargo.lock`. There was previously no caching at all, so every
+  run rebuilt the whole dependency tree from scratch on three platforms.
+- The four Rust gates run through `scripts/ci_gates.py`, the same entry point a
+  developer runs locally, so "passes locally" and "passes in CI" cannot drift.
+  The script stops at the first failing gate and names it.
+- Failure diagnostics: the `quality` job uploads its logs on failure, and the
+  native job's artifact now includes the whole differential build tree, so a
+  compiler regression can be diagnosed from the run that caught it.
+- The CPython version used as the differential oracle is documented in `ci.yml`.
+  It stays pinned to 3.12 because some `statistics` results differ between 3.12
+  and 3.13; a single-element `median_grouped` or `quantiles` input raises on
+  3.12 and returns a value on 3.13.
+
 ### Fixed - keyword arguments were silently dropped
 
 - The frontend discarded keyword arguments, so `f(x, n=2)` compiled as `f(x)` and
