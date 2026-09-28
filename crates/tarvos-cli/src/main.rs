@@ -1474,11 +1474,17 @@ fn project_toolchain_channel() -> Option<String> {
     // `rustup show active-toolchain` already honours rust-toolchain.toml and the
     // RUSTUP_TOOLCHAIN override, so it is the single source of truth.
     for tool in ["rustup", "rustup.exe"] {
-        let path = which_simple(tool).ok().flatten().unwrap_or_else(|| PathBuf::from(tool));
+        let path = which_simple(tool)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| PathBuf::from(tool));
         if !path.exists() {
             continue;
         }
-        let Ok(output) = Command::new(&path).args(["show", "active-toolchain"]).output() else {
+        let Ok(output) = Command::new(&path)
+            .args(["show", "active-toolchain"])
+            .output()
+        else {
             continue;
         };
         if !output.status.success() {
