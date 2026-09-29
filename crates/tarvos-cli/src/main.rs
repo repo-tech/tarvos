@@ -10,6 +10,7 @@ use std::{
 
 mod ai_probe;
 mod commands;
+mod toolchain;
 use commands::{
     analyze_command, benchmark_command, clean_command, doctor_command, export_command,
     init_command, install_command, validate_command,
@@ -84,6 +85,10 @@ enum Commands {
         /// Emit only Rust source without building executable
         #[arg(long)]
         source_only: bool,
+
+        /// Use an explicitly validated system Rust instead of the managed one
+        #[arg(long = "system-rust")]
+        system_rust: bool,
     },
 
     /// Transpile, build, and run a Python file in one seamless step
@@ -233,6 +238,7 @@ fn main() -> Result<()> {
             input,
             output,
             source_only,
+            system_rust,
         }) => {
             let mut args = vec![input.to_string_lossy().to_string()];
             if let Some(o) = output {
@@ -241,6 +247,9 @@ fn main() -> Result<()> {
             }
             if source_only {
                 args.push("--source-only".to_string());
+            }
+            if system_rust {
+                args.push("--system-rust".to_string());
             }
             build_mode(&args)
         }
@@ -403,6 +412,7 @@ pub(crate) fn compile_mode(args: &[String]) -> Result<()> {
 pub(crate) fn build_mode(args: &[String]) -> Result<()> {
     let mut output_file = "tarvos_app.exe".to_string();
     let mut source_only = false;
+    let mut prefer_system = false;
     let mut iter = args.iter();
     let input_file = iter
         .next()
@@ -414,6 +424,9 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
             }
             "--source-only" => {
                 source_only = true;
+            }
+            "--system-rust" => {
+                prefer_system = true;
             }
             _ => {
                 if output_file == "tarvos_app.exe" {
@@ -443,7 +456,7 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    match compile_rust_binary(&output_path, &rust_source) {
+    match compile_rust_binary_toolchain(&output_path, &rust_source, false, prefer_system) {
         Ok(()) => {
             if compatibility_launcher {
                 println!(
@@ -1045,6 +1058,22 @@ pub(crate) fn doctor_mode(_args: &[String]) -> Result<()> {
         }
     }
 
+    match toolchain::resolve(false) {
+        Ok(found) => {
+            println!(
+                "  [✓] Toolchain (managed): {} {} ({})",
+                found.mode.label(),
+                found.version,
+                found.target
+            );
+            println!("      source: {}", found.source);
+        }
+        Err(error) => {
+            println!("  [!] Toolchain (managed): unavailable");
+            println!("      {error}");
+        }
+    }
+
     let rustc_cmd = find_rustc_command();
     match &rustc_cmd {
         Some(cmd) => {
@@ -1053,13 +1082,13 @@ pub(crate) fn doctor_mode(_args: &[String]) -> Result<()> {
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_else(|_| "rustc stable".to_string());
             println!(
-                "  [✓] Rust Compiler (rustc): {} ({})",
+                "  [✓] Rust Compiler (legacy system discovery): {} ({})",
                 cmd.display(),
                 ver_str
             );
         }
         None => {
-            println!("  [!] Rust Compiler (rustc): Not detected (source-only mode available, auto-bootstrap via rustup supported)");
+            println!("  [!] Rust Compiler (legacy system discovery): Not detected (source-only mode available, auto-bootstrap via rustup supported)");
         }
     }
 
@@ -1399,7 +1428,39 @@ fn compile_rust_binary(output_path: &Path, rust_source: &str) -> Result<()> {
 }
 
 fn compile_rust_binary_opt(output_path: &Path, rust_source: &str, fast_dev: bool) -> Result<()> {
-    let rustc = ensure_rust_toolchain()?;
+    compile_rust_binary_toolchain(output_path, rust_source, fast_dev, false)
+}
+
+/// Compile with an explicitly resolved toolchain.
+///
+/// `prefer_system` is only true for `--system-rust`. The managed path never
+/// consults PATH, and the system path never silently receives a managed
+/// compiler: the two resolutions share no code that could mix them up.
+fn compile_rust_binary_toolchain(
+    output_path: &Path,
+    rust_source: &str,
+    fast_dev: bool,
+    prefer_system: bool,
+) -> Result<()> {
+    let resolved = toolchain::resolve(prefer_system).or_else(|managed_error| {
+        if prefer_system {
+            // An explicit mode never degrades into another one.
+            Err(managed_error)
+        } else {
+            ensure_rust_toolchain()
+                .map(toolchain::legacy_system_toolchain)
+                .map_err(|legacy_error| {
+                    anyhow::anyhow!("{managed_error}\nLegacy system-Rust fallback also failed: {legacy_error}\nRun `tarvos toolchain install` once for the managed compiler.")
+                })
+        }
+    })?;
+    let rustc = resolved.rustc;
+    println!(
+        "Toolchain: {} ({} {})",
+        resolved.mode.label(),
+        resolved.version,
+        resolved.target
+    );
     let cache_dir = tarvos_cache_dir()?.join("rustc");
     fs::create_dir_all(&cache_dir).with_context(|| {
         format!(
