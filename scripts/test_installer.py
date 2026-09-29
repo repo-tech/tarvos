@@ -125,6 +125,37 @@ def main() -> int:
             "scripts/verify_linux.sh must exercise the managed toolchain",
         )
 
+    # The managed install shells out to the upstream install.sh. Two of its
+    # flags are load-bearing, and both were missing at some point:
+    #
+    #   --profile=minimal   without it the install pulls rust-docs, clippy,
+    #                       rust-analyzer and llvm-tools: gigabytes that no
+    #                       Tarvos build can ever invoke.
+    #   --no-modify-path    without it the upstream script appends a PATH line
+    #                       to the user's ~/.profile or ~/.bashrc, which breaks
+    #                       this toolchain's own promise to touch nothing
+    #                       outside its staging tree.
+    toolchain_src = ROOT / "crates" / "tarvos-cli" / "src" / "toolchain.rs"
+    if not toolchain_src.exists():
+        failures.append("crates/tarvos-cli/src/toolchain.rs is missing")
+    else:
+        tc_text = toolchain_src.read_text(encoding="utf-8")
+        check(
+            '"--profile=minimal"' in tc_text,
+            "toolchain.rs must install the toolchain with --profile=minimal",
+        )
+        check(
+            '"--no-modify-path"' in tc_text,
+            "toolchain.rs must pass --no-modify-path so install.sh cannot edit "
+            "the user's shell profile",
+        )
+        check(
+            '"--profile=minimal"' in tc_text
+            and '"--no-modify-path"' in tc_text
+            and tc_text.index('"--profile=minimal"') < tc_text.index('"--no-modify-path"'),
+            "toolchain flags must be passed in a stable order for testability",
+        )
+
     for failure in failures:
         print(f"[FAIL] {failure}")
     if failures:

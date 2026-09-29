@@ -492,7 +492,13 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
             eprintln!(
                 "Rust native build unavailable; generated Rust remains in the user cache for this invocation."
             );
-            eprintln!("Install Rust or use `tarvos compile <file.py> --source-only` to keep source mode working without a Rust toolchain.");
+            // This message used to say "Install Rust", which is wrong twice
+            // over: the toolchain had already resolved successfully by the
+            // time codegen could fail, so telling the user to install Rust
+            // points at a problem they do not have. Name the toolchain that
+            // actually ran and the real reason instead.
+            eprintln!("The toolchain above did compile; the generated Rust did not.");
+            eprintln!("Use `tarvos compile <file.py> --source-only` to emit Rust without native compilation.");
             Err(err)
         }
     }

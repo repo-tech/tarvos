@@ -68,8 +68,8 @@ impl CompilePipeline {
     /// have produced. That is only sound because the cache key carries the
     /// compiler epoch, so a payload written by a different build is never read.
     pub fn generate_from_cached_ir(ir_json: &str, input_path: &Path) -> Result<String> {
-        let ir: tarvos_ir::Module = serde_json::from_str(ir_json)
-            .context("failed to decode cached IR")?;
+        let ir: tarvos_ir::Module =
+            serde_json::from_str(ir_json).context("failed to decode cached IR")?;
         Ok(Self::finish_from_ir(&ir, input_path)?.rust)
     }
 
@@ -82,7 +82,10 @@ impl CompilePipeline {
         let optimized = Optimizer::optimize(ir)?;
         let rust = RustCodegen::generate(&optimized)
             .with_context(|| format!("failed to generate Rust for {}", input_path.display()))?;
-        Ok(Staged { ir: Self::encode_ir(ir)?, rust })
+        Ok(Staged {
+            ir: Self::encode_ir(ir)?,
+            rust,
+        })
     }
 
     fn canonical_or_original(path: &Path) -> PathBuf {

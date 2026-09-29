@@ -505,6 +505,17 @@ fn install_triple() -> Result<String> {
 ///    after every check passes, so an interrupted or failed install never
 ///    leaves a half-toolchain where the next build would find it.
 fn install_managed() -> Result<()> {
+    // Installing a valid toolchain again would re-download a few hundred
+    // megabytes and re-unpack it for no reason. Verify first and stop.
+    if let Ok(existing) = resolve_managed() {
+        println!(
+            "Managed toolchain already present at {} ({} {}); nothing to do.",
+            existing.rustc.display(),
+            existing.version,
+            existing.target
+        );
+        return Ok(());
+    }
     let triple = install_triple()?;
     // Refuse an unsupported host before a single byte is fetched.
     if !host_supports_install_script() {
@@ -773,9 +784,22 @@ fn run_install_sh(script: &std::path::Path, prefix: &std::path::Path) -> Result<
     }
     #[cfg(not(windows))]
     {
+        // `--profile=minimal` keeps rustc, cargo and the standard library and
+        // drops rust-docs, clippy, rust-analyzer and llvm-tools. Tarvos only
+        // ever drives rustc, so a full-profile install spends gigabytes on
+        // components no build here can reach.
+        //
+        // `--no-modify-path` matters for correctness, not just tidiness: the
+        // upstream script otherwise appends a PATH line to the user's shell
+        // profile. This function is documented as touching nothing outside the
+        // staging tree, so the script must not edit ~/.profile or ~/.bashrc
+        // behind our back. Tarvos resolves the toolchain by absolute path, so
+        // it does not need a PATH entry at all.
         let status = Command::new("sh")
             .arg(script)
             .arg(format!("--prefix={}", prefix.display()))
+            .arg("--profile=minimal")
+            .arg("--no-modify-path")
             .status()
             .with_context(|| format!("failed to run {}", script.display()))?;
         if !status.success() {

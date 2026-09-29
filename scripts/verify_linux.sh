@@ -49,7 +49,10 @@ def classify(n):
     return "positive"
 
 
-values = [classify(n) for n in (-1, 0, 1)]
+# A list, not a tuple: iterating a tuple literal is a separate lowering
+# defect (the generated code calls .into_iter() on a Rust tuple, which is not
+# an IntoIterator) and has nothing to do with the toolchain under test here.
+values = [classify(n) for n in [-1, 0, 1]]
 print(json.dumps(values))
 PY
 
@@ -100,7 +103,11 @@ if [[ "$USE_SYSTEM" -eq 1 ]]; then
   fi
 else
   say "Managed toolchain install"
-  if "$TARBOS" toolchain --install; then
+  # Only when it is genuinely missing: a re-install re-downloads the archive,
+  # and on a shared filesystem that is minutes of work for no new information.
+  if "$TARBOS" toolchain --verify > /dev/null 2>&1; then
+    ok "managed toolchain already present; install not re-run"
+  elif "$TARBOS" toolchain --install; then
     ok "toolchain --install"
   else
     bad "toolchain --install (see the message above)"
