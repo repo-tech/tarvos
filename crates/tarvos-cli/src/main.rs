@@ -194,6 +194,21 @@ enum Commands {
     /// Clean build artifacts, temporary cache files, and intermediate outputs
     Clean,
 
+    /// Manage the Tarvos-owned Rust toolchain (status, install, verify)
+    Toolchain {
+        /// Show resolved toolchain, layout, and per-stage validation
+        #[arg(long)]
+        status: bool,
+
+        /// Fetch the pinned channel into ~/.tarvos/toolchain
+        #[arg(long)]
+        install: bool,
+
+        /// Re-run validation on the managed toolchain and report each check
+        #[arg(long)]
+        verify: bool,
+    },
+
     /// Install Tarvos system-wide into your PATH
     Install,
 
@@ -306,6 +321,11 @@ fn main() -> Result<()> {
             output_dir,
         }) => package_project_mode(&input, entry.as_deref(), output_dir.as_deref()),
         Some(Commands::Clean) => clean_command(&[]),
+        Some(Commands::Toolchain {
+            status,
+            install,
+            verify,
+        }) => toolchain::toolchain_command(status, install, verify),
         Some(Commands::Install) => install_command(&[]),
         Some(Commands::Validate) => validate_command(&[]),
         None => {
