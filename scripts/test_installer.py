@@ -13,6 +13,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 INSTALLER = ROOT / "install.sh"
+LINUX_VERIFY = ROOT / "scripts" / "verify_linux.sh"
 
 # Flags curl accepts. Anything starting with `--` and not listed here is
 # rejected by curl at runtime, which is exactly how the --tl1v1 typo shipped.
@@ -90,11 +91,45 @@ def main() -> int:
         "installer does not check for a Tarvos source tree before building",
     )
 
+    # The Linux acceptance script is shell too, and a CRLF shebang makes bash
+    # refuse the file with an error that looks like a missing interpreter.
+    check(
+        LINUX_VERIFY.is_file(),
+        "scripts/verify_linux.sh is missing",
+    )
+    if LINUX_VERIFY.is_file():
+        raw = LINUX_VERIFY.read_bytes()
+        check(
+            b"\r\n" not in raw,
+            "scripts/verify_linux.sh has CRLF line endings; bash needs LF for the shebang",
+        )
+        check(
+            not raw.startswith(b"\xef\xbb\xbf"),
+            "scripts/verify_linux.sh starts with a UTF-8 BOM; bash cannot match the shebang",
+        )
+        verify_text = raw.decode("utf-8")
+        # The shebang is compared against the raw first line: stripping
+        # comments would strip the shebang too and make this check vacuous.
+        first_line = verify_text.splitlines()[0] if verify_text.splitlines() else ""
+        check(
+            first_line == "#!/usr/bin/env bash",
+            f"scripts/verify_linux.sh needs a bash shebang, found {first_line!r}",
+        )
+        # The acceptance run has to hide Rust from PATH, or it proves nothing.
+        check(
+            'PATH="/usr/bin:/bin"' in verify_text,
+            "scripts/verify_linux.sh must build with rustc absent from PATH",
+        )
+        check(
+            "toolchain --install" in verify_text and "toolchain --verify" in verify_text,
+            "scripts/verify_linux.sh must exercise the managed toolchain",
+        )
+
     for failure in failures:
         print(f"[FAIL] {failure}")
     if failures:
         return 1
-    print("installer checks passed")
+    print("installer and linux-verify checks passed")
     return 0
 
 

@@ -135,6 +135,13 @@ jobs:
         # differential corpus, so it cannot claim coverage that no test proves.
         run: python scripts/compatibility_matrix.py --check
 
+      - name: Check the shipped shell scripts
+        run: python scripts/test_installer.py
+
+      # The acceptance question is "does Tarvos build with no Rust on PATH", and
+      # only a real Linux runner can answer it. It downloads and installs the
+      # managed toolchain, so it is kept out of `quality` and given its own job
+      # with a longer timeout: a cold managed install is minutes, not seconds.
       - name: Upload diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -143,6 +150,53 @@ jobs:
           path: |
             rust-toolchain.toml
             .build-tmp
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Linux-only acceptance: installs the Tarvos-managed toolchain, then rebuilds
+  # with rustc, cargo and rustup removed from PATH. A green run here is the
+  # evidence for "a user installs Tarvos, not Rust"; without it that claim is
+  # only ever tested on a machine that already had Rust.
+  managed-toolchain:
+    name: Managed toolchain acceptance (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.0
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Rust for building the CLI
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+
+      - name: Cache Cargo downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup
+          key: managed-tc-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            managed-tc-${{ runner.os }}-
+
+      - name: Run the Linux acceptance script
+        run: bash scripts/verify_linux.sh
+
+      - name: Upload the acceptance report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: managed-toolchain-report
+          path: .build-tmp/linux-verify
           if-no-files-found: ignore
           retention-days: 7
 
