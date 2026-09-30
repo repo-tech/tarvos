@@ -516,6 +516,57 @@ jobs:
           echo "source repository : ${{ github.repository }}"
           echo "target repository : $DISTRIBUTION_REPO"
 
+      # The distribution repository has its own version line. It is deliberately
+      # NOT the compiler's tag: the compiler ships many release candidates, while
+      # the public distribution is cut when there is something worth publishing.
+      # Mirroring the tag here meant every compiler pre-release appeared to the
+      # user as a product release, which made the public history unreadable.
+      #
+      # The distribution repository owns its version in its own VERSION file, so
+      # bumping the public line is a change in that repository and needs nothing
+      # here. If the file is missing, fall back to the compiler tag rather than
+      # publishing under an empty tag name.
+      - name: Check out the distribution repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DISTRIBUTION_REPO }}
+          ref: main
+          path: distribution
+          token: ${{ secrets.TARVOS_DISTRIBUTION_TOKEN }}
+
+      - name: Resolve the distribution version
+        id: version
+        run: |
+          set -euo pipefail
+          if [ ! -f distribution/VERSION ]; then
+            echo "::warning title=No distribution VERSION file::Falling back to the compiler tag $RELEASE_TAG."
+            echo "engine_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          engine_tag="v$(tr -d '[:space:]' < distribution/VERSION)"
+          case "$engine_tag" in
+            v[0-9]*) ;;
+            *)
+              echo "::error title=Malformed distribution version::distribution/VERSION resolved to '$engine_tag', which is not a version tag."
+              exit 1
+              ;;
+          esac
+          echo "engine_tag=$engine_tag" >> "$GITHUB_OUTPUT"
+          echo "distribution version: $engine_tag (compiler tag: $RELEASE_TAG)"
+
+          # The public release body is the distribution repository's own notes,
+          # not the compiler's. The compiler's notes describe internal milestones
+          # and compiler-only work that someone installing Tarvos never sees.
+          if [ ! -f distribution/RELEASE_NOTES.md ]; then
+            echo "::warning title=No distribution release notes::Falling back to the compiler release body."
+            python scripts/extract_release_notes.py "$RELEASE_TAG" > engine-body.md
+          else
+            python scripts/extract_engine_release_notes.py \
+              --notes distribution/RELEASE_NOTES.md \
+              --version "$engine_tag" > engine-body.md
+          fi
+          echo "engine body prepared: $(wc -l < engine-body.md) lines"
+
       - name: Download production binaries
         uses: actions/download-artifact@v4
         with:
@@ -570,11 +621,18 @@ jobs:
         with:
           repository: ${{ env.DISTRIBUTION_REPO }}
           token: ${{ secrets.TARVOS_DISTRIBUTION_TOKEN }}
-          tag_name: ${{ inputs.release_tag || github.ref_name }}
-          # The body comes from RELEASE_NOTES.md only. Auto-generated notes
-          # would append a second "Full Changelog" block to the hand-written
-          # one, which is the duplicated body seen on the deleted v1.2.0 draft.
-          body_path: release-body.md
+          # The public distribution is versioned independently of the compiler.
+          # Publishing under the compiler's tag made every compiler
+          # release candidate look like a product release to a user browsing this
+          # repository, so the tag comes from the distribution repository's own
+          # VERSION file instead.
+          tag_name: ${{ steps.version.outputs.engine_tag }}
+          # The body comes from the distribution repository's own RELEASE_NOTES.md
+          # section. Auto-generated notes would append a second "Full Changelog"
+          # block to the hand-written one, which is the duplicated body seen on
+          # the deleted v1.2.0 draft.
+          body_path: engine-body.md
+          name: Tarvos Engine ${{ steps.version.outputs.engine_tag }}
           generate_release_notes: false
           files: |
             release-assets/tarvos-windows-x86_64.exe
