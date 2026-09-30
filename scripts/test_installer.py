@@ -125,35 +125,80 @@ def main() -> int:
             "scripts/verify_linux.sh must exercise the managed toolchain",
         )
 
-    # The managed install shells out to the upstream install.sh. Two of its
-    # flags are load-bearing, and both were missing at some point:
+    # The managed install shells out to the upstream install.sh, which accepts
+    # only the flags it documents in --help:
     #
-    #   --profile=minimal   without it the install pulls rust-docs, clippy,
-    #                       rust-analyzer and llvm-tools: gigabytes that no
-    #                       Tarvos build can ever invoke.
-    #   --no-modify-path    without it the upstream script appends a PATH line
-    #                       to the user's ~/.profile or ~/.bashrc, which breaks
-    #                       this toolchain's own promise to touch nothing
-    #                       outside its staging tree.
+    #   --prefix --components --without --bindir --libdir --datadir
+    #   --mandir --docdir --disable-ldconfig --verbose --destdir --sysconfdir
+    #   --uninstall --list-components --disable-verify
+    #
+    # Two of these are load-bearing:
+    #
+    #   --components / --without   a measured install laid down 993 MB of HTML
+    #                               in share/doc, 55% of the toolchain, which
+    #                               rustc and cargo never read.
+    #   (and NOT --no-modify-path)  passing it aborted the install with
+    #                               "Option '--no-modify-path' is not
+    #                               recognized". PATH editing is rustup-init's
+    #                               job, not this script's.
+    KNOWN_INSTALL_SH_FLAGS = {
+        "--uninstall",
+        "--destdir",
+        "--prefix",
+        "--without",
+        "--components",
+        "--list-components",
+        "--sysconfdir",
+        "--bindir",
+        "--libdir",
+        "--datadir",
+        "--mandir",
+        "--docdir",
+        "--disable-ldconfig",
+        "--disable-verify",
+        "--verbose",
+    }
     toolchain_src = ROOT / "crates" / "tarvos-cli" / "src" / "toolchain.rs"
     if not toolchain_src.exists():
         failures.append("crates/tarvos-cli/src/toolchain.rs is missing")
     else:
         tc_text = toolchain_src.read_text(encoding="utf-8")
+        # Only inspect the flags passed to the installer invocation.
+        start = tc_text.find("let components = format!")
+        end = tc_text.find(".status()", start)
+        inv = tc_text[start:end] if start != -1 and end != -1 else ""
+        if not inv:
+            failures.append(
+                "could not locate the install.sh invocation in toolchain.rs; "
+                "the flag checks below would silently pass"
+            )
+        used = set(re.findall(r'\.arg\("(--[a-z0-9-]+)', inv))
+        unknown = used - KNOWN_INSTALL_SH_FLAGS
         check(
-            '"--profile=minimal"' in tc_text,
-            "toolchain.rs must install the toolchain with --profile=minimal",
+            not unknown,
+            f"toolchain.rs passes flags install.sh does not accept: "
+            f"{sorted(unknown)}",
         )
         check(
-            '"--no-modify-path"' in tc_text,
-            "toolchain.rs must pass --no-modify-path so install.sh cannot edit "
-            "the user's shell profile",
+            "rustc,cargo,rust-std-{triple}" in inv,
+            "the component set must be exactly rustc, cargo and the host std",
         )
         check(
-            '"--profile=minimal"' in tc_text
-            and '"--no-modify-path"' in tc_text
-            and tc_text.index('"--profile=minimal"') < tc_text.index('"--no-modify-path"'),
-            "toolchain flags must be passed in a stable order for testability",
+            "--without=rust-docs" in inv,
+            "the documentation trees must be excluded by name; a full install "
+            "left 993 MB of unread HTML in share/doc",
+        )
+        # Look for these only where a flag is genuinely passed, so a comment
+        # explaining the mistake cannot trip the check.
+        passed = set(re.findall(r'\.arg\("(--[a-z0-9-]+)', inv))
+        check(
+            "--no-modify-path" not in passed,
+            "--no-modify-path does not exist in this install.sh and aborts the "
+            "install; PATH editing belongs to rustup-init, not this script",
+        )
+        check(
+            "--profile=minimal" not in passed,
+            "--profile is not a documented flag for this install.sh either",
         )
 
     for failure in failures:

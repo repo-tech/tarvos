@@ -555,7 +555,7 @@ fn install_managed() -> Result<()> {
     // so nothing outside ~/.tarvos is touched.
     let unpacked = staging.join(format!("rust-{PINNED_CHANNEL}-{triple}"));
     let installed = staging.join("installed");
-    run_install_sh(&unpacked.join("install.sh"), &installed)?;
+    run_install_sh(&unpacked.join("install.sh"), &installed, &triple)?;
     let rustc = installed.join("bin").join(exe("rustc"));
     if !rustc.exists() {
         return Err(anyhow::anyhow!(
@@ -774,32 +774,41 @@ fn extract_tar_gz(archive: &std::path::Path, dest: &std::path::Path) -> Result<(
 }
 
 /// Run the static distribution's install.sh with `--prefix` inside our tree.
-fn run_install_sh(script: &std::path::Path, prefix: &std::path::Path) -> Result<()> {
+fn run_install_sh(script: &std::path::Path, prefix: &std::path::Path, triple: &str) -> Result<()> {
     #[cfg(windows)]
     {
-        let _ = (script, prefix);
+        let _ = (script, prefix, triple);
         Err(anyhow::anyhow!(
             "the upstream Windows static distribution has no install.sh; Windows installs ship the managed toolchain inside the Tarvos installer instead"
         ))
     }
     #[cfg(not(windows))]
     {
-        // `--profile=minimal` keeps rustc, cargo and the standard library and
-        // drops rust-docs, clippy, rust-analyzer and llvm-tools. Tarvos only
-        // ever drives rustc, so a full-profile install spends gigabytes on
-        // components no build here can reach.
+        // Use only flags this script actually documents. `install.sh --help`
+        // for the pinned channel lists exactly:
         //
-        // `--no-modify-path` matters for correctness, not just tidiness: the
-        // upstream script otherwise appends a PATH line to the user's shell
-        // profile. This function is documented as touching nothing outside the
-        // staging tree, so the script must not edit ~/.profile or ~/.bashrc
-        // behind our back. Tarvos resolves the toolchain by absolute path, so
-        // it does not need a PATH entry at all.
+        //   --prefix  --components  --without  --bindir  --libdir
+        //   --datadir --mandir --docdir --disable-ldconfig --verbose
+        //
+        // An earlier revision here passed --no-modify-path on the theory that
+        // the script rewrites the user's shell profile. It does not: PATH
+        // editing belongs to rustup-init, a different script that this one
+        // never invokes. Passing the flag only made the install abort with
+        // "Option '--no-modify-path' is not recognized", so the concern was
+        // both unfounded and fatal.
+        //
+        // --components names what Tarvos can drive; --without then removes
+        // the documentation trees by name as well, because a measured install
+        // laid down 993 MB of HTML in share/doc that rustc and cargo never
+        // read. --disable-ldconfig keeps a user-local prefix from poking the
+        // system dynamic-linker cache.
+        let components = format!("rustc,cargo,rust-std-{triple}");
         let status = Command::new("sh")
             .arg(script)
             .arg(format!("--prefix={}", prefix.display()))
-            .arg("--profile=minimal")
-            .arg("--no-modify-path")
+            .arg(format!("--components={components}"))
+            .arg("--without=rust-docs,rust-docs-json-preview,rust-html")
+            .arg("--disable-ldconfig")
             .status()
             .with_context(|| format!("failed to run {}", script.display()))?;
         if !status.success() {
