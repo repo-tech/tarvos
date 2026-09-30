@@ -22,6 +22,53 @@ mod pipeline {
         RustCodegen::generate(&ir).map_err(|e| e.to_string())
     }
 
+    /// A tuple assignment rebinds its targets, so the constant `a = 0` must not
+    /// survive into `return a`.
+    ///
+    /// This is the Fibonacci shape, and it is a real correctness regression: with
+    /// `Destructure` missing from the optimizer's mutation set, copy propagation
+    /// kept the literal and the generated Rust read `return 0_i64`. The program
+    /// still compiled and ran, so nothing but a parity check would have caught
+    /// it. `a, b = 0, 1` on one line happened to work, which is why it survived:
+    /// only the separate `a = 0` then `b = 1` form reproduced it.
+    #[test]
+    fn a_loop_rebinding_through_tuple_assignment_is_not_folded_away() {
+        let ast = r#"{
+            "type": "module",
+            "body": [
+                {"type":"funcdef","name":"fib",
+                 "args":["n"],
+                 "arg_annotations":["int"],
+                 "returns":"int",
+                 "body":[
+                    {"type":"assign","target":{"type":"name","id":"a"},"value":{"type":"int","value":0}},
+                    {"type":"assign","target":{"type":"name","id":"b"},"value":{"type":"int","value":1}},
+                    {"type":"for","target":{"type":"name","id":"i"},
+                     "iter":{"type":"call","function":{"type":"name","id":"range"},
+                             "args":[{"type":"name","id":"n"}],"keywords":[]},
+                     "body":[
+                      {"type":"assign",
+                       "target":{"type":"tuple","elements":[{"type":"name","id":"a"},{"type":"name","id":"b"}]},
+                       "value":{"type":"tuple","elements":[
+                          {"type":"name","id":"b"},
+                          {"type":"binary","left":{"type":"name","id":"a"},"operator":"add","right":{"type":"name","id":"b"}}
+                       ]}}
+                     ]},
+                    {"type":"return","value":{"type":"name","id":"a"}}
+                 ]}
+            ]
+        }"#;
+        let code = compile(ast).expect("tuple assignment in a loop should lower");
+        assert!(
+            code.contains("return a;"),
+            "`return a` must return the variable, not a folded literal:\n{code}"
+        );
+        assert!(
+            !code.contains("return 0_i64;"),
+            "the initial `a = 0` leaked past the tuple assignment that rebinds it:\n{code}"
+        );
+    }
+
     #[test]
     fn numeric_pow_append_len_and_break_lower() {
         let ast = r#"{"type":"module","body":[

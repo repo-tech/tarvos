@@ -41,6 +41,16 @@ CLI start no longer re-proves what the previous command already proved.
 
 ### Fixed
 
+- **Tuple assignment inside a loop returned a stale constant.** Copy propagation
+  tracked `a = 0` and did not learn that `a, b = b, a + b` rebinds both names, so
+  a function ending in `return a` compiled to `return 0_i64`. The native binary
+  ran and produced output, so this was a silently wrong answer rather than a
+  compile error. The Fibonacci loop
+  (`a = 0; b = 1; for ...: a, b = b, a + b; return a`) returned `0` instead of
+  `832040`. Both the optimizer's mutation set and the code generator's
+  assignment check now treat a tuple assignment as a write to every target.
+  Writing the initial values as `a, b = 0, 1` happened to avoid the bug, which
+  is why it went unnoticed.
 - Two `non_fmt_panics` sites in the generated `int()` and `float()` error paths.
   `{value}` inside a plain `panic!` string is not an interpolation in Rust, so
   the literal text was emitted instead of the value. The value is now passed as

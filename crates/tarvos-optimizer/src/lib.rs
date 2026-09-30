@@ -557,6 +557,18 @@ impl Optimizer {
                 Stmt::Assign { name, .. } => {
                     set.insert(name.clone());
                 }
+                // A tuple assignment rebinds every one of its targets, so each has
+                // to be reported as mutated. Leaving it out let copy propagation
+                // keep a stale constant for a variable that a loop had just
+                // reassigned: `a = 0` followed by `a, b = b, a + b` and `return a`
+                // compiled to `return 0_i64`, which is a silently wrong answer
+                // rather than a compile error.
+                Stmt::Destructure { targets, .. } => {
+                    set.extend(targets.iter().cloned());
+                }
+                Stmt::ListAppend { target, .. } => {
+                    set.insert(target.clone());
+                }
                 Stmt::IndexAssign { target, .. } => {
                     set.insert(target.clone());
                 }
@@ -1656,6 +1668,104 @@ mod tests {
     use super::*;
     use tarvos_ir::{BinaryOp, Module, Stmt, Value};
     use tarvos_types::Type;
+
+    /// A tuple assignment rebinds its targets, so copy propagation must forget
+    /// any constant it had learned about them.
+    ///
+    /// This is the Fibonacci shape: `a` is initialised to a literal, a loop then
+    /// rebinds it through `a, b = b, a + b`, and the function returns `a`. When
+    /// `Destructure` was missing from the mutation set, the literal survived the
+    /// loop and the generated Rust read `return 0_i64` — a silently wrong answer
+    /// that still compiled and ran, which is the failure mode this guards.
+    #[test]
+    fn a_tuple_assignment_invalidates_a_propagated_constant() {
+        let module = Module {
+            statements: vec![Stmt::Function {
+                name: "fib".into(),
+                params: vec![("n".into(), Type::Int)],
+                return_type: Type::Int,
+                body: vec![
+                    Stmt::Let {
+                        name: "a".into(),
+                        ty: Type::Int,
+                        value: Value::Int(0),
+                    },
+                    Stmt::Let {
+                        name: "b".into(),
+                        ty: Type::Int,
+                        value: Value::Int(1),
+                    },
+                    Stmt::For {
+                        target: "_".into(),
+                        iter: Value::Call {
+                            function: "range".into(),
+                            args: vec![Value::Name("n".into())],
+                            return_type: Type::Array(Box::new(Type::Int)),
+                        },
+                        iter_type: Type::Array(Box::new(Type::Int)),
+                        body: vec![Stmt::Destructure {
+                            targets: vec!["a".into(), "b".into()],
+                            value: Value::Tuple {
+                                elements: vec![
+                                    Value::Name("b".into()),
+                                    Value::Binary {
+                                        left: Box::new(Value::Name("a".into())),
+                                        op: BinaryOp::Add,
+                                        right: Box::new(Value::Name("b".into())),
+                                        ty: Type::Int,
+                                    },
+                                ],
+                                element_types: vec![Type::Int, Type::Int],
+                            },
+                        }],
+                    },
+                    Stmt::Return(Some(Value::Name("a".into()))),
+                ],
+            }],
+        };
+
+        let optimized = Optimizer::copy_propagation(&module).unwrap();
+        let Stmt::Function { body, .. } = &optimized.statements[0] else {
+            panic!("expected a function, got {:?}", optimized.statements[0]);
+        };
+        assert!(
+            matches!(body.last(), Some(Stmt::Return(Some(Value::Name(name)))) if name == "a"),
+            "`return a` must stay a name, not a folded constant: {:?}",
+            body.last()
+        );
+    }
+
+    /// The same reasoning for the direct block case, without a function or loop.
+    #[test]
+    fn a_tuple_assignment_clears_the_constant_in_its_own_block() {
+        let module = Module {
+            statements: vec![
+                Stmt::Let {
+                    name: "a".into(),
+                    ty: Type::Int,
+                    value: Value::Int(0),
+                },
+                Stmt::Destructure {
+                    targets: vec!["a".into()],
+                    value: Value::Tuple {
+                        elements: vec![Value::Int(7)],
+                        element_types: vec![Type::Int],
+                    },
+                },
+                Stmt::Return(Some(Value::Name("a".into()))),
+            ],
+        };
+
+        let optimized = Optimizer::copy_propagation(&module).unwrap();
+        assert!(
+            matches!(
+                optimized.statements.last(),
+                Some(Stmt::Return(Some(Value::Name(name)))) if name == "a"
+            ),
+            "a rebinding must stop the earlier constant from being propagated: {:?}",
+            optimized.statements.last()
+        );
+    }
 
     #[test]
     fn removes_unused_literal_assignments() {

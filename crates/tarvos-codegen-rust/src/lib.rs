@@ -2493,6 +2493,14 @@ impl RustCodegen {
     fn contains_assignment_to(stmts: &[Stmt], target: &str) -> bool {
         stmts.iter().any(|stmt| match stmt {
             Stmt::Assign { name, .. } => name == target,
+            Stmt::Destructure { targets, .. } => targets.iter().any(|name| name == target),
+            // A tuple assignment rebinds its targets just as a plain assignment
+            // does, so `a, b = ...` counts as a write to `a`. Missing this let a
+            // variable that is only ever rebound by tuple assignment look
+            // unassigned, and it was then hoisted with a zero initializer.
+            Stmt::Destructure { targets, .. } => targets.iter().any(|name| name == target),
+            Stmt::IndexAssign { target: name, .. } => name == target,
+            Stmt::ListAppend { target: name, .. } => name == target,
             Stmt::If { body, orelse, .. } => {
                 Self::contains_assignment_to(body, target)
                     || Self::contains_assignment_to(orelse, target)
