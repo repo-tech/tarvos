@@ -2602,7 +2602,6 @@ impl RustCodegen {
     fn contains_assignment_to(stmts: &[Stmt], target: &str) -> bool {
         stmts.iter().any(|stmt| match stmt {
             Stmt::Assign { name, .. } => name == target,
-            Stmt::Destructure { targets, .. } => targets.iter().any(|name| name == target),
             // A tuple assignment rebinds its targets just as a plain assignment
             // does, so `a, b = ...` counts as a write to `a`. Missing this let a
             // variable that is only ever rebound by tuple assignment look

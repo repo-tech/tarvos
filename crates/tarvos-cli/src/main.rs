@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use std::{
     env, fs,
     hash::{Hash, Hasher},
@@ -24,25 +24,253 @@ use tarvos_core::{
 };
 use tarvos_parser::parse_python_ast;
 
+/// Long description shown by `tarvos --help`.
+const LONG_ABOUT: &str = "\
+Tarvos transpiles a statically analyzable subset of Python into optimized Rust
+and compiles it into a single native executable. The produced binary is a
+standalone program: it does not embed CPython and does not require pyo3 or a
+Python installation at run time.
+
+Tarvos aims at a measurable subset of Python, not full CPython compatibility.
+Run `tarvos doctor` to verify your toolchain, and `tarvos analyze <file.py>` to
+see which functions a given module can accelerate before you compile it.
+
+Quick start:
+  tarvos doctor                       Check Python, Rust, Cargo, and linker
+  tarvos build hello.py -o hello      Transpile and build a native executable
+  tarvos run hello.py arg1 arg2       Build, then run it in one step
+  tarvos benchmark kernel.py          Measure Python vs native with fairness
+                                      checks
+  tarvos validate                     Run the reference output test suite
+
+Docs and examples: https://github.com/repo-tech/tarvos-engine
+Benchmarks and compatibility notes are published with every engine release.";
+
+/// Trailing section shown after the option list in `tarvos --help`.
+const AFTER_HELP: &str = "\
+Environment:
+  RUSTC                    Path to the rustc used by `build` and `compile`
+  TARVOS_STRICT_RUST_PIN   Set to 1 to fail instead of using a loose system Rust
+  TARVOS_OLLAMA_ENDPOINT   Loopback endpoint read by `tarvos ai-status`
+                           (default http://127.0.0.1:11434)
+  TARVOS_SANDBOX           Restricts commands to a sandboxed working area
+
+Exit status:
+  0  success
+  1  compilation, toolchain, or runtime failure
+  2  invalid command-line usage
+
+Examples:
+  tarvos compile main.py --format exe -o app.exe
+  tarvos build main.py -o app --system-rust
+  tarvos run main.py -- --verbose input.csv
+  tarvos run main.py --python-fallback
+  tarvos analyze src/ --hot-functions
+  tarvos package ./myproject --entry main.py -o ./dist
+  tarvos export main.py ./tarvos-export
+  tarvos init my-app";
+
+const COMPILE_HELP: &str = "\
+Compile Python code to optimized Rust source or binary.
+
+Runs the full front end: Python AST export, parsing, type checking and IR
+lowering, optimization, then Rust code generation.
+
+With `--format rust` (the default) Tarvos writes Rust source and stops there,
+so no Rust toolchain is required. With `--format exe` it invokes rustc
+afterwards to produce a native executable.
+
+When a module uses dynamic constructs outside the native subset, Tarvos reports
+why and emits a compatibility launcher that delegates to Python at run time
+instead of failing the build.
+
+Examples:
+  tarvos compile app.py
+  tarvos compile app.py -o src/main.rs
+  tarvos compile app.py --format exe -o app.exe
+  tarvos compile app.py --target embedded";
+
+const BUILD_HELP: &str = "\
+Build a native binary executable directly from Python.
+
+Transpiles the module and links it into a standalone executable in one step. The
+resulting binary embeds no Python interpreter, so it can be shipped to a machine
+with no Python installed.
+
+Tarvos uses the managed toolchain in ~/.tarvos/toolchain by default. Use
+`--system-rust` to opt into an already validated system Rust.
+
+Examples:
+  tarvos build app.py
+  tarvos build app.py -o dist/app
+  tarvos build app.py --system-rust
+  tarvos build app.py --source-only";
+
+const RUN_HELP: &str = "\
+Transpile, build, and run a Python file in one seamless step.
+
+Attempts a native build first and executes the resulting binary. If the module
+relies on dynamic behaviour that the native subset cannot express, Tarvos reports
+the reason and transparently falls back to the local Python runtime so the
+program still runs.
+
+Use `--python-fallback` to skip the native attempt entirely, which helps isolate
+whether a slowdown comes from the transpiler or from the original code.
+Arguments after the script name are forwarded to the program; use `--` to stop
+Tarvos option parsing.
+
+Examples:
+  tarvos run app.py
+  tarvos run app.py input.csv
+  tarvos run app.py -- --verbose input.csv
+  tarvos run app.py --python-fallback";
+
+const PYTHON_HELP: &str = "\
+Execute any Python program through the local Python runtime.
+
+Always uses CPython and never invokes the transpiler, which makes this the
+reference path for checking Tarvos output against the original program.
+
+Examples:
+  tarvos python app.py
+  tarvos python app.py --verbose data.json";
+
+const DOCTOR_HELP: &str = "\
+Run environment diagnostics and check toolchain dependencies.
+
+Reports the resolved path and version of every component Tarvos depends on, and
+explains what to install or fix when something is missing. Run this first
+whenever a build fails.
+
+Example:
+  tarvos doctor";
+
+const ANALYZE_HELP: &str = "\
+Static analysis and complexity profiling of a Python module.
+
+Reports per-function complexity and the constructs Tarvos can lower to native
+code. With `--hot-functions` it ranks the functions worth accelerating first.
+
+Accepts either a single file or a project directory.
+
+Examples:
+  tarvos analyze app.py
+  tarvos analyze ./src --hot-functions";
+
+const SCAN_HELP: &str = "\
+Scan a Python project for library-backed hot loops and native plans.
+
+Walks a project directory, finds loops that call into supported libraries, and
+proposes a native plan for each one. This is the fastest way to find out whether
+a project is a good candidate for Tarvos.
+
+Example:
+  tarvos scan ./myproject";
+
+const BENCHMARK_HELP: &str = "\
+Benchmark Python vs Tarvos (Native Rust) with fairness metrics.
+
+Compiles the workload both ways, compares their output for equality, then reports
+median and per-iteration timings. Workloads are run without constant folding so
+the comparison reflects real work.
+
+Pass a reference .rs file to benchmark hand-written Rust alongside Python and
+Tarvos.
+
+Examples:
+  tarvos benchmark kernel.py
+  tarvos benchmark kernel.py reference.rs";
+
+const INIT_HELP: &str = "\
+Initialize a new Tarvos project template.
+
+Creates a ready to build project skeleton in a new directory.
+
+Example:
+  tarvos init my-app";
+
+const EXPORT_HELP: &str = "\
+Export Python code as a complete standalone Cargo Rust project.
+
+Writes a self-contained Cargo project you can open, edit, and build with plain
+cargo. Useful when you want to inspect or hand-tune the generated Rust before
+shipping a binary.
+
+Examples:
+  tarvos export app.py
+  tarvos export app.py ./my-export";
+
+const PACKAGE_HELP: &str = "\
+Convert a Python file or project folder into a Cargo release project and binary.
+
+Like `export`, but also runs a release cargo build, so the command ends with a
+ready to distribute optimized binary. When the input is a directory, point at the
+entry point with `--entry`.
+
+Examples:
+  tarvos package app.py
+  tarvos package ./myproject --entry main.py
+  tarvos package app.py -o ./dist";
+
+const CLEAN_HELP: &str = "\
+Clean build artifacts, temporary cache files, and intermediate outputs.
+
+Removes generated Rust, staged Cargo projects, and Tarvos cache directories.
+Source files are never touched.
+
+Example:
+  tarvos clean";
+
+const TOOLCHAIN_HELP: &str = "\
+Manage the Tarvos-owned Rust toolchain (status, install, verify).
+
+Tarvos pins its own Rust channel under ~/.tarvos/toolchain so native builds are
+reproducible regardless of the system Rust version.
+
+Examples:
+  tarvos toolchain --status
+  tarvos toolchain --install
+  tarvos toolchain --verify";
+
+const INSTALL_HELP: &str = "\
+Install Tarvos system-wide into your PATH.
+
+Copies the tarvos executable into a directory already on your PATH and tells you
+if a shell restart is needed.
+
+Example:
+  tarvos install";
+
+const VALIDATE_HELP: &str = "\
+Validate Tarvos output against reference test suite.
+
+Compiles every workload in the reference suite and diffs the program output
+against the recorded expected values, so a regression shows up before it reaches
+a release.
+
+Example:
+  tarvos validate";
+
 /// Tarvos — Ultra-fast Python to Native Rust Transpiler & Compiler
 #[derive(Parser, Debug)]
 #[command(name = "tarvos", disable_version_flag = true)]
 #[command(author = "Himanshu & Repo-Tech Team")]
 #[command(version = "1.1.0-rc.6")]
-#[command(about = "Transpiles and compiles Python code to native high-performance Rust executables", long_about = None)]
+#[command(about = "Transpiles and compiles Python code to native high-performance Rust executables", long_about = LONG_ABOUT, after_help = AFTER_HELP, after_long_help = AFTER_HELP)]
 struct Cli {
-    /// Print the Tarvos version.
+    /// Print the Tarvos version and exit
     #[arg(short = 'v', long = "version", action = ArgAction::SetTrue)]
     version: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Direct input Python file when no subcommand is specified
+    /// Direct input Python file when no subcommand is specified.
+    /// Shorthand for `tarvos compile <FILE.py>`.
     #[arg(value_name = "INPUT.py")]
     input: Option<PathBuf>,
 
-    /// Output path when running in direct mode
+    /// Output path when running in direct mode (defaults to output.rs)
     #[arg(short, long, value_name = "OUTPUT")]
     output: Option<PathBuf>,
 }
@@ -50,6 +278,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Compile Python code to optimized Rust source or binary
+    #[command(long_about = COMPILE_HELP)]
     Compile {
         /// Input Python file (.py)
         #[arg(value_name = "FILE.py")]
@@ -73,6 +302,7 @@ enum Commands {
     },
 
     /// Build a native binary executable directly from Python
+    #[command(long_about = BUILD_HELP)]
     Build {
         /// Input Python file (.py)
         #[arg(value_name = "FILE.py")]
@@ -92,6 +322,7 @@ enum Commands {
     },
 
     /// Transpile, build, and run a Python file in one seamless step
+    #[command(long_about = RUN_HELP)]
     Run {
         /// Input Python file (.py)
         #[arg(value_name = "FILE.py")]
@@ -107,6 +338,7 @@ enum Commands {
     },
 
     /// Execute any Python program through the local Python runtime
+    #[command(long_about = PYTHON_HELP)]
     Python {
         /// Input Python file (.py)
         #[arg(value_name = "FILE.py")]
@@ -118,6 +350,7 @@ enum Commands {
     },
 
     /// Run environment diagnostics and check toolchain dependencies (Python, Rust, Cargo, Linker)
+    #[command(long_about = DOCTOR_HELP)]
     Doctor,
 
     /// Report the optional local AI capability (Ollama).
@@ -132,6 +365,7 @@ enum Commands {
     },
 
     /// Static analysis and complexity profiling of a Python module
+    #[command(long_about = ANALYZE_HELP)]
     Analyze {
         /// Input Python file (.py) or a project directory
         #[arg(value_name = "INPUT")]
@@ -143,12 +377,14 @@ enum Commands {
     },
 
     /// Scan a Python project for library-backed hot loops and native plans
+    #[command(long_about = SCAN_HELP)]
     Scan {
         /// Project directory or Python file to inspect
         input: PathBuf,
     },
 
     /// Benchmark Python vs Tarvos (Native Rust) with fairness metrics
+    #[command(long_about = BENCHMARK_HELP)]
     Benchmark {
         /// Input Python file (.py)
         #[arg(value_name = "FILE.py")]
@@ -160,6 +396,7 @@ enum Commands {
     },
 
     /// Initialize a new Tarvos project template
+    #[command(long_about = INIT_HELP)]
     Init {
         /// Project directory name
         #[arg(default_value = "tarvos-app")]
@@ -167,6 +404,7 @@ enum Commands {
     },
 
     /// Export Python code as a complete standalone Cargo Rust project
+    #[command(long_about = EXPORT_HELP)]
     Export {
         /// Input Python file (.py)
         #[arg(value_name = "FILE.py")]
@@ -178,6 +416,7 @@ enum Commands {
     },
 
     /// Convert a Python file or project folder into a Cargo release project and binary
+    #[command(long_about = PACKAGE_HELP)]
     Package {
         /// Python file or project directory
         input: PathBuf,
@@ -192,9 +431,11 @@ enum Commands {
     },
 
     /// Clean build artifacts, temporary cache files, and intermediate outputs
+    #[command(long_about = CLEAN_HELP)]
     Clean,
 
     /// Manage the Tarvos-owned Rust toolchain (status, install, verify)
+    #[command(long_about = TOOLCHAIN_HELP)]
     Toolchain {
         /// Show resolved toolchain, layout, and per-stage validation
         #[arg(long)]
@@ -210,9 +451,11 @@ enum Commands {
     },
 
     /// Install Tarvos system-wide into your PATH
+    #[command(long_about = INSTALL_HELP)]
     Install,
 
     /// Validate Tarvos output against reference test suite
+    #[command(long_about = VALIDATE_HELP)]
     Validate,
 }
 
@@ -1990,45 +2233,12 @@ fn resolve_readable_path(input: &str, base_dir: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+/// Print the full help, identical to `tarvos --help`.
+///
+/// Rendered from the same clap definition as the flag, so the bare invocation
+/// can never drift from the documented one.
 fn print_help() {
-    eprintln!("Tarvos - Python to Rust compiler");
-    eprintln!();
-    eprintln!("Usage:");
-    eprintln!("  tarvos <file.py> [output.rs]");
-    eprintln!("  tarvos compile <file.py> [output.rs]");
-    eprintln!("  tarvos build <file.py> [output.exe]");
-    eprintln!("  tarvos run <file.py> [args...]");
-    eprintln!("  tarvos run <file.py> [--compat-runtime] [args...]");
-    eprintln!("  tarvos python <file.py> [args...]");
-    eprintln!("  tarvos analyze <file.py>");
-    eprintln!("  tarvos benchmark <file.py> [reference.rs]");
-    eprintln!("  tarvos doctor");
-    eprintln!("  tarvos --help");
-    eprintln!();
-    eprintln!("Native output notes:");
-    eprintln!(
-        "  - `compile` emits Rust source and can optionally build an EXE via `--format exe`."
-    );
-    eprintln!("  - `build` directly emits a native executable when a Rust toolchain is available.");
-    eprintln!("  - `run` transpiles, builds, and executes the program in one command.");
-    eprintln!(
-        "  - `run` automatically tries native compilation and falls back to Python for unsupported dynamic code."
-    );
-    eprintln!("  - generated native executables do not embed Python or require pyo3.");
-    eprintln!("  - `python` executes any Python program through the local CPython runtime.");
-    eprintln!("  - Rust remains optional for source emission; developers can still use `tarvos compile` without final native build.");
-    eprintln!();
-    eprintln!("Supported subset:");
-    eprintln!("  - integers, floats, bools, strings, None");
-    eprintln!("  - arithmetic and comparisons");
-    eprintln!("  - print(), if/else, while, for range(...) loops");
-    eprintln!("  - simple function definitions and typed annotations");
-    eprintln!();
-    eprintln!("Example:");
-    eprintln!("  def add(a: int, b: int) -> int:");
-    eprintln!("      return a + b");
-    eprintln!();
-    eprintln!("Note: Tarvos targets a statically analyzable subset of Python, not full Python compatibility.");
+    eprint!("{}", Cli::command().render_long_help());
 }
 
 fn find_rustc_command() -> Option<PathBuf> {
