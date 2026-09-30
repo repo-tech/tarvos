@@ -12,5 +12,6 @@
   "nested_loops.py": "2025",
   "recursion.py": "3628800",
   "string_dict_ops.py": "35",
-  "tuple_swap_loop.py": "832040"
+  "tuple_swap_loop.py": "832040",
+  "guarded_division.py": "5\n-1\n-4\n5.0\n-1.0"
 }

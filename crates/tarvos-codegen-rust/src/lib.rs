@@ -981,6 +981,85 @@ pub fn __tarvos_uncaught(error: &__TarvosError) -> ! {
     std::process::exit(1);
 }
 
+/// Python's `/` on integers.
+///
+/// `checked_div` returns `None` for both a zero divisor and an overflowing
+/// quotient, so the two are separated here: CPython raises `ZeroDivisionError`
+/// for the first and `OverflowError` for the second.
+#[inline(always)]
+fn __tarvos_div_i64(a: i64, b: i64) -> __TarvosResult<i64> {
+    match a.checked_div(b) {
+        Some(value) => Ok(value),
+        None if b == 0 => Err(__TarvosError::new(
+            "ZeroDivisionError",
+            "integer division or modulo by zero",
+        )),
+        None => Err(__TarvosError::new(
+            "OverflowError",
+            "integer division result too large",
+        )),
+    }
+}
+
+/// Python's `//` on integers: floors toward negative infinity, where Rust's `/`
+/// truncates toward zero.
+#[inline(always)]
+fn __tarvos_floor_div_i64(a: i64, b: i64) -> __TarvosResult<i64> {
+    let quotient = match a.checked_div(b) {
+        Some(value) => value,
+        None if b == 0 => {
+            return Err(__TarvosError::new(
+                "ZeroDivisionError",
+                "integer division or modulo by zero",
+            ))
+        }
+        None => {
+            return Err(__TarvosError::new(
+                "OverflowError",
+                "integer division result too large",
+            ))
+        }
+    };
+    let remainder = match a.checked_rem(b) {
+        Some(value) => value,
+        None => {
+            return Err(__TarvosError::new(
+                "OverflowError",
+                "integer division result too large",
+            ))
+        }
+    };
+    Ok(if remainder != 0 && ((remainder < 0) != (b < 0)) {
+        quotient - 1
+    } else {
+        quotient
+    })
+}
+
+/// Python's `/` on floats, which raises rather than producing an infinity.
+#[inline(always)]
+fn __tarvos_div_f64(a: f64, b: f64) -> __TarvosResult<f64> {
+    if b == 0.0 {
+        return Err(__TarvosError::new(
+            "ZeroDivisionError",
+            "float division by zero",
+        ));
+    }
+    Ok(a / b)
+}
+
+/// Python's `//` on floats.
+#[inline(always)]
+fn __tarvos_floor_div_f64(a: f64, b: f64) -> __TarvosResult<f64> {
+    if b == 0.0 {
+        return Err(__TarvosError::new(
+            "ZeroDivisionError",
+            "float floor division by zero",
+        ));
+    }
+    Ok((a / b).floor())
+}
+
 /// Whether a `try` body ran to completion, which decides if `else` runs.
 /// A body that left through `return` did not, so `else` is skipped for it.
 #[derive(Clone, Copy, PartialEq)]
@@ -3110,6 +3189,28 @@ impl RustCodegen {
         }
     }
 
+    /// Route an operation that can fail to the innermost `try`, when there is one.
+    ///
+    /// Python raises instead of trapping: `1 / 0` is an exception, not a trap and
+    /// not a sentinel value. The previous lowering called `.expect(...)` or
+    /// `panic!`, which aborted the native process, so an enclosing
+    /// `except ZeroDivisionError` never ran and the program died instead of
+    /// recovering. With a `try` in scope the failure travels as a `Result` and
+    /// jumps to the handler, matching the way a call to a fallible function
+    /// already propagates.
+    ///
+    /// Without a `try` there is nothing to catch, so the expression stays a
+    /// panic: that is the honest rendering of an uncaught exception and keeps the
+    /// no-handler path from growing a `Result` it would immediately discard.
+    fn raise_aware(ctx: &EmitCtx, checked: &str, panicking: &str) -> String {
+        match ctx.try_stack.last().cloned() {
+            Some((label, error_var)) => format!(
+                "match {checked} {{ Ok(__tarvos_v) => __tarvos_v, Err(__tarvos_e) => {{ {error_var} = Some(__tarvos_e); break '{label}; }} }}"
+            ),
+            None => panicking.to_string(),
+        }
+    }
+
     fn emit_value(value: &Value, ctx: &EmitCtx) -> Result<String> {
         Ok(match value {
             Value::Int(v) => format!("{}_i64", v),
@@ -3171,9 +3272,13 @@ impl RustCodegen {
                     return Ok(format!("({}).repeat(({} as usize))", sequence, count));
                 }
                 if *op == BinaryOp::Div && *ty == Type::Int {
-                    return Ok(format!(
-                        "{}.checked_div({}).expect(\"ZeroDivisionError\")",
-                        left_str, right_str
+                    return Ok(Self::raise_aware(
+                        ctx,
+                        &format!("__tarvos_div_i64({}, {})", left_str, right_str),
+                        &format!(
+                            "{}.checked_div({}).expect(\"ZeroDivisionError\")",
+                            left_str, right_str
+                        ),
                     ));
                 }
                 if *op == BinaryOp::Div
@@ -3181,15 +3286,49 @@ impl RustCodegen {
                     && matches!(left.as_ref(), Value::Int(_))
                     && matches!(right.as_ref(), Value::Int(_))
                 {
-                    return Ok(format!(
-                        "if {} == 0_i64 {{ panic!(\"ZeroDivisionError\") }} else {{ ({} as f64) / ({} as f64) }}",
-                        right_str, left_str, right_str
+                    return Ok(Self::raise_aware(
+                        ctx,
+                        &format!("__tarvos_div_f64({} as f64, {} as f64)", left_str, right_str),
+                        &format!(
+                            "if {} == 0_i64 {{ panic!(\"ZeroDivisionError\") }} else {{ ({} as f64) / ({} as f64) }}",
+                            right_str, left_str, right_str
+                        ),
+                    ));
+                }
+                // Float `/` where the operands are not both literals. Without this
+                // the generic operator table emits a bare `a / b`, and a zero
+                // divisor silently produces an infinity instead of raising, so an
+                // `except ZeroDivisionError` never runs.
+                if *op == BinaryOp::Div && *ty == Type::Float {
+                    // Python's `/` is true division, so integer operands are
+                    // promoted. The cast is applied unconditionally because an
+                    // `as f64` on a value that is already `f64` is a no-op, and
+                    // without it an `i64` operand is passed where `f64` is
+                    // expected.
+                    return Ok(Self::raise_aware(
+                        ctx,
+                        &format!(
+                            "__tarvos_div_f64({} as f64, {} as f64)",
+                            left_str, right_str
+                        ),
+                        &format!(
+                            "{{ if {} == 0.0_f64 {{ panic!(\"ZeroDivisionError: float division\") }} else {{ ({} as f64) / ({} as f64) }} }}",
+                            right_str, left_str, right_str
+                        ),
                     ));
                 }
                 if *op == BinaryOp::FloorDiv && *ty == Type::Int {
                     // Python `//` floors toward negative infinity; Rust `/` truncates.
-                    return Ok(format!(
-                        "{{ let __tarvos_dividend = {left_str}; let __tarvos_divisor = {right_str}; if __tarvos_divisor == 0_i64 {{ panic!(\"ZeroDivisionError: integer division or modulo by zero\") }} let __tarvos_quotient = __tarvos_dividend.checked_div(__tarvos_divisor).expect(\"integer division overflow\"); let __tarvos_remainder = __tarvos_dividend.checked_rem(__tarvos_divisor).expect(\"integer division overflow\"); if __tarvos_remainder != 0_i64 && ((__tarvos_remainder < 0_i64) != (__tarvos_divisor < 0_i64)) {{ __tarvos_quotient - 1_i64 }} else {{ __tarvos_quotient }} }}"
+                    // Python `//` floors toward negative infinity; Rust `/` truncates.
+                    return Ok(Self::raise_aware(
+                        ctx,
+                        &format!(
+                            "__tarvos_floor_div_i64({}, {})",
+                            left_str, right_str
+                        ),
+                        &format!(
+                            "{{ let __tarvos_dividend = {left_str}; let __tarvos_divisor = {right_str}; if __tarvos_divisor == 0_i64 {{ panic!(\"ZeroDivisionError: integer division or modulo by zero\") }} let __tarvos_quotient = __tarvos_dividend.checked_div(__tarvos_divisor).expect(\"integer division overflow\"); let __tarvos_remainder = __tarvos_dividend.checked_rem(__tarvos_divisor).expect(\"integer division overflow\"); if __tarvos_remainder != 0_i64 && ((__tarvos_remainder < 0_i64) != (__tarvos_divisor < 0_i64)) {{ __tarvos_quotient - 1_i64 }} else {{ __tarvos_quotient }} }}"
+                        ),
                     ));
                 }
                 if *op == BinaryOp::FloorDiv && *ty == Type::Float {
@@ -3203,7 +3342,17 @@ impl RustCodegen {
                     } else {
                         right_str
                     };
-                    return Ok(format!("({} / {}).floor()", left_str, right_str));
+                    return Ok(Self::raise_aware(
+                        ctx,
+                        &format!(
+                            "__tarvos_floor_div_f64({}, {})",
+                            left_str, right_str
+                        ),
+                        // Without the guard this is `(a / b).floor()`, which
+                        // yields an infinity for a zero divisor. CPython raises,
+                        // so the no-handler path keeps an explicit failure.
+                        &format!("{{ if {} == 0.0_f64 {{ panic!(\"ZeroDivisionError: float floor division\") }} else {{ ({} / {}).floor() }} }}", right_str, left_str, right_str),
+                    ));
                 }
                 if *op == BinaryOp::LShift || *op == BinaryOp::RShift {
                     // Python shifts by a negative count raise ValueError. Counts larger

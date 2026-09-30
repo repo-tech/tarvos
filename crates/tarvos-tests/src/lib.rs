@@ -469,6 +469,55 @@ mod pipeline {
     // Typed function definition and call
     // Python: def add(a: int, b: int) -> int: return a + b; print(add(5, 7))
     // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    /// A zero divisor must reach the `except` handler instead of aborting.
+    ///
+    /// Division used to be lowered to `.checked_div(..).expect("ZeroDivisionError")`
+    /// and `panic!("ZeroDivisionError")`. Both kill the process, so an enclosing
+    /// handler never ran and `except ZeroDivisionError` was unreachable. Float
+    /// `/` was worse: it emitted a bare `a / b`, so a zero divisor produced
+    /// `inf` and the program carried on with a wrong number.
+    #[test]
+    fn a_zero_divisor_reaches_the_handler_instead_of_aborting() {
+        let ast = r#"{
+            "type": "module",
+            "body": [
+                {"type":"funcdef","name":"safe",
+                 "args":["a","b"],
+                 "arg_annotations":["int","int"],
+                 "returns":"int",
+                 "body":[
+                    {"type":"try",
+                     "body":[
+                       {"type":"return","value":
+                        {"type":"binary","left":{"type":"name","id":"a"},
+                         "operator":"floordiv","right":{"type":"name","id":"b"}}}
+                     ],
+                     "handlers":[
+                       {"exc_type":{"type":"name","id":"ZeroDivisionError"},
+                        "name":null,
+                        "body":[{"type":"return","value":{"type":"int","value":-1}}]}
+                     ],
+                     "orelse":[],
+                     "finalbody":[]}
+                 ]}
+            ]
+        }"#;
+
+        let code = compile(ast).expect("a guarded division should lower");
+        assert!(
+            code.contains("__tarvos_floor_div_i64"),
+            "the division must go through the checking helper:\n{code}"
+        );
+        assert!(
+            !code.contains("panic!(\"ZeroDivisionError"),
+            "the guarded path must not abort the process:\n{code}"
+        );
+        assert!(
+            code.contains("__tarvos_error1 = Some(__tarvos_e)"),
+            "the failure must be handed to the enclosing try:\n{code}"
+        );
+    }
+
     /// A `return` inside an `except` handler must not be lowered to a `break`
     /// aimed at the `try`'s own label.
     ///

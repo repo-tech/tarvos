@@ -14,6 +14,21 @@ missing.
 
 ### Fixed
 
+- **A zero divisor aborted the process instead of raising a catchable error.**
+  Division was lowered to `.checked_div(..).expect("ZeroDivisionError")` for
+  integers and to `panic!("ZeroDivisionError")` for floats. Both kill the
+  process, so an enclosing `except ZeroDivisionError` never ran: a program
+  written to recover from division by zero instead died.
+
+  Float `/` was worse than a crash. It emitted a bare `a / b`, so a zero divisor
+  produced `inf` and the program carried on with a silently wrong number. Float
+  `//` had no zero check at all and did the same.
+
+  Division now goes through checking helpers that report failure as a
+  `Result`. Inside a `try`, the failure jumps to the handler the same way a call
+  to a fallible function already did; with no handler the program still fails
+  loudly. A zero divisor now matches CPython for `//`, `/` on integers, `/` on
+  floats, and `//` on floats.
 - **A `return` inside an `except` handler produced Rust that did not compile.**
   The `try` body is lowered to a labelled block so a `return` inside it can
   `break` out after `finally` runs. That block has already been closed by the
