@@ -1,3 +1,149 @@
+# Tarvos 1.1.0-rc.5
+
+## Summary
+
+`1.1.0-rc.5` is the **managed toolchain** release candidate. Its headline is that
+**you no longer need Rust installed to use Tarvos.** A normal `tarvos build` or
+`tarvos run` resolves a Tarvos-managed compiler that Tarvos downloads and
+verifies itself; system Rust is now consulted only when you explicitly ask for it
+with `--system-rust`.
+
+The second change is startup latency. Every `build`, `run`, and `verify` used to
+re-link a throwaway probe program just to re-learn what the previous invocation
+already knew, and that subprocess is what made the CLI feel slow. A verified
+compiler is now recorded once and re-used.
+
+This is a **pre-release**. The supported-subset contract has not widened; read
+[Python Compatibility](#python-compatibility) before assuming a feature is
+available.
+
+## Highlights
+
+- **Managed toolchain, no system Rust required.** `tarvos toolchain install`
+  fetches the pinned channel into `~/.tarvos/toolchain` and verifies its SHA-256.
+  Nothing silently falls back from managed to system: the mode is explicit and
+  labelled on every build.
+- **Explicit toolchain resolution.** Managed and system are separate paths that
+  share no code. A build names which compiler ran and why.
+- **Warm-start probe cache.** A compiler that has passed the link probe is
+  recorded in `~/.tarvos/toolchain/cache`, keyed to the exact rustc path, the
+  pinned channel, and the host triple. A stamp is rejected if the compiler is
+  newer than the stamp, so an upgraded toolchain is re-probed rather than trusted.
+- **Windows managed install without `install.sh`.** The static distribution's
+  installer script is Unix-only; Windows now assembles the toolchain directly.
+- **Install size and disk footprint reduced.** Component documentation trees and
+  unused components are no longer installed, and the managed install no longer
+  edits the user's shell profile.
+- **Correctness fixes found by testing, not assumed**, including two
+  `non_fmt_panics` sites in generated `int()`/`float()` error paths where
+  `{value}` inside a plain panic string was never interpolated.
+
+## Breaking Changes
+
+- **A build no longer uses whatever `rustc` is on `PATH`.** If a managed
+  toolchain is installed it is used. If none is installed and you did not pass
+  `--system-rust`, the build fails with a message naming
+  `tarvos toolchain install`. This is the intended consequence of making the
+  toolchain explicit; a silently substituted compiler is worse.
+- **`--system-rust` is now the only way to select a system compiler.** It is
+  validated before use and never silently receives a managed compiler.
+- The toolchain install no longer appends to shell profiles. Add
+  `~/.tarvos/toolchain/bin` to `PATH` yourself if you want it on every shell.
+
+## Performance
+
+Measured on this repository, not carried over. Workload
+`benchmarks/workloads/fair_no_fold.py`, 1 warm-up run plus 7 samples, medians
+compared, with the CPython and Tarvos stdout compared for equality.
+
+| Runtime | Median | Min | Max | Compile |
+|---|---|---|---|---|
+| CPython 3.13.13 | 1915.51 ms | 1317.68 ms | 4809.62 ms | — |
+| Tarvos | 12.15 ms | 11.20 ms | 13.71 ms | 3.26 s |
+| rustc 1.98.0 direct | 29.33 ms | 27.03 ms | 32.64 ms | 0.54 s |
+
+`execution speedup = CPython median / Tarvos median` = **157.6×** on this runner,
+and the Tarvos output matched CPython output exactly (`50000005000000`).
+
+Read this as one measurement, not a general claim:
+
+- It is **one named workload** on one machine. Tarvos targets statically
+  analyzable, compute-heavy kernels; a program dominated by I/O or dynamic
+  dispatch will not show this ratio.
+- CPython's spread on this run was large (standard deviation 1213 ms, max
+  4809 ms), which points at a noisy shared runner. The minimum-to-minimum
+  comparison is a more conservative 117×. Treat the headline as order of
+  magnitude rather than an exact figure.
+- Compilation time is reported **separately** and is not part of the speedup.
+  End-to-end cost is compile plus run.
+- Competitor runtimes (PyPy, Numba, Nuitka, Codon) were unavailable on this
+  runner and are reported as unavailable rather than quietly dropped.
+- Release CI re-measures on its own runners; the `runtime-matrix` artifact is
+  the authoritative record for a given tag.
+
+## Python Compatibility
+
+The supported subset is unchanged in shape and is documented
+machine-readably in `docs/compatibility.json`, generated and checked by CI.
+At this tag: **95 features — 52 supported, 18 partial, 24 unsupported, 1 planned**.
+
+Known limitations that are deliberately not papered over:
+
+- Tarvos is not a drop-in CPython replacement. GUI frameworks, arbitrary
+  third-party imports, reflection, and dynamic dispatch remain outside the
+  native subset and are reported explicitly rather than silently falling back.
+- The native standard-library surface includes `math`, `time`, `os.path`
+  (`join`, `basename`, `dirname`, `exists`, `isfile`, `isdir`), `statistics`,
+  and the exception hierarchy.
+- An uncaught native exception prints `Class: message` on stderr and exits 1.
+  It does not print a Python traceback, because a native binary does not carry
+  the source-level frame information a traceback needs.
+
+## Validation
+
+- Differential parity across the benchmark corpus: **19 passed, 0 failed,
+  1 skipped** (the skip uses imports outside the native subset), with every
+  compiled binary's stdout compared against CPython.
+- Workspace test suite: **0 failures** across all crates.
+- `cargo fmt --check` clean.
+- Version consistency gate: all declarations match `1.1.0-rc.5`.
+- Compatibility matrix, installer, and Linux shell verification scripts pass.
+
+## Installation
+
+Windows, without administrator rights:
+
+```powershell
+irm https://raw.githubusercontent.com/repo-tech/tarvos-engine/main/install.ps1 | iex
+tarvos toolchain install
+tarvos --version
+```
+
+Linux and macOS:
+
+```bash
+curl --fail --location https://raw.githubusercontent.com/repo-tech/tarvos-engine/main/install.sh | bash
+tarvos toolchain install
+tarvos --version
+```
+
+From source (requires a Rust toolchain already present):
+
+```bash
+cargo build --workspace --release
+target/release/tarvos --version   # prints 1.1.0-rc.5
+```
+
+If you already have Rust and want to use it:
+
+```bash
+tarvos build app.py --system-rust
+```
+
+## Full Changelog
+
+https://github.com/repo-tech/tarvos/compare/v1.1.0-rc.4...v1.1.0-rc.5
+
 # Tarvos 1.1.0-rc.4
 
 ## Summary

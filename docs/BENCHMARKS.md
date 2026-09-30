@@ -34,7 +34,7 @@ compiler that emits a single static binary are not measuring the same thing.
 | Python | 3.13.13 |
 | cargo | 1.98.0 (797e8a9bc 2026-08-05) |
 | rustc | 1.98.0 (88d9e12ae 2026-08-18) |
-| Tarvos | 1.1.0-rc.4 |
+| Tarvos | 1.1.0-rc.5 |
 | Profile | release: `opt-level="z"`, `lto = true`, `codegen-units = 1`, `strip = true` |
 
 **Single machine, single run of the harness.** These are indicative, not a

@@ -23,7 +23,7 @@ members = [
 # verified against this value by `scripts/check_version_consistency.py`, which
 # CI runs on every push.
 [workspace.package]
-version = "1.1.0-rc.4"
+version = "1.1.0-rc.5"
 edition = "2021"
 
 [profile.dev]

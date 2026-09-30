@@ -4,6 +4,54 @@ All notable changes to Tarvos are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0-rc.5] - 2026-09-30
+
+This release candidate carries 22 commits on top of `v1.1.0-rc.4`. The headline
+is that **Tarvos no longer requires a system Rust installation**, and that a warm
+CLI start no longer re-proves what the previous command already proved.
+
+### Added - managed toolchain
+
+- `tarvos toolchain install` fetches the pinned channel into
+  `~/.tarvos/toolchain` and verifies its SHA-256 before use.
+- `tarvos toolchain --status` and `--verify` report the resolved toolchain, its
+  layout, and per-stage validation.
+- Managed and system toolchains resolve through separate code paths that share
+  nothing, so a mode can never be substituted for the other by accident.
+- Windows assembles the managed toolchain directly, because the upstream static
+  distribution has no `install.sh`.
+
+### Changed - explicit toolchain selection
+
+- A build no longer uses whatever `rustc` happens to be on `PATH`. System Rust is
+  consulted only when `--system-rust` is passed, and that compiler is validated
+  before use.
+- The managed install no longer edits the user's shell profile. Component
+  documentation trees are skipped, which removes roughly 993 MB of HTML that
+  rustc and cargo never read.
+
+### Performance
+
+- The compiler link probe result is cached in `~/.tarvos/toolchain/cache`, keyed
+  to the exact rustc path, the pinned channel, and the host triple. Previously
+  every `build`, `run`, and `verify` re-linked a throwaway probe program, and
+  that subprocess is what made the CLI feel slow.
+- A stamp is rejected when the compiler is newer than the stamp or when the
+  payload differs, so an upgraded toolchain is re-probed rather than trusted.
+
+### Fixed
+
+- Two `non_fmt_panics` sites in the generated `int()` and `float()` error paths.
+  `{value}` inside a plain `panic!` string is not an interpolation in Rust, so
+  the literal text was emitted instead of the value. The value is now passed as
+  a format argument; the message text is unchanged.
+- `version_of` strips a leading `v` from the parsed version token so the pin
+  comparison does not depend on how a given rustc spells its own version.
+- A packed-project error path built a path with a literal backslash, which is one
+  path element on Unix; the separator now comes from `Path::join`.
+- CI captures a failing test's assertion text, not just its name, and no longer
+  caches `target/`, so a test can never run a stale binary.
+
 ## [1.1.0-rc.4] - 2026-09-27
 
 This release candidate carries 43 commits of compiler work on top of
