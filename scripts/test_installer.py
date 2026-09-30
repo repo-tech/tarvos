@@ -125,6 +125,45 @@ def main() -> int:
             "scripts/verify_linux.sh must exercise the managed toolchain",
         )
 
+    # Every shell script this repository runs on Linux has the same two
+    # hazards, and both produce a bare "syntax error: unexpected end of file"
+    # that names neither the file nor the line. Checking one script by hand
+    # already let a CRLF-measuring script ship broken, so sweep them all.
+    for sh_path in sorted(ROOT.glob("scripts/*.sh")) + sorted(ROOT.glob("*.sh")):
+        sh_raw = sh_path.read_bytes()
+        rel = sh_path.relative_to(ROOT).as_posix()
+        check(
+            b"\r\n" not in sh_raw,
+            f"{rel} has CRLF line endings; bash needs LF and will fail with an "
+            "unattributed 'unexpected end of file'",
+        )
+        check(
+            not sh_raw.startswith(b"\xef\xbb\xbf"),
+            f"{rel} starts with a UTF-8 BOM; bash cannot match the shebang",
+        )
+        head = sh_raw.split(b"\n", 1)[0]
+        check(
+            head.startswith(b"#!"),
+            f"{rel} has no shebang, so it cannot be executed directly",
+        )
+
+    size_script = ROOT / "scripts" / "measure_toolchain_size.sh"
+    check(
+        size_script.is_file(),
+        "scripts/measure_toolchain_size.sh is missing",
+    )
+    if size_script.is_file():
+        size_text = size_script.read_text(encoding="utf-8")
+        check(
+            "share/doc" in size_text,
+            "the size measurement must assert that share/doc is absent, since "
+            "that tree was 993 MB of documentation rustc and cargo never read",
+        )
+        check(
+            'PATH="/usr/bin:/bin"' in size_text,
+            "the size measurement must build with rustc absent from PATH",
+        )
+
     # The managed install shells out to the upstream install.sh, which accepts
     # only the flags it documents in --help:
     #
