@@ -4,6 +4,52 @@ All notable changes to Tarvos are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0-rc.6] - 2026-09-30
+
+A correctness release. `1.1.0-rc.5` shipped a real bug in which a tuple
+assignment inside a loop could leave a stale constant in place, so a function
+returning that variable produced a **silently wrong number** rather than a
+compile error. This release fixes it and adds the regression coverage that was
+missing.
+
+### Fixed
+
+- **Tuple assignment inside a loop returned a stale constant.** Copy
+  propagation learned `a = 0` and did not learn that `a, b = b, a + b` rebinds
+  both names, so a function ending in `return a` compiled to `return 0_i64`.
+  The binary built and ran, printing a plausible value. The Fibonacci loop
+
+  ```python
+  a = 0
+  b = 1
+  for _ in range(n):
+      a, b = b, a + b
+  return a
+  ```
+
+  returned `0` instead of `832040` at `n = 30`. Both the optimizer's mutation
+  set and the code generator's assignment check now treat a tuple assignment as
+  a write to every one of its targets.
+
+  The reason this survived to a release: writing the initial values on one line
+  as `a, b = 0, 1` did **not** trigger it. Only the separated form did, so the
+  common-looking version of the idiom happened to be the working one.
+
+### Added
+
+- An end-to-end pipeline regression that runs the real lowering, optimizer, and
+  code generator over this exact shape and asserts the generated Rust returns
+  the variable rather than a folded literal.
+- Unit coverage that a tuple assignment clears a propagated constant, both
+  inside a function with a loop and in a plain block.
+
+### Why this was missed
+
+The existing differential suite compares compiled output against CPython, which
+is exactly the check that should have caught this. It did not, because no
+workload in the corpus used the separated initialisation followed by a tuple
+swap. The gap was in the corpus, not in the parity harness.
+
 ## [1.1.0-rc.5] - 2026-09-30
 
 This release candidate carries 22 commits on top of `v1.1.0-rc.4`. The headline

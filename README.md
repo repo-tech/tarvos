@@ -1,7 +1,7 @@
 # Tarvos ⚡
 
 [![CI](https://github.com/repo-tech/Tarvos/actions/workflows/ci.yml/badge.svg)](https://github.com/repo-tech/Tarvos/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/version-1.1.0--rc.5-blue.svg)](https://github.com/repo-tech/Tarvos/releases)
+[![Release](https://img.shields.io/badge/version-1.1.0--rc.6-blue.svg)](https://github.com/repo-tech/Tarvos/releases)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
 
@@ -91,7 +91,7 @@ tarvos analyze .\app.py --hot-functions
 ```
 
 ```powershell
-# Install the v1.1.0-rc.5 release candidate without administrator rights.
+# Install the v1.1.0-rc.6 release candidate without administrator rights.
 .\install.ps1
 ```
 

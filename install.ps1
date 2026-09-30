@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$Version = "v1.1.0-rc.5",
+    [string]$Version = "v1.1.0-rc.6",
     [string]$Repository = "repo-tech/tarvos",
     [string]$Token = $env:TARVOS_GITHUB_TOKEN,
     [switch]$Force
@@ -29,7 +29,7 @@ $release = Invoke-RestMethod -Uri $releaseEndpoint -Headers $headers
 $releaseAsset = @($release.assets | Where-Object { $_.name -eq $asset }) | Select-Object -First 1
 $checksumAsset = @($release.assets | Where-Object { $_.name -eq "$asset.sha256" }) | Select-Object -First 1
 if ($null -eq $releaseAsset -or $null -eq $checksumAsset) {
-    throw "Release $($release.tag_name) is missing $asset or $asset.sha256. Publish the v1.1.0-rc.5 assets from .github/workflows/release.yml."
+    throw "Release $($release.tag_name) is missing $asset or $asset.sha256. Publish the v1.1.0-rc.6 assets from .github/workflows/release.yml."
 }
 
 New-Item -ItemType Directory -Path $binDir -Force | Out-Null

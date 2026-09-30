@@ -11,5 +11,6 @@
   "mixed_arithmetic_control_flow.py": "85",
   "nested_loops.py": "2025",
   "recursion.py": "3628800",
-  "string_dict_ops.py": "35"
+  "string_dict_ops.py": "35",
+  "tuple_swap_loop.py": "832040"
 }

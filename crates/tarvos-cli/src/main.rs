@@ -28,7 +28,7 @@ use tarvos_parser::parse_python_ast;
 #[derive(Parser, Debug)]
 #[command(name = "tarvos", disable_version_flag = true)]
 #[command(author = "Himanshu & Repo-Tech Team")]
-#[command(version = "1.1.0-rc.5")]
+#[command(version = "1.1.0-rc.6")]
 #[command(about = "Transpiles and compiles Python code to native high-performance Rust executables", long_about = None)]
 struct Cli {
     /// Print the Tarvos version.
@@ -219,7 +219,7 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.version {
-        println!("tarvos 1.1.0-rc.5");
+        println!("tarvos 1.1.0-rc.6");
         return Ok(());
     }
 
@@ -580,7 +580,7 @@ fn package_project_mode(
     fs::write(
         output.join("Cargo.toml"),
         format!(
-            "[workspace]\n\n[package]\nname = \"{}\"\nversion = \"1.1.0-rc.5\"\nedition = \"2021\"\n\n[profile.release]\nopt-level = \"z\"         # Optimize aggressively for strict minimum size\nlto = true              # Enable whole-program Link-Time Optimization\ncodegen-units = 1       # Reduce parallel blocks to maximize single-binary optimization\npanic = \"abort\"         # Completely terminate stack unwinding code tables\nstrip = true            # Guarantee complete binary stripping of metadata and symbols\n",
+            "[workspace]\n\n[package]\nname = \"{}\"\nversion = \"1.1.0-rc.6\"\nedition = \"2021\"\n\n[profile.release]\nopt-level = \"z\"         # Optimize aggressively for strict minimum size\nlto = true              # Enable whole-program Link-Time Optimization\ncodegen-units = 1       # Reduce parallel blocks to maximize single-binary optimization\npanic = \"abort\"         # Completely terminate stack unwinding code tables\nstrip = true            # Guarantee complete binary stripping of metadata and symbols\n",
             project_name
         ),
     )?;

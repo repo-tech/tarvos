@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tarvos"
-version = "1.1.0rc5"
+version = "1.1.0rc6"
 description = "Ultra-fast Python to Native Rust Transpiler and Compiler"
 readme = "README.md"
 authors = [{ name = "Repo-Tech Team" }]

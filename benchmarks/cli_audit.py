@@ -72,7 +72,7 @@ def _cli_surface(a: Audit, work: pathlib.Path) -> pathlib.Path:
             + (f" missing={sorted(COMMANDS - listed)}" if listed != COMMANDS else ""))
 
     proc = run(["--version"])
-    a.check("--version", proc.returncode == 0 and "1.1.0-rc.5" in proc.stdout,
+    a.check("--version", proc.returncode == 0 and "1.1.0-rc.6" in proc.stdout,
             proc.stdout.strip()[:60])
 
     bad = [c for c in sorted(COMMANDS) if run([c, "--help"]).returncode != 0]

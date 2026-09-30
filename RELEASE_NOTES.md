@@ -1,3 +1,138 @@
+# Tarvos 1.1.0-rc.6
+
+## Summary
+
+`1.1.0-rc.6` is a **correctness release**. `1.1.0-rc.5` shipped a bug that made
+a function return a stale constant when a loop rebound a variable through tuple
+assignment. The compiled binary ran and printed a plausible number, so nothing
+crashed and nothing looked wrong — it was simply the wrong answer.
+
+This release fixes it, adds the regression coverage that would have caught it,
+and closes a hole in the benchmark corpus.
+
+If you are on `1.1.0-rc.5`, upgrade before relying on numeric results from
+functions that use `a, b = ...` inside a loop.
+
+## Highlights
+
+- A tuple assignment is now correctly treated as a write to **every** target, in
+  both the optimizer's copy propagation and the code generator's assignment
+  check. Previously it was invisible to both.
+- Regression coverage that runs the full lowering → optimization → codegen
+  pipeline over this exact shape and asserts the generated Rust returns the
+  variable, not a folded literal.
+- The differential corpus gained the workload that exercises this shape, so
+  future changes are checked against CPython rather than only against a unit
+  assertion.
+
+## The bug, concretely
+
+```python
+def fib(n: int) -> int:
+    a = 0
+    b = 1
+    for _ in range(n):
+        a, b = b, a + b
+    return a
+
+print(fib(30))
+```
+
+| | Output |
+|---|---|
+| CPython 3.13.13 | `832040` |
+| Tarvos 1.1.0-rc.5 | `0` |
+
+The optimizer recorded `a = 0` as a known constant. When it later saw
+`a, b = b, a + b`, it did not register that statement as modifying `a` or `b`,
+because tuple assignment was missing from its mutation set. The stale `0`
+survived, and `return a` was emitted as `return 0_i64`.
+
+The failure is silent by construction: the program compiles, links, runs, and
+prints an integer. Only a comparison against CPython reveals it.
+
+### Why it survived a release
+
+Writing the initial values on one line does **not** trigger it:
+
+```python
+a, b = 0, 1   # this form was fine
+```
+
+so the idiom most people write by hand happened to be the working one, and the
+separated form — which is what my own test happened to use — was the broken one.
+The differential harness was correct; the corpus simply had no workload with
+that shape. That is now fixed, and it is worth being plain about: the parity
+guarantee is only as good as the programs we run through it.
+
+## Breaking Changes
+
+None. `1.1.0-rc.6` is otherwise identical to `1.1.0-rc.5`, including the managed
+toolchain work and the warm-start probe cache. If you need the
+`--system-rust` behaviour change, it was introduced in `1.1.0-rc.5` and is
+described there.
+
+## Performance
+
+Unchanged from `1.1.0-rc.5`. The fix touches a mutation-tracking set that is
+consulted during optimization, not the generated code shape, so the measured
+matrix is the same:
+
+| Runtime | Median | Min | Max | Compile |
+|---|---|---|---|---|
+| CPython 3.13.13 | 1915.51 ms | 1317.68 ms | 4809.62 ms | — |
+| Tarvos | 12.15 ms | 11.20 ms | 13.71 ms | 3.26 s |
+| rustc 1.98.0 direct | 29.33 ms | 27.03 ms | 32.64 ms | 0.54 s |
+
+157.6× on the median for `fair_no_fold.py`, with output byte-identical to
+CPython. The caveats in [BENCHMARKS.md](BENCHMARKS.md) still apply in full,
+including that the CPython spread on that run was wide and the minimum-to-minimum
+comparison is a more conservative 117×.
+
+## Python Compatibility
+
+The supported subset is unchanged: **95 features — 52 supported, 18 partial, 24
+unsupported, 1 planned**. This release changes what is correctly compiled within
+that subset, not what the subset contains.
+
+## Validation
+
+- The new end-to-end regression fails on `1.1.0-rc.5`'s optimizer and passes on
+  this one. That was verified by building both and running the failing case, not
+  by inspection.
+- Differential parity across the benchmark corpus: **19 passed, 0 failed,
+  1 skipped**, with the new tuple-assignment workload included.
+- Workspace test suite: **0 failures**.
+- `cargo fmt --check` clean; version consistency gate passes for `1.1.0-rc.6`.
+
+## Installation
+
+Windows, without administrator rights:
+
+```powershell
+irm https://raw.githubusercontent.com/repo-tech/tarvos-engine/main/install.ps1 | iex
+tarvos toolchain install
+tarvos --version
+```
+
+Linux and macOS:
+
+```bash
+curl --fail --location https://raw.githubusercontent.com/repo-tech/tarvos-engine/main/install.sh | bash
+tarvos toolchain install
+tarvos --version
+```
+
+To pin the previous candidate explicitly, pass its tag:
+
+```powershell
+.\install.ps1 -Version v1.1.0-rc.5
+```
+
+## Full Changelog
+
+https://github.com/repo-tech/tarvos/compare/v1.1.0-rc.5...v1.1.0-rc.6
+
 # Tarvos 1.1.0-rc.5
 
 ## Summary

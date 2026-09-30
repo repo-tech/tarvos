@@ -94,7 +94,7 @@ async fn health() -> impl IntoResponse {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
-        r#"{"status":"operational","version":"1.1.0-rc.5"}"#,
+        r#"{"status":"operational","version":"1.1.0-rc.6"}"#,
     )
 }
 
@@ -988,7 +988,7 @@ fn cache_root() -> PathBuf {
         .or_else(|| env::var_os("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir);
-    home.join(".tarvos").join("cache").join("v1.1.0-rc.5")
+    home.join(".tarvos").join("cache").join("v1.1.0-rc.6")
 }
 
 fn workspace_root() -> PathBuf {
@@ -996,7 +996,7 @@ fn workspace_root() -> PathBuf {
         .or_else(|| env::var_os("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir);
-    home.join(".tarvos").join("workspaces").join("v1.1.0-rc.5")
+    home.join(".tarvos").join("workspaces").join("v1.1.0-rc.6")
 }
 
 #[derive(Debug)]
