@@ -57,6 +57,7 @@ desktop.ini
 # Local-only tools and scratch files
 /tools/
 /true/
+.wininst-*.txt
 dummy*
 output.rs
 temp_output.rs
