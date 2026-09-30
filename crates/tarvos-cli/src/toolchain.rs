@@ -518,13 +518,12 @@ fn install_managed() -> Result<()> {
     }
     let triple = install_triple()?;
     // Refuse an unsupported host before a single byte is fetched.
-    if !host_supports_install_script() {
+    if !host_supports_install_script() && !cfg!(windows) {
         return Err(anyhow::anyhow!(
             "managed toolchain install is not available on this host: the official Rust \
              static distribution ships an install.sh script that only runs on Unix, and this \
              host is {triple}. Nothing was downloaded. Use `tarvos build --system-rust` with an \
-             existing Rust install, or install the Windows toolchain through the Tarvos \
-             installer."
+             existing Rust install."
         ));
     }
     let url = dist_url(PINNED_CHANNEL, &triple);
@@ -549,13 +548,27 @@ fn install_managed() -> Result<()> {
         &staging.join("rust.tar.gz.sha256"),
     )?;
     println!("Checksum verified. Extracting...");
-    extract_tar_gz(&staging.join("rust.tar.gz"), &staging)?;
-    // The static distribution unpacks to rust-{channel}-{triple}/ with
-    // install.sh inside; run it with --prefix pointing at our staging tree
-    // so nothing outside ~/.tarvos is touched.
     let unpacked = staging.join(format!("rust-{PINNED_CHANNEL}-{triple}"));
     let installed = staging.join("installed");
-    run_install_sh(&unpacked.join("install.sh"), &installed, &triple)?;
+
+    // Two ways to lay the components down, same three components either way.
+    //
+    // The Windows archive does ship an install.sh, but that script is POSIX:
+    // it calls `uname` before doing any work, so on Windows it needs a POSIX
+    // layer Tarvos cannot assume. An earlier revision here refused Windows
+    // outright on the claim that the archive had no install.sh at all. Both
+    // halves of that were wrong, and the second one sent users to a manual
+    // install for a path that works unattended.
+    #[cfg(windows)]
+    {
+        assemble_windows_toolchain(&staging.join("rust.tar.gz"), &staging, &installed, &triple)?;
+    }
+    #[cfg(not(windows))]
+    {
+        extract_tar_gz(&staging.join("rust.tar.gz"), &staging)?;
+        run_install_sh(&unpacked.join("install.sh"), &installed, &triple)?;
+    }
+    let _ = &unpacked;
     let rustc = installed.join("bin").join(exe("rustc"));
     if !rustc.exists() {
         return Err(anyhow::anyhow!(
@@ -759,6 +772,10 @@ fn digest_hex(bytes: &[u8]) -> String {
 }
 
 /// Unpack a `.tar.gz` using the platform tar, so no archive crate is needed.
+///
+/// Unix only: Windows assembles the components itself in
+/// ssemble_windows_toolchain because the shipped install.sh is POSIX.
+#[cfg(not(windows))]
 fn extract_tar_gz(archive: &std::path::Path, dest: &std::path::Path) -> Result<()> {
     let status = Command::new("tar")
         .args(["-xzf"])
@@ -773,7 +790,112 @@ fn extract_tar_gz(archive: &std::path::Path, dest: &std::path::Path) -> Result<(
     Ok(())
 }
 
+/// Assemble the toolchain directly from the distribution's component
+/// directories, for hosts where install.sh cannot run.
+///
+/// The upstream install.sh is a POSIX script: it calls `uname` on its first
+/// line of real work, so it cannot execute on Windows without a POSIX layer.
+/// The archive it would have processed is platform-neutral though, and carries
+/// the same component layout on every host:
+///
+///   rust-{channel}-{triple}/rustc/bin/rustc.exe
+///   rust-{channel}-{triple}/cargo/bin/cargo.exe
+///   rust-{channel}-{triple}/rust-std-{triple}/lib/...
+///
+/// so the equivalent operation is to extract exactly the components Tarvos
+/// can drive and merge them into one prefix. Extracting selectively rather
+/// than unpacking everything is also what keeps this small: a full Windows
+/// archive is 403 MB, and the documentation and analyzer trees inside it are
+/// never invoked by a build.
+///
+/// No install.sh, no POSIX host required, and the same three components the
+/// Unix path asks for.
+#[cfg(windows)]
+fn assemble_windows_toolchain(
+    archive: &std::path::Path,
+    unpacked_root: &std::path::Path,
+    dest: &std::path::Path,
+    triple: &str,
+) -> Result<()> {
+    let dist_dir = format!("rust-{PINNED_CHANNEL}-{triple}");
+    let wanted = [
+        format!("{dist_dir}/rustc"),
+        format!("{dist_dir}/cargo"),
+        format!("{dist_dir}/rust-std-{triple}"),
+    ];
+
+    // Extract only the three components, and drop the leading component so
+    // the merge below does not have to walk a nested directory.
+    let mut cmd = Command::new("tar");
+    cmd.arg("-xzf").arg(archive).arg("-C").arg(unpacked_root);
+    for w in &wanted {
+        cmd.arg(w);
+    }
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to unpack {archive:?}"))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "failed to unpack the components of {}",
+            archive.display()
+        ));
+    }
+
+    let dist = unpacked_root.join(&dist_dir);
+    std::fs::create_dir_all(dest)
+        .with_context(|| format!("failed to create {}", dest.display()))?;
+    for component in ["rustc", "cargo", &format!("rust-std-{triple}")] {
+        let src = dist.join(component);
+        if !src.is_dir() {
+            return Err(anyhow::anyhow!(
+                "the distribution is missing the {component} component at {}",
+                src.display()
+            ));
+        }
+        // The toolchain searches its own lib/ for the sysroot, so component
+        // trees have to be merged rather than kept in separate directories.
+        copy_tree(&src, dest)
+            .with_context(|| format!("failed to stage the {component} component"))?;
+    }
+    Ok(())
+}
+
+/// Merge `src` over `dest`, creating directories as needed.
+///
+/// Uses the platform copy so no filesystem crate is needed, and skips the
+/// paths a build never reads: component documentation, which is the bulk of
+/// the archive.
+#[cfg(windows)]
+fn copy_tree(src: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    for entry in
+        std::fs::read_dir(src).with_context(|| format!("failed to read {}", src.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy().to_string();
+        // Component docs are the reason a naive extract costs 403 MB.
+        if name_str == "share" || name_str == "doc" || name_str == "man" {
+            continue;
+        }
+        let from = entry.path();
+        let to = dest.join(&name);
+        if from.is_dir() {
+            std::fs::create_dir_all(&to)
+                .with_context(|| format!("failed to create {}", to.display()))?;
+            copy_tree(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to).with_context(|| {
+                format!("failed to copy {} to {}", from.display(), to.display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// Run the static distribution's install.sh with `--prefix` inside our tree.
+///
+/// Unix only, for the same reason as extract_tar_gz.
+#[cfg(not(windows))]
 fn run_install_sh(script: &std::path::Path, prefix: &std::path::Path, triple: &str) -> Result<()> {
     #[cfg(windows)]
     {
