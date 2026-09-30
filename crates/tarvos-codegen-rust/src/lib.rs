@@ -2098,9 +2098,21 @@ impl RustCodegen {
                                 "{hin}    {name} = __tarvos_exc.message.clone();\n"
                             ));
                         }
+                        // The labelled block for this `try` is already closed by
+                        // the time a handler runs, so a `return` inside the
+                        // handler must not be lowered to `break '<this try's
+                        // label>`; that label is out of scope and the generated
+                        // Rust does not compile. Pop this frame before emitting
+                        // the handler body so a deferred return targets the
+                        // enclosing `try`, or becomes a real `return` when there
+                        // is none.
+                        ctx.try_stack.pop();
                         for nested in &handler.body {
                             Self::emit_stmt(out, nested, indent + 3, declared, ctx)?;
                         }
+                        // Restore the frame so a later handler, and the
+                        // propagation path below, still see this `try`.
+                        ctx.try_stack.push((label.clone(), error_var.clone()));
                         out.push_str(&format!("{hin}}}\n"));
                     }
                     out.push_str(&format!("{ind}}}\n"));
@@ -2135,6 +2147,24 @@ impl RustCodegen {
                     None => out.push_str(&format!(
                         "{ind}    __tarvos_uncaught(&__tarvos_err);\n{ind}}}\n"
                     )),
+                }
+                // When the `try` is the last statement of a value-returning
+                // function, nothing after the propagation path above is known to
+                // Rust to diverge, so it rejects the body as an `if` missing its
+                // `else`. Every real exit already returned or diverged, so this
+                // line is unreachable; it exists only to give the function a
+                // tail of the right type.
+                if let (Some(slot), Some(ty)) = (&ret_slot, &ret_type) {
+                    let tail = match ty.as_str() {
+                        "i64" => "0_i64".to_string(),
+                        "u128" => "0_u128".to_string(),
+                        "f64" => "0.0_f64".to_string(),
+                        "bool" => "false".to_string(),
+                        _ => format!("Default::default() as {ty}"),
+                    };
+                    out.push_str(&format!(
+                        "{ind}if let Some(__tarvos_value) = {slot} {{\n{ind}    return __tarvos_value;\n{ind}}}\n{ind}{tail}\n"
+                    ));
                 }
                 ctx.try_depth -= 1;
             }

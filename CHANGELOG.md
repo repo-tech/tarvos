@@ -14,6 +14,13 @@ missing.
 
 ### Fixed
 
+- **A `return` inside an `except` handler produced Rust that did not compile.**
+  The `try` body is lowered to a labelled block so a `return` inside it can
+  `break` out after `finally` runs. That block has already been closed by the
+  time a handler executes, but the handler was still emitted against it, so the
+  generated code read `break '__tarvos_try1;` with the label out of scope:
+  `error[E0426]: use of undeclared label`. A handler now sees the enclosing
+  `try`, or none, so its `return` is a real return.
 - **Tuple assignment inside a loop returned a stale constant.** Copy
   propagation learned `a = 0` and did not learn that `a, b = b, a + b` rebinds
   both names, so a function ending in `return a` compiled to `return 0_i64`.

@@ -469,6 +469,59 @@ mod pipeline {
     // Typed function definition and call
     // Python: def add(a: int, b: int) -> int: return a + b; print(add(5, 7))
     // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    /// A `return` inside an `except` handler must not be lowered to a `break`
+    /// aimed at the `try`'s own label.
+    ///
+    /// The labelled block that represents the `try` body is already closed by the
+    /// time a handler runs, so emitting `break '__tarvos_try1;` there produced
+    /// `error[E0426]: use of undeclared label` and the generated Rust did not
+    /// compile at all. The handler now sees the enclosing `try` — or none — so
+    /// its `return` becomes a real return.
+    #[test]
+    fn a_return_inside_an_except_handler_does_not_target_the_try_label() {
+        let ast = r#"{
+            "type": "module",
+            "body": [
+                {"type":"funcdef","name":"pick",
+                 "args":["n"],
+                 "arg_annotations":["int"],
+                 "returns":"int",
+                 "body":[
+                    {"type":"try",
+                     "body":[
+                       {"type":"return","value":{"type":"int","value":100}}
+                     ],
+                     "handlers":[
+                       {"exc_type":{"type":"name","id":"ValueError"},
+                        "name":null,
+                        "body":[{"type":"return","value":{"type":"int","value":-1}}]}
+                     ],
+                     "orelse":[],
+                     "finalbody":[]}
+                 ]},
+                {"type":"expr","value":{"type":"call","function":{"type":"name","id":"print"},
+                 "args":[{"type":"call","function":{"type":"name","id":"pick"},
+                          "args":[{"type":"int","value":5}]}]}}
+            ]
+        }"#;
+
+        let code = compile(ast).expect("a return inside a handler should lower");
+        // Exactly one `break '__tarvos_try1`, and it is the one in the try body
+        // where the label is still in scope. A second one, emitted for the
+        // handler, is what produced `error[E0426]`.
+        assert_eq!(
+            code.matches("break '__tarvos_try1").count(),
+            1,
+            "only the try body may break to its own label:\
+             \n{code}"
+        );
+        assert!(
+            code.contains("return -1_i64"),
+            "the handler's return should be a real return:\
+             \n{code}"
+        );
+    }
+
     #[test]
     fn typed_function_def_and_call() {
         let ast = r#"{
