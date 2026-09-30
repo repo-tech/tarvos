@@ -590,6 +590,19 @@ fn install_managed() -> Result<()> {
             "installed rustc cannot compile a probe program; refusing a partial install"
         ));
     }
+    // Every check that could reject the install has now passed, so pruning is
+    // safe: if it fails, the staging tree is discarded with the rest and the
+    // user gets an error rather than a half-cleaned toolchain. Doing it here
+    // rather than after publish also means the size the user sees is the size
+    // they actually get.
+    let reclaimed = prune_unneeded_docs(&installed)?;
+    let installed_mb = tree_size(&installed) / (1024 * 1024);
+    if reclaimed > 0 {
+        println!(
+            "Pruned {} MB of documentation and shell completions Tarvos never reads.",
+            reclaimed / (1024 * 1024)
+        );
+    }
     if root.exists() {
         std::fs::remove_dir_all(&root)
             .with_context(|| format!("failed to replace {}", root.display()))?;
@@ -603,48 +616,88 @@ fn install_managed() -> Result<()> {
     let _ = std::fs::remove_dir_all(&staging);
     println!("Managed toolchain installed at {}", root.display());
     println!("Version: {version}");
+    println!("Installed size: {installed_mb} MB");
     Ok(())
 }
 
-/// Raw bytes of a URL using the platform's own transfer tool, so Tarvos needs
-/// no vendored TLS stack for this step.
+/// Fetch `url` straight to `dest`, streaming to disk with progress shown.
 ///
-/// On failure the caller gets the tool's stderr, not a bare status code: "the
-/// toolchain download failed" is only actionable when the user can see why.
-fn fetch_url(url: &str) -> Result<Vec<u8>> {
-    #[cfg(windows)]
-    let probe = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!(
-                "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object Net.WebClient).DownloadData('{url}')"
-            ),
-        ])
-        .output();
-    #[cfg(not(windows))]
-    let probe = Command::new("curl")
-        .args(["--proto", "=https", "--tlsv1.2", "-sSfL", url, "-o", "-"])
-        .output();
-    let output = probe.with_context(|| format!("failed to start download of {url}"))?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+/// Every platform Tarvos targets ships `curl`: POSIX from the base install,
+/// Windows since 8.1 as `system32\curl.exe`. Streaming matters for two
+/// reasons that a user actually notices. The archive is hundreds of
+/// megabytes, so buffering it in memory before writing meant the staging
+/// directory reported 0 MB for the whole download and a machine with little
+/// headroom could fail on the allocation. And with the transfer tool's
+/// progress line visible, a slow connection looks busy rather than hung,
+/// which is the difference between a user waiting and a user giving up.
+fn download_to(url: &str, dest: &std::path::Path) -> Result<()> {
+    // --progress-bar: a plain -s hides everything, and a bare -S prints only
+    // errors. The bar writes to stderr so the rest of the tool's stdout stays
+    // machine-readable.
+    let status = Command::new("curl")
+        .args(["--proto", "=https", "--tlsv1.2", "-sSfL", "--progress-bar"])
+        .arg(url)
+        .arg("-o")
+        .arg(dest)
+        .status()
+        .with_context(|| format!("failed to start download of {url}"))?;
+    if !status.success() {
         return Err(anyhow::anyhow!(
-            "download failed for {url}: {}",
-            if detail.is_empty() {
-                "no further detail from the transfer tool".to_string()
-            } else {
-                detail
-            }
+            "download failed for {url} (see the transfer output above)"
         ));
     }
-    Ok(output.stdout)
+    let written = std::fs::metadata(dest)
+        .map(|m| m.len())
+        .with_context(|| format!("failed to stat {}", dest.display()))?;
+    if written == 0 {
+        return Err(anyhow::anyhow!(
+            "{url} downloaded 0 bytes; refusing to continue with an empty file"
+        ));
+    }
+    Ok(())
 }
 
-fn download_to(url: &str, dest: &std::path::Path) -> Result<()> {
-    let bytes = fetch_url(url)?;
-    std::fs::write(dest, bytes).with_context(|| format!("failed to write {}", dest.display()))?;
-    Ok(())
+/// Remove documentation and shell-completion trees after a successful
+/// install, and report what was reclaimed.
+///
+/// `--without=rust-docs,...` drops those components by name, but `share/doc`
+/// still came back at 17 MB: the `rustc` component ships its own copy, so
+/// excluding a *component* cannot exclude a path *inside another component*.
+/// Tarvos only ever invokes `rustc` and `cargo`, which read neither `share/`
+/// nor `man/`, so pruning them after validation is exact and costs nothing.
+///
+/// Returns the megabytes reclaimed. It runs against the staging tree before
+/// publish, so a failure here cannot leave a damaged install visible.
+fn prune_unneeded_docs(root: &std::path::Path) -> Result<u64> {
+    let mut reclaimed = 0u64;
+    for dir in ["share", "man", "doc"] {
+        let path = root.join(dir);
+        if !path.exists() {
+            continue;
+        }
+        let size = tree_size(&path);
+        std::fs::remove_dir_all(&path)
+            .with_context(|| format!("failed to remove {}", path.display()))?;
+        reclaimed += size;
+    }
+    Ok(reclaimed)
+}
+
+/// Size of a directory tree in bytes, best effort: a file that vanishes
+/// mid-walk only makes the number an undercount, never a failure.
+fn tree_size(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                total += tree_size(&p);
+            } else if let Ok(meta) = entry.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
 }
 
 /// Compare the archive against the sidecar digest. The sidecar format is
