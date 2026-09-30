@@ -6,6 +6,7 @@
 //! from one mode to the other.
 
 use anyhow::{Context, Result};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -110,11 +111,11 @@ fn version_of(rustc: &Path) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    String::from_utf8(output.stdout)
-        .ok()?
-        .split_whitespace()
+    let text = String::from_utf8(output.stdout).ok()?;
+    // rustc appends the commit after the number; compare the number only.
+    text.split_whitespace()
         .nth(1)
-        .map(str::to_string)
+        .map(|token| token.trim_start_matches('v').to_string())
 }
 
 /// The default host target rustc reports, e.g. `x86_64-pc-windows-msvc`.
@@ -132,7 +133,87 @@ fn host_target_of(rustc: &Path) -> Option<String> {
 }
 
 /// A compiler proves itself by compiling, not by existing on disk.
+///
+/// The probe used to live only in memory: every `tarvos build`, `tarvos run`,
+/// and `tarvos verify` re-ran a full `rustc` link just to re-learn what the
+/// previous invocation already knew, and that subprocess is what made the CLI
+/// feel slow after the managed toolchain landed. The stamp file below keeps
+/// the guarantee (a compiler that cannot link is still rejected) without
+/// paying the link on every command.
+fn probe_stamp_path(rustc: &Path) -> Option<PathBuf> {
+    let home = user_home().ok()?;
+    Some(managed_root(&home).join("cache").join(format!(
+        "probe-ok-{:016x}",
+        fnv1a_64(&rustc.as_os_str().as_encoded_bytes())
+    )))
+}
+
+/// The probe a stamp certifies: the exact rustc binary, pinned channel, and
+/// host triple the stamp was written for. A stamp copied from another machine
+/// or left behind by an upgrade names a compiler this one is not, so it must
+/// never pass.
+fn probe_stamp_payload(rustc: &Path) -> Option<String> {
+    let version = version_of(rustc)?;
+    let target = host_target_of(rustc)?;
+    (version == PINNED_CHANNEL).then(|| probe_stamp_payload_for(&version, &target, rustc))
+}
+
+/// The stamp text, built from already-resolved facts so the identity rules can
+/// be tested without needing a compiler on disk. Every field is load-bearing: a
+/// stamp that omitted any one of them would let a different compiler satisfy a
+/// probe it never passed.
+fn probe_stamp_payload_for(version: &str, target: &str, rustc: &Path) -> String {
+    format!("{version}\n{target}\n{}\n", rustc.display())
+}
+
+fn probe_stamp_fresh(rustc: &Path) -> bool {
+    let (stamp, payload) = match (probe_stamp_path(rustc), probe_stamp_payload(rustc)) {
+        (Some(stamp), Some(payload)) => (stamp, payload),
+        _ => return false,
+    };
+    // Same clock rule as the probe itself: the compiler must not be newer than
+    // the stamp, otherwise the stamp certifies a binary that changed since.
+    let compiler_newer = fs::metadata(rustc)
+        .and_then(|meta| meta.modified())
+        .and_then(|modified| {
+            fs::metadata(&stamp)
+                .and_then(|stamp_meta| stamp_meta.modified())
+                .map(|stamped| modified > stamped)
+        })
+        .unwrap_or(true);
+    if compiler_newer {
+        return false;
+    }
+    fs::read_to_string(&stamp)
+        .map(|cached| cached == payload)
+        .unwrap_or(false)
+}
+
+fn record_probe_stamp(rustc: &Path) {
+    if let (Some(stamp), Some(payload)) = (probe_stamp_path(rustc), probe_stamp_payload(rustc)) {
+        if let Some(parent) = stamp.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&stamp, payload);
+    }
+}
+
+/// Stable hash for stamp file names. `std`'s `DefaultHasher` is explicitly
+/// *not* stable across processes, so it would address a different stamp file
+/// on every invocation and the cache would never hit.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 fn proves_compilation(rustc: &Path) -> bool {
+    if probe_stamp_fresh(rustc) {
+        return true;
+    }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -156,6 +237,9 @@ fn proves_compilation(rustc: &Path) -> bool {
         .map(|o| o.status.success())
         .unwrap_or(false);
     let _ = std::fs::remove_dir_all(&dir);
+    if ok {
+        record_probe_stamp(rustc);
+    }
     ok
 }
 
@@ -1026,6 +1110,49 @@ fn report_checks(checks: Vec<Check>, failed: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stamp file that cannot be addressed deterministically is worse than no
+    /// cache at all, so the hash is pinned to a published FNV-1a vector.
+    #[test]
+    fn the_stamp_hash_is_stable_and_addresses_one_file() {
+        assert_eq!(fnv1a_64(b"abc"), 0xe71fa2190541574b);
+        assert_eq!(fnv1a_64(b""), 0xcbf29ce484222325);
+        // Two different compilers must never share a stamp file, or one
+        // compiler's passing probe would vouch for the other.
+        assert_ne!(fnv1a_64(b"rustc-a"), fnv1a_64(b"rustc-b"));
+    }
+
+    /// A stamp only certifies the exact compiler, channel, and target it was
+    /// written for; anything else has to fall through to a real probe.
+    #[test]
+    fn a_stamp_for_another_compiler_never_satisfies_the_check() {
+        let certified = probe_stamp_payload_for(
+            PINNED_CHANNEL,
+            "x86_64-pc-windows-msvc",
+            Path::new(r"C:\rustup\toolchains\1.98.0\bin\rustc.exe"),
+        );
+        // A different compiler at the same version and target: the channel
+        // alone cannot vouch for a binary.
+        assert_ne!(
+            certified,
+            probe_stamp_payload_for(
+                PINNED_CHANNEL,
+                "x86_64-pc-windows-msvc",
+                Path::new(r"C:\toolchains\other\bin\rustc.exe"),
+            )
+        );
+        // A different channel for the same compiler path.
+        assert_ne!(
+            certified,
+            probe_stamp_payload_for(
+                "1.99.0",
+                "x86_64-pc-windows-msvc",
+                Path::new(r"C:\rustup\toolchains\1.98.0\bin\rustc.exe"),
+            )
+        );
+        // A stamp with a field stripped must not match either.
+        assert_ne!(certified, certified.trim_end().replace(PINNED_CHANNEL, ""));
+    }
 
     #[test]
     fn pin_and_platform_table_cover_every_target() {

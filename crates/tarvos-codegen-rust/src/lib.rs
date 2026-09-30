@@ -1100,7 +1100,14 @@ fn __tarvos_parse_int(value: &str) -> i64 {
         // surrounding whitespace, which `parse` already rejected above.
         Err(_) => match trimmed.parse::<f64>() {
             Ok(parsed) if parsed.fract() == 0.0 => parsed as i64,
-            _ => panic!("ValueError: invalid literal for int() with base 10: '{value}'"),
+            // `{}` is the message itself: `{value}` inside a plain panic!
+            // string is not an interpolation in Rust, and newer rustc warns
+            // `non_fmt_panics` on exactly that. Passing the value as an
+            // argument keeps the output identical and the warning away.
+            _ => panic!(
+                "ValueError: invalid literal for int() with base 10: '{}'",
+                value
+            ),
         },
     }
 }
@@ -1110,7 +1117,11 @@ fn __tarvos_parse_float(value: &str) -> f64 {
     let trimmed = value.trim();
     match trimmed.parse::<f64>() {
         Ok(parsed) => parsed,
-        Err(_) => panic!("ValueError: could not convert string to float: '{value}'"),
+        // Same `{value}`-is-not-an-interpolation note as `__tarvos_parse_int`.
+        Err(_) => panic!(
+            "ValueError: could not convert string to float: '{}'",
+            value
+        ),
     }
 }
 /// Python truthiness.
