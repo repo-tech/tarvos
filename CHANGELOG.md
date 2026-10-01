@@ -8,6 +8,22 @@ All notable changes to Tarvos are documented here. The format follows
 
 ### Fixed
 
+- **The fallback broke any program that reads a file next to its own source.**
+  When the native backend could not express a program, `tarvos run` did not run
+  the caller's file. It compiled a compatibility launcher, cached it under
+  `~/.tarvos/cache`, and executed that instead — so the program ran against a
+  *copy* of the source and `__file__` pointed into the cache directory. A
+  script loading a local model through `os.path.dirname(__file__)` failed with
+  the model reported as missing and the cache path named as the place it had
+  searched. A config file beside the script, or a sibling import, failed the
+  same way. The fallback now hands the interpreter the original file, so
+  `__file__` means what it means under `python main.py` and the working
+  directory is the caller's own. As a side effect the program no longer pays a
+  full `rustc` compile before it starts, and its own exit status is passed
+  through instead of being reported as a failed Tarvos run.
+  A standalone `tarvos build` executable is unchanged and still unpacks its
+  source beside itself, which is what makes it portable.
+
 - **Every command could hang for minutes on a real project.** Building the
   translation-cache key walked the input file's whole containing directory
   *recursively* and read and hashed every `.py` file it found, even though

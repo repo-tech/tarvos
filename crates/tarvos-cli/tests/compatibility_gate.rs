@@ -533,6 +533,60 @@ fn unsupported_program_uses_automatic_compatibility_runtime() {
     cleanup(project);
 }
 
+/// A program that resolves something relative to its own file must still find it
+/// under the fallback.
+///
+/// The compatibility runtime used to run a *copy* of the source out of
+/// `~/.tarvos/cache`, so `__file__` pointed into the cache and the lookup failed
+/// while naming the cache path — a local model folder, a config file, or a
+/// sibling import all broke the same way. `tarvos run` now hands the interpreter
+/// the original file.
+#[test]
+fn fallback_finds_data_beside_the_original_source() {
+    let project = temporary_project("source-relative-data");
+    write_program(
+        &project,
+        "import os\n\
+         here = os.path.dirname(os.path.abspath(__file__))\n\
+         with open(os.path.join(here, 'data.txt')) as handle:\n\
+         \x20   print('data:', handle.read().strip())\n",
+    );
+    fs::write(project.join("data.txt"), "beside-the-source\n").unwrap();
+
+    let output = run_tarvos(&project, &["run", "main.py"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "fallback run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "data: beside-the-source"),
+        "the fallback must resolve paths against the original source directory:\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    cleanup(project);
+}
+
+/// The fallback must not quietly turn a program's own exit status into a
+/// Tarvos failure. A script that calls `sys.exit(3)` has exited 3.
+#[test]
+fn fallback_passes_through_the_program_exit_status() {
+    let project = temporary_project("fallback-exit-status");
+    write_program(&project, "import sys\nprint('failing')\nsys.exit(3)\n");
+
+    let output = run_tarvos(&project, &["run", "main.py"]);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "the program's own exit code must survive the fallback:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    cleanup(project);
+}
+
 #[test]
 fn fallback_executes_cpython_and_preserves_runtime_argument() {
     let project = temporary_project("fallback");

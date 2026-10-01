@@ -1231,44 +1231,57 @@ pub(crate) fn hybrid_run_mode(args: &[String]) -> Result<()> {
                 "Running with the local Python runtime ({})",
                 summarize_native_error(&native_error)
             );
-            let result = prepare_compatibility_run(args)?;
-            return execute_native_run(&result.0, &result.1);
+            return run_source_with_local_python(args);
         }
     };
     execute_native_run(&exe_path, &runtime_args)
 }
 
-fn prepare_compatibility_run(args: &[String]) -> Result<(PathBuf, Vec<String>)> {
+/// Run the caller's own source file with the local interpreter.
+///
+/// This used to compile a compatibility launcher, cache it, and execute that
+/// instead. The launcher carries a *copy* of the source, so `__file__` pointed
+/// into `~/.tarvos/cache/...` and every program that resolved something
+/// relative to its own file broke: a script loading a local model folder from
+/// `os.path.dirname(__file__)` reported that the model was missing and named
+/// the cache path as the place it had looked. A sibling import failed the same
+/// way, and the program also paid a full `rustc` compile for the privilege.
+///
+/// There is no reason to copy the file when the original is sitting right
+/// there. The interpreter is given the same path the user typed, the working
+/// directory is the caller's own, `__file__` means what it means under
+/// `python main.py`, and the program's exit status is passed through instead of
+/// being reported as a failed Tarvos run.
+fn run_source_with_local_python(args: &[String]) -> Result<()> {
     let input_file = args
         .first()
         .ok_or_else(|| anyhow::anyhow!("usage: tarvos run <file.py> [args...]"))?;
     let working_dir = env::current_dir()?;
     let input_path = secure_input_path(input_file, &working_dir)?;
-    let source = fs::read(&input_path)
-        .with_context(|| format!("failed to read {}", input_path.display()))?;
-    let cache_dir = tarvos_cache_dir()?.join("runs");
-    fs::create_dir_all(&cache_dir)
-        .with_context(|| format!("failed to create {}", cache_dir.display()))?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    "tarvos-compat-run-v1".hash(&mut hasher);
-    input_path
-        .canonicalize()
-        .unwrap_or_else(|_| input_path.clone())
-        .to_string_lossy()
-        .hash(&mut hasher);
-    source.hash(&mut hasher);
-    let exe_path = cache_dir.join(format!(
-        "{}-compat-{:016x}{}",
-        input_path.file_stem().unwrap_or_default().to_string_lossy(),
-        hasher.finish(),
-        if cfg!(windows) { ".exe" } else { "" }
-    ));
-    if exe_path.is_file() {
-    } else {
-        let rust_source = compatibility_launcher_source(&input_path)?;
-        compile_rust_binary_opt(&exe_path, &rust_source, true)?;
+    let mut last_error = String::new();
+    // `python3` first: on Linux and macOS `python` is often absent or still
+    // bound to Python 2, while on Windows only `python` exists.
+    for interpreter in ["python3", "python"] {
+        match Command::new(interpreter)
+            .arg(&input_path)
+            .args(&args[1..])
+            .status()
+        {
+            Ok(status) => {
+                // The program's own exit status is the outcome of the command.
+                // Nothing is added to it: `tarvos run` that succeeded under
+                // CPython must still succeed under the fallback.
+                std::process::exit(status.code().unwrap_or(1));
+            }
+            Err(error) => last_error = format!("{interpreter}: {error}"),
+        }
     }
-    Ok((exe_path, args[1..].to_vec()))
+    Err(anyhow::anyhow!(
+        "no working Python interpreter was found to run {}\nTried {last_error}\n\
+         This program needs Python 3 on this machine, because the native backend cannot \
+         express what it does.",
+        input_path.display()
+    ))
 }
 
 fn warn_native_fallback(error: &anyhow::Error) {
