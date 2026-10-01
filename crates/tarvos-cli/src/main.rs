@@ -100,10 +100,17 @@ with no Python installed.
 Tarvos uses the managed toolchain in ~/.tarvos/toolchain by default. Use
 `--system-rust` to opt into an already validated system Rust.
 
+If the module uses behaviour the native backend cannot express, this command
+fails rather than emitting a launcher. Such a launcher would re-run the original
+.py file through the system `python` using a path baked in at build time, so it
+would only work on the machine that built it. Use `tarvos run` to execute the
+program on this machine, or pass `--compat-launcher` to force the launcher.
+
 Examples:
   tarvos build app.py
   tarvos build app.py -o dist/app
   tarvos build app.py --system-rust
+  tarvos build app.py --compat-launcher
   tarvos build app.py --source-only";
 
 const RUN_HELP: &str = "\
@@ -332,6 +339,11 @@ enum Commands {
         /// Use an explicitly validated system Rust instead of the managed one
         #[arg(long = "system-rust")]
         system_rust: bool,
+
+        /// Allow a launcher that requires Python at run time, for code outside
+        /// the native subset. The result is not portable.
+        #[arg(long = "compat-launcher")]
+        compat_launcher: bool,
     },
 
     /// Transpile, build, and run a Python file in one seamless step
@@ -510,6 +522,7 @@ fn main() -> Result<()> {
             output,
             source_only,
             system_rust,
+            compat_launcher,
         }) => {
             let mut args = vec![input.to_string_lossy().to_string()];
             if let Some(o) = output {
@@ -521,6 +534,9 @@ fn main() -> Result<()> {
             }
             if system_rust {
                 args.push("--system-rust".to_string());
+            }
+            if compat_launcher {
+                args.push("--compat-launcher".to_string());
             }
             build_mode(&args)
         }
@@ -689,6 +705,7 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
     let mut output_file = "tarvos_app.exe".to_string();
     let mut source_only = false;
     let mut prefer_system = false;
+    let mut allow_compat_launcher = false;
     let mut iter = args.iter();
     let input_file = iter
         .next()
@@ -704,6 +721,9 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
             "--system-rust" => {
                 prefer_system = true;
             }
+            "--compat-launcher" => {
+                allow_compat_launcher = true;
+            }
             _ => {
                 if output_file == "tarvos_app.exe" {
                     output_file = arg.clone();
@@ -718,6 +738,27 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
     let (rust_source, compatibility_launcher) = match transpile_python_to_rust(&input_path) {
         Ok(source) => (source, false),
         Err(error) if is_dynamic_native_error(&error) => {
+            // `build` produces an artifact meant to be shipped to another machine,
+            // so a launcher that needs the original .py file, a Python install and
+            // the build machine's absolute path is not a build the caller asked
+            // for. It used to be produced anyway, and the only trace was one line
+            // of output; the resulting executable then failed on any machine
+            // without the same paths, which is exactly where it was supposed to
+            // work. Refusing here is the only failure that happens early enough to
+            // be cheap.
+            if !allow_compat_launcher {
+                return Err(anyhow::anyhow!(
+                    "{error}\n\n\
+                     `tarvos build` did not produce a native binary. The program uses Python \
+                     behaviour the native backend cannot express, so the only thing that could \
+                     be built here is a launcher that re-runs the original .py file through the \
+                     system `python`. Such an executable is not portable: it needs that file at \
+                     its original path, plus a Python installation, and it fails on every \
+                     machine that does not have both.\n\n\
+                     To run it on this machine instead of shipping it, use `tarvos run`.\n\
+                     To force the launcher anyway, pass --compat-launcher."
+                ));
+            }
             warn_native_fallback(&error);
             (compatibility_launcher_source(&input_path)?, true)
         }

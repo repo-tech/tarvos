@@ -8,6 +8,21 @@ All notable changes to Tarvos are documented here. The format follows
 
 ### Fixed
 
+- **`tarvos build` could emit an executable that was not a build of the program.**
+  When a module used behaviour the native backend cannot express, the command
+  fell back to a launcher: a tiny Rust program that re-ran the original `.py`
+  file through the system `python`, using a path baked in at build time. The
+  result only ever worked on the machine that built it. It carried the original
+  absolute path, needed a Python installation and the original source file
+  beside it, and the help text claimed such binaries embed no interpreter. A
+  Windows executable produced this way failed under Wine with
+  `failed to start Python compatibility runtime: program not found`, and would
+  fail identically on any target machine. `build` now stops with an error that
+  names the unsupported construct, explains why the launcher is not portable,
+  points at `tarvos run` for executing the program locally, and names the new
+  `--compat-launcher` flag for callers who want it anyway. `run` still falls back
+  automatically, which is the right default for a command meant to execute
+  something now rather than ship it.
 - **`tarvos build` produced a binary tied to the CPU of the build machine.** The
   release path passed `-C target-cpu=native`, which tunes generated code for
   whichever processor happened to run the build. A binary produced on a recent
