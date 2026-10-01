@@ -91,7 +91,7 @@ def _cli_surface(a: Audit, work: pathlib.Path) -> pathlib.Path:
     # here, so cutting a release cannot leave this audit asserting a version the
     # binary no longer reports. A packaging build may pin a different product
     # line, so only the shape is required unless TARVOS_PRODUCT_VERSION is unset.
-    expected = os.environ.get("TARBOS_PRODUCT_VERSION") or workspace_version()
+    expected = os.environ.get("TARVOS_PRODUCT_VERSION") or workspace_version()
     a.check("--version", proc.returncode == 0 and expected in proc.stdout,
             proc.stdout.strip()[:60])
 

@@ -256,10 +256,10 @@ Example:
 /// The compiler and the public distribution are released on independent version
 /// lines: the compiler ships many release candidates, while the packaged engine
 /// is cut when there is something worth publishing. A build can therefore pin
-/// the user-facing line with `TARBOS_PRODUCT_VERSION`; without it the crate
+/// the user-facing line with `TARVOS_PRODUCT_VERSION`; without it the crate
 /// version is used, so a plain `cargo build` still reports the compiler version
 /// and the version-consistency gate keeps passing.
-const PRODUCT_VERSION: &str = match option_env!("TARBOS_PRODUCT_VERSION") {
+const PRODUCT_VERSION: &str = match option_env!("TARVOS_PRODUCT_VERSION") {
     Some(version) => version,
     None => env!("CARGO_PKG_VERSION"),
 };

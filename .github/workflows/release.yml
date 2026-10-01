@@ -277,7 +277,7 @@ jobs:
       # distribution cut sets this to the engine version (for example 1.0.0) so
       # the published binaries report the product release a user installed,
       # rather than the compiler candidate they were built from.
-      TARBOS_PRODUCT_VERSION: ${{ vars.TARVOS_PRODUCT_VERSION || '' }}
+      TARVOS_PRODUCT_VERSION: ${{ vars.TARVOS_PRODUCT_VERSION || '' }}
 
     steps:
       - name: Check out the release tag
@@ -334,7 +334,7 @@ jobs:
           # A distribution cut pins the product line to the engine version, which
           # by design is not the compiler tag, so the comparison is made against
           # whichever version line this build was asked to report.
-          expected="${TARBOS_PRODUCT_VERSION:-${RELEASE_TAG#v}}"
+          expected="${TARVOS_PRODUCT_VERSION:-${RELEASE_TAG#v}}"
           case "$reported" in
             *"$expected") ;;
             *)
