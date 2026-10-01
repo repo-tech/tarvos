@@ -6,6 +6,27 @@ All notable changes to Tarvos are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tarvos build` produced a binary tied to the CPU of the build machine.** The
+  release path passed `-C target-cpu=native`, which tunes generated code for
+  whichever processor happened to run the build. A binary produced on a recent
+  CPU could fault with an illegal instruction on an older one, so a program
+  built here was not guaranteed to run there. The baseline is used instead and
+  the output stays portable across processors of the same architecture. The
+  release workflow deliberately avoided this flag for the same reason, which
+  made a `tarvos build` output *less* portable than the release binary built
+  from the same commit.
+- **A missing managed toolchain silently fell back to whatever Rust was on
+  `PATH`.** The toolchain module states that nothing in it may silently fall
+  back from one mode to the other, and the function performing the fallback
+  claims the managed path never consults `PATH`; both were untrue of this path.
+  On a machine with an old system Rust the build continued against it and
+  surfaced as `unexpected argument '-C' found` naming `rustup`, a program the
+  user never asked for. The fallback is kept — a developer with a working system
+  Rust should still be able to build — but it now announces itself, names the
+  compiler it fell back to, and points at `tarvos toolchain --install`.
+
 ### Added
 
 - **The managed toolchain install now shows a real progress meter.** Fetching the

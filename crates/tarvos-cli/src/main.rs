@@ -1729,11 +1729,32 @@ fn compile_rust_binary_toolchain(
             // An explicit mode never degrades into another one.
             Err(managed_error)
         } else {
-            ensure_rust_toolchain()
-                .map(toolchain::legacy_system_toolchain)
-                .map_err(|legacy_error| {
-                    anyhow::anyhow!("{managed_error}\nLegacy system-Rust fallback also failed: {legacy_error}\nRun `tarvos toolchain --install` once for the managed compiler.")
-                })
+            // Reaching here means the managed toolchain is absent, so PATH is
+            // consulted. That contradicts the contract stated above and used to
+            // happen without a word: the build then continued against whatever
+            // `rustc` happened to be installed, which on an old machine surfaced
+            // as `unexpected argument '-C' found` from rustup — an error naming
+            // a program the user never asked for. The fallback is kept because a
+            // developer with a working system Rust should still be able to build,
+            // but it is announced, and a compiler too old to accept the flags
+            // this command passes is rejected before it is used.
+            match ensure_rust_toolchain().map(toolchain::legacy_system_toolchain) {
+                Ok(legacy) => {
+                    eprintln!(
+                        "Warning: no managed toolchain; falling back to {} ({}).",
+                        legacy.source, legacy.version
+                    );
+                    eprintln!(
+                        "Warning: this is NOT the pinned toolchain. Run \
+                         `tarvos toolchain --install` for a reproducible build."
+                    );
+                    Ok(legacy)
+                }
+                Err(legacy_error) => Err(anyhow::anyhow!(
+                    "{managed_error}\nSystem Rust could not be used either: {legacy_error}\nRun \
+                     `tarvos toolchain --install` once for the managed compiler."
+                )),
+            }
         }
     })?;
     let rustc = resolved.rustc;
@@ -1775,9 +1796,15 @@ fn compile_rust_binary_toolchain(
             .arg("-C")
             .arg("codegen-units=1")
             .arg("-C")
-            .arg("target-cpu=native")
-            .arg("-C")
             .arg("strip=symbols");
+        // `target-cpu=native` used to be passed here. It tunes the generated code
+        // for whichever CPU happened to run the build, so a binary produced on a
+        // recent processor died with SIGILL on an older one. A build tool cannot
+        // know the machine a program will run on, so the baseline is used and the
+        // result stays portable across processors of the same architecture. The
+        // release workflow already took this position for the same reason; a
+        // `tarvos build` output was therefore *less* portable than the release
+        // binary of the same commit.
     }
 
     let status = cmd
