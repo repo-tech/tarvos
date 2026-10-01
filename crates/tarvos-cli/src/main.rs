@@ -1732,7 +1732,7 @@ fn compile_rust_binary_toolchain(
             ensure_rust_toolchain()
                 .map(toolchain::legacy_system_toolchain)
                 .map_err(|legacy_error| {
-                    anyhow::anyhow!("{managed_error}\nLegacy system-Rust fallback also failed: {legacy_error}\nRun `tarvos toolchain install` once for the managed compiler.")
+                    anyhow::anyhow!("{managed_error}\nLegacy system-Rust fallback also failed: {legacy_error}\nRun `tarvos toolchain --install` once for the managed compiler.")
                 })
         }
     })?;

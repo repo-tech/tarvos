@@ -7,8 +7,11 @@
 
 use anyhow::{Context, Result};
 use std::fs;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::which_simple;
 
@@ -19,7 +22,7 @@ use crate::which_simple;
 pub const PINNED_CHANNEL: &str = "1.98.0";
 
 /// Which host each managed installer is expected to run on. Used by the
-/// `toolchain install` listing (Milestone 2); kept here so the manager is
+/// `toolchain --install` listing (Milestone 2); kept here so the manager is
 /// the single place that names platforms.
 #[allow(dead_code)]
 pub const EXPECTED_TRIPLES: &[(&str, &str)] = &[
@@ -252,7 +255,7 @@ pub fn resolve(prefer_system: bool) -> Result<ResolvedToolchain> {
     match resolve_managed() {
         Ok(found) => Ok(found),
         Err(managed_error) => Err(anyhow::anyhow!(
-            "{managed_error} Run `tarvos toolchain install` once, or pass --system-rust to use an explicitly validated system compiler."
+            "{managed_error} Run `tarvos toolchain --install` once, or pass --system-rust to use an explicitly validated system compiler."
         )),
     }
 }
@@ -282,32 +285,32 @@ fn resolve_managed() -> Result<ResolvedToolchain, ToolchainError> {
         return Err(ToolchainError {
             mode: ToolchainMode::Managed,
             reason: format!("no managed rustc at {}", rustc.display()),
-            hint: "run `tarvos toolchain install` once to fetch the pinned channel.".to_string(),
+            hint: "run `tarvos toolchain --install` once to fetch the pinned channel.".to_string(),
         });
     }
     let version = version_of(&rustc).ok_or_else(|| ToolchainError {
         mode: ToolchainMode::Managed,
         reason: format!("managed rustc at {} did not report a version", rustc.display()),
-        hint: "run `tarvos toolchain verify`; if it still fails, reinstall with `tarvos toolchain install`."
+        hint: "run `tarvos toolchain --verify`; if it still fails, reinstall with `tarvos toolchain --install`."
             .to_string(),
     })?;
     if !version.starts_with(PINNED_CHANNEL) {
         return Err(ToolchainError {
             mode: ToolchainMode::Managed,
             reason: format!("managed rustc reports {version} but Tarvos expects {PINNED_CHANNEL}"),
-            hint: "run `tarvos toolchain install` to refresh the managed compiler.".to_string(),
+            hint: "run `tarvos toolchain --install` to refresh the managed compiler.".to_string(),
         });
     }
     let target = host_target_of(&rustc).ok_or_else(|| ToolchainError {
         mode: ToolchainMode::Managed,
         reason: "managed rustc did not report a host target".to_string(),
-        hint: "run `tarvos toolchain verify`.".to_string(),
+        hint: "run `tarvos toolchain --verify`.".to_string(),
     })?;
     if !proves_compilation(&rustc) {
         return Err(ToolchainError {
             mode: ToolchainMode::Managed,
             reason: "managed rustc exists but cannot compile a probe program".to_string(),
-            hint: "run `tarvos toolchain verify`; if it still fails, reinstall.".to_string(),
+            hint: "run `tarvos toolchain --verify`; if it still fails, reinstall.".to_string(),
         });
     }
     Ok(ResolvedToolchain {
@@ -376,7 +379,7 @@ fn resolve_system() -> Result<ResolvedToolchain> {
     Err(anyhow::anyhow!(ToolchainError {
         mode: ToolchainMode::System,
         reason: "no system toolchain validated".to_string(),
-        hint: "install rust or run `tarvos toolchain install`.".to_string(),
+        hint: "install rust or run `tarvos toolchain --install`.".to_string(),
     }))
 }
 
@@ -620,18 +623,23 @@ fn install_managed() -> Result<()> {
     }
     std::fs::create_dir_all(&staging)
         .with_context(|| format!("failed to create {}", staging.display()))?;
+    // Every phase below prints where it got to, because a several-hundred-megabyte
+    // install is long enough that a silent stretch reads as a hang.
+    let started = Instant::now();
     println!("Fetching pinned toolchain {PINNED_CHANNEL} for {triple}");
     println!("Source: {url}");
-    download_to(&url, &staging.join("rust.tar.gz"))?;
+    let archive = download_to(&url, &staging.join("rust.tar.gz"), "  Downloading")?;
     download_to(
         &format!("{url}.sha256"),
         &staging.join("rust.tar.gz.sha256"),
+        "  Checksum   ",
     )?;
+    step(2, 6, "Verifying the SHA-256 checksum");
     verify_sha256(
         &staging.join("rust.tar.gz"),
         &staging.join("rust.tar.gz.sha256"),
     )?;
-    println!("Checksum verified. Extracting...");
+    step(3, 6, "Unpacking the components");
     let unpacked = staging.join(format!("rust-{PINNED_CHANNEL}-{triple}"));
     let installed = staging.join("installed");
 
@@ -643,13 +651,21 @@ fn install_managed() -> Result<()> {
     // outright on the claim that the archive had no install.sh at all. Both
     // halves of that were wrong, and the second one sent users to a manual
     // install for a path that works unattended.
+    step(4, 6, "Laying out the toolchain");
     #[cfg(windows)]
     {
         assemble_windows_toolchain(&staging.join("rust.tar.gz"), &staging, &installed, &triple)?;
     }
     #[cfg(not(windows))]
     {
-        extract_tar_gz(&staging.join("rust.tar.gz"), &staging)?;
+        // Only the three components Tarvos can drive are unpacked. A full
+        // extraction also writes the documentation trees, which measured at
+        // close to a gigabyte and which neither rustc nor cargo ever reads, and
+        // install.sh then copies its components a second time. Selecting at the
+        // archive is what makes this the fastest part of the install instead of
+        // the slowest. install.sh only lays down the components it was asked for,
+        // so the missing documentation is not something it will go looking for.
+        extract_components(&staging.join("rust.tar.gz"), &staging, &triple)?;
         run_install_sh(&unpacked.join("install.sh"), &installed, &triple)?;
     }
     let _ = &unpacked;
@@ -660,6 +676,7 @@ fn install_managed() -> Result<()> {
             rustc.display()
         ));
     }
+    step(5, 6, "Validating the installed compiler");
     // Validate before publish: a broken compiler must fail here, not later.
     let version = version_of(&rustc).ok_or_else(|| {
         anyhow::anyhow!("installed rustc reported no version; refusing a partial install")
@@ -687,6 +704,7 @@ fn install_managed() -> Result<()> {
             reclaimed / (1024 * 1024)
         );
     }
+    step(6, 6, "Publishing the toolchain");
     if root.exists() {
         std::fs::remove_dir_all(&root)
             .with_context(|| format!("failed to replace {}", root.display()))?;
@@ -698,38 +716,273 @@ fn install_managed() -> Result<()> {
     std::fs::rename(&installed, &root)
         .with_context(|| format!("failed to publish {}", root.display()))?;
     let _ = std::fs::remove_dir_all(&staging);
+    println!();
     println!("Managed toolchain installed at {}", root.display());
     println!("Version: {version}");
+    // The closing numbers are the ones a user asks for afterwards: what came
+    // over the network, what it took, and what it left on the disk.
+    println!(
+        "Downloaded: {:.1} MB in {:.1}s ({})",
+        as_mb(archive.bytes as f64),
+        archive.elapsed.as_secs_f64(),
+        format_rate(archive.bytes as f64 / archive.elapsed.as_secs_f64().max(0.001))
+    );
     println!("Installed size: {installed_mb} MB");
+    println!("Total time: {:.1}s", started.elapsed().as_secs_f64());
     Ok(())
 }
 
-/// Fetch `url` straight to `dest`, streaming to disk with progress shown.
+/// Total bytes at `url`, or `None` when the server does not say.
+///
+/// A `HEAD` is enough and costs one round trip instead of a second transfer of a
+/// few hundred megabytes. The header repeats across a redirect chain, so the last
+/// value seen is the one for the resource that will actually be written.
+fn remote_size(url: &str) -> Option<u64> {
+    let output = Command::new("curl")
+        .args(["--proto", "=https", "--tlsv1.2", "-sSIL"])
+        .arg(url)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut size = None;
+    for line in text.lines() {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                size = value.trim().parse::<u64>().ok();
+            }
+        }
+    }
+    size
+}
+
+/// What one completed transfer cost, for the closing summary.
+struct Downloaded {
+    bytes: u64,
+    elapsed: Duration,
+}
+
+/// Render a byte count the way a platform installer does, in binary megabytes so
+/// the number matches what the user sees in a file manager.
+fn as_mb(bytes: f64) -> f64 {
+    bytes / (1024.0 * 1024.0)
+}
+
+/// Transfer rate, dropping to KB/s only when the rate is genuinely small.
+fn format_rate(bytes_per_second: f64) -> String {
+    if bytes_per_second >= 1024.0 * 1024.0 {
+        format!("{:.1} MB/s", as_mb(bytes_per_second))
+    } else if bytes_per_second >= 1024.0 {
+        format!("{:.0} KB/s", bytes_per_second / 1024.0)
+    } else {
+        // A rate that rounds to "0 KB/s" reads as a stall rather than as a
+        // four-hundred-byte checksum file that arrived instantly.
+        "<1 KB/s".to_string()
+    }
+}
+
+/// Remaining time as `MM:SS`, blank before there is enough signal to mean it.
+fn format_eta(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 || seconds > 24.0 * 3600.0 {
+        return "--:--".to_string();
+    }
+    format!(
+        "{:02}:{:02}",
+        (seconds / 60.0) as u64,
+        (seconds % 60.0) as u64
+    )
+}
+
+/// One numbered line of the install plan, so the phases that have no byte
+/// counter still show that something is happening and roughly where it got to.
+fn step(index: usize, total: usize, label: &str) {
+    println!("  [{index}/{total}] {label}");
+}
+
+/// A live download meter.
+///
+/// Two output modes, because one of them is always wrong somewhere. An
+/// interactive terminal gets a single line redrawn in place; a log or CI capture
+/// gets one line per decile instead, because a carriage return in a saved log is
+/// a file full of overwritten lines and no visible progress at all. The meter
+/// goes to stderr either way so the rest of stdout stays parseable.
+///
+/// Without a known total it still counts bytes and rate, which is the half a user
+/// needs most; the percentage is omitted rather than invented.
+struct Progress {
+    label: String,
+    total: Option<u64>,
+    started: Instant,
+    interactive: bool,
+    last_reported: u8,
+    drawn: bool,
+}
+
+impl Progress {
+    fn new(label: &str, total: Option<u64>) -> Self {
+        Progress {
+            label: label.to_string(),
+            total,
+            started: Instant::now(),
+            interactive: std::io::stderr().is_terminal(),
+            last_reported: 0,
+            drawn: false,
+        }
+    }
+
+    /// Redraw at `done` bytes. Cheap enough to call on every poll.
+    fn tick(&mut self, done: u64) {
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let rate = if elapsed > 0.0 {
+            done as f64 / elapsed
+        } else {
+            0.0
+        };
+
+        if self.interactive {
+            self.draw(done, rate);
+        } else if let Some(total) = self.total.filter(|t| *t > 0) {
+            let percent = ((done.min(total) * 100) / total) as u8;
+            // One line per decile: enough to show movement in a log, not so many
+            // that a 250 MB download buries the rest of the output.
+            if percent / 10 > self.last_reported / 10 || percent == 100 {
+                self.last_reported = percent;
+                let eta = total.saturating_sub(done) as f64 / rate.max(1.0);
+                self.line(&format!(
+                    "  {} {:>3}%  {:>7.1} MB / {:.1} MB  {}  ETA {}",
+                    self.label,
+                    percent,
+                    as_mb(done as f64),
+                    as_mb(total as f64),
+                    format_rate(rate),
+                    format_eta(eta)
+                ));
+            }
+        }
+    }
+
+    fn draw(&mut self, done: u64, rate: f64) {
+        const WIDTH: usize = 28;
+        let (filled, percent_text, size_text, eta_text) = match self.total {
+            Some(total) if total > 0 => {
+                let ratio = (done as f64 / total as f64).clamp(0.0, 1.0);
+                let eta = total.saturating_sub(done) as f64 / rate.max(1.0);
+                (
+                    (ratio * WIDTH as f64).round() as usize,
+                    format!("{:>5.1}%", ratio * 100.0),
+                    format!("{:.1} / {:.1} MB", as_mb(done as f64), as_mb(total as f64)),
+                    format_eta(eta),
+                )
+            }
+            // No Content-Length: bytes and rate are still honest and useful.
+            _ => (
+                0,
+                String::new(),
+                format!("{:.1} MB", as_mb(done as f64)),
+                String::new(),
+            ),
+        };
+
+        let line = format!(
+            "\r  {} [{}{}] {:>6}  {:>17}  {:>10}  ETA {}   ",
+            self.label,
+            "#".repeat(filled),
+            "-".repeat(WIDTH.saturating_sub(filled)),
+            percent_text,
+            size_text,
+            format_rate(rate),
+            eta_text
+        );
+        self.write(&line);
+        self.drawn = true;
+    }
+
+    /// Final line: the transfer as a whole, once the bar is no longer useful.
+    fn finish(&mut self, done: u64, elapsed: Duration) {
+        if self.drawn {
+            // Erase the in-place line so the summary is not written over it.
+            self.write(&format!("\r{0:80}\r", ""));
+        }
+        let rate = done as f64 / elapsed.as_secs_f64().max(0.001);
+        self.line(&format!(
+            "  {} {:.1} MB in {:.1}s ({})",
+            self.label,
+            as_mb(done as f64),
+            elapsed.as_secs_f64(),
+            format_rate(rate)
+        ));
+    }
+
+    fn line(&self, text: &str) {
+        self.write(&format!("{text}\n"));
+    }
+
+    fn write(&self, text: &str) {
+        let mut err = std::io::stderr();
+        // A closed or piped-away stderr must never fail an install that is
+        // otherwise fine, so a write error here is deliberately ignored.
+        let _ = err.write_all(text.as_bytes());
+        let _ = err.flush();
+    }
+}
+
+/// Fetch `url` straight to `dest`, streaming to disk with a live meter.
 ///
 /// Every platform Tarvos targets ships `curl`: POSIX from the base install,
-/// Windows since 8.1 as `system32\curl.exe`. Streaming matters for two
-/// reasons that a user actually notices. The archive is hundreds of
-/// megabytes, so buffering it in memory before writing meant the staging
-/// directory reported 0 MB for the whole download and a machine with little
-/// headroom could fail on the allocation. And with the transfer tool's
-/// progress line visible, a slow connection looks busy rather than hung,
-/// which is the difference between a user waiting and a user giving up.
-fn download_to(url: &str, dest: &std::path::Path) -> Result<()> {
-    // --progress-bar: a plain -s hides everything, and a bare -S prints only
-    // errors. The bar writes to stderr so the rest of the tool's stdout stays
-    // machine-readable.
-    let status = Command::new("curl")
-        .args(["--proto", "=https", "--tlsv1.2", "-sSfL", "--progress-bar"])
+/// Windows since 8.1 as `system32\curl.exe`. Streaming matters for two reasons a
+/// user actually notices. The archive is hundreds of megabytes, so buffering it
+/// in memory before writing meant the staging directory reported 0 MB for the
+/// whole download and a machine with little headroom could fail on the
+/// allocation.
+///
+/// The meter is drawn here rather than by curl for two more. curl's own bar goes
+/// silent when its output is redirected, which is exactly the CI and log case
+/// where progress matters most. And its format differs between platforms and
+/// curl versions, so a screenshot of one host would not describe another.
+/// Polling the size of the file curl is writing gives the same numbers
+/// everywhere and keeps the percentages and rates consistent.
+fn download_to(url: &str, dest: &std::path::Path, label: &str) -> Result<Downloaded> {
+    let total = remote_size(url);
+    let started = Instant::now();
+
+    let mut child = Command::new("curl")
+        .args(["--proto", "=https", "--tlsv1.2", "-sSfL"])
         .arg(url)
         .arg("-o")
         .arg(dest)
-        .status()
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
         .with_context(|| format!("failed to start download of {url}"))?;
+
+    let mut progress = Progress::new(label, total);
+    // Poll rather than read a pipe: curl owns the write, and the size of the
+    // file it is writing is the one byte count that cannot disagree with what
+    // actually landed on disk.
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                let done = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+                progress.tick(done);
+                // 120ms looks continuous to the eye and slow enough that polling
+                // never competes with curl for the disk it is writing to.
+                thread::sleep(Duration::from_millis(120));
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("failed to wait for the download of {url}")))
+            }
+        }
+    }
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to finish the download of {url}"))?;
     if !status.success() {
         return Err(anyhow::anyhow!(
             "download failed for {url} (see the transfer output above)"
         ));
     }
+
     let written = std::fs::metadata(dest)
         .map(|m| m.len())
         .with_context(|| format!("failed to stat {}", dest.display()))?;
@@ -738,7 +991,25 @@ fn download_to(url: &str, dest: &std::path::Path) -> Result<()> {
             "{url} downloaded 0 bytes; refusing to continue with an empty file"
         ));
     }
-    Ok(())
+    // A short read is the one failure a byte counter can catch that curl itself
+    // reports as success: a connection that dropped cleanly at a boundary would
+    // otherwise be handed to the checksum step as if it were complete.
+    if let Some(expected) = total {
+        if written != expected {
+            return Err(anyhow::anyhow!(
+                "{url} was truncated: received {} bytes but the server announced {}",
+                written,
+                expected
+            ));
+        }
+    }
+
+    let elapsed = started.elapsed();
+    progress.finish(written, elapsed);
+    Ok(Downloaded {
+        bytes: written,
+        elapsed,
+    })
 }
 
 /// Remove documentation and shell-completion trees after a successful
@@ -908,21 +1179,44 @@ fn digest_hex(bytes: &[u8]) -> String {
     h.iter().map(|w| format!("{w:08x}")).collect()
 }
 
-/// Unpack a `.tar.gz` using the platform tar, so no archive crate is needed.
+/// Unpack only the components Tarvos can drive, using the platform tar so no
+/// archive crate is needed.
 ///
 /// Unix only: Windows assembles the components itself in
-/// ssemble_windows_toolchain because the shipped install.sh is POSIX.
+/// `assemble_windows_toolchain` because the shipped install.sh is POSIX.
+///
+/// Selecting the members is the difference between a fast install and a slow
+/// one. The distribution archive carries rust-docs, rust-html and rustc-docs
+/// alongside the three components a build needs, and a full extract writes all of
+/// it to disk only for the next step to copy three directories out of it and
+/// discard the rest. Naming the members costs one extra tar argument and none of
+/// the work.
 #[cfg(not(windows))]
-fn extract_tar_gz(archive: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+fn extract_components(
+    archive: &std::path::Path,
+    dest: &std::path::Path,
+    triple: &str,
+) -> Result<()> {
+    let dist_dir = format!("rust-{PINNED_CHANNEL}-{triple}");
     let status = Command::new("tar")
-        .args(["-xzf"])
+        .arg("-xzf")
         .arg(archive)
         .arg("-C")
         .arg(dest)
+        .arg(format!("{dist_dir}/rustc"))
+        .arg(format!("{dist_dir}/cargo"))
+        .arg(format!("{dist_dir}/rust-std-{triple}"))
         .status()
         .with_context(|| format!("failed to unpack {}", archive.display()))?;
     if !status.success() {
-        return Err(anyhow::anyhow!("failed to unpack {}", archive.display()));
+        // A missing member makes tar exit non-zero even when everything else was
+        // unpacked, so the message names the components rather than implying the
+        // whole download was bad.
+        return Err(anyhow::anyhow!(
+            "failed to unpack the compiler components from {}; the archive does not contain \
+             rustc, cargo and rust-std for {triple}",
+            archive.display()
+        ));
     }
     Ok(())
 }
@@ -1031,7 +1325,7 @@ fn copy_tree(src: &std::path::Path, dest: &std::path::Path) -> Result<()> {
 
 /// Run the static distribution's install.sh with `--prefix` inside our tree.
 ///
-/// Unix only, for the same reason as extract_tar_gz.
+/// Unix only, for the same reason as extract_components.
 #[cfg(not(windows))]
 fn run_install_sh(script: &std::path::Path, prefix: &std::path::Path, triple: &str) -> Result<()> {
     #[cfg(windows)]

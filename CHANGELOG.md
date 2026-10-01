@@ -4,6 +4,47 @@ All notable changes to Tarvos are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **The managed toolchain install now shows a real progress meter.** Fetching the
+  pinned channel used to hand the transfer to `curl --progress-bar`, which draws a
+  bare bar, prints nothing at all when its output is redirected, and renders
+  differently on each platform and curl version. `tarvos toolchain --install` now
+  draws its own meter from the size of the file being written, so the same run
+  reports the same numbers everywhere: percentage complete, megabytes received of
+  megabytes expected, current transfer rate, and a remaining-time estimate. An
+  interactive terminal gets one line redrawn in place; a redirected log or CI run
+  gets one line per 10% rather than a file full of overwritten lines. The closing
+  summary reports the downloaded size, the average rate, the installed size, and
+  the total wall-clock time.
+- The install reports each phase it enters (`[2/6]` through `[6/6]`), so the
+  steps that move no bytes — checksum, unpack, validate, publish — are visibly
+  distinct instead of appearing as a silent pause.
+
+### Changed
+
+- **The Unix install unpacks only the components it uses.** The distribution
+  archive carries `rust-docs`, `rust-html` and `rustc-docs` alongside `rustc`,
+  `cargo` and `rust-std`, and a full extraction wrote all of it to disk only for
+  `install.sh` to copy three directories out of it and discard the rest. Selecting
+  the members at the archive skips the bulk of the bytes written. The Windows
+  path has always done this; the Unix path now matches it. `install.sh` is still
+  what lays out the prefix, so the resulting tree is unchanged.
+
+### Fixed
+
+- A truncated download is now rejected. `curl` can exit successfully when a
+  connection drops cleanly at a boundary, and the short file was handed to the
+  checksum step as though it were complete. The installer now compares the byte
+  count against the size the server announced and refuses to continue on a
+  mismatch.
+- Several hints and error messages spelled the command `tarvos toolchain
+  install`, which reads as a subcommand and is rejected. They now say
+  `tarvos toolchain --install`, matching the top-level help, the managed
+  toolchain documentation, and the verification scripts.
+
 ## [1.1.0-rc.6] - 2026-09-30
 
 A correctness release. `1.1.0-rc.5` shipped a real bug in which a tuple
@@ -80,7 +121,7 @@ CLI start no longer re-proves what the previous command already proved.
 
 ### Added - managed toolchain
 
-- `tarvos toolchain install` fetches the pinned channel into
+- `tarvos toolchain --install` fetches the pinned channel into
   `~/.tarvos/toolchain` and verifies its SHA-256 before use.
 - `tarvos toolchain --status` and `--verify` report the resolved toolchain, its
   layout, and per-stage validation.
