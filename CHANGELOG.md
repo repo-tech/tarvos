@@ -8,6 +8,20 @@ All notable changes to Tarvos are documented here. The format follows
 
 ### Fixed
 
+- **Every command could hang for minutes on a real project.** Building the
+  translation-cache key walked the input file's whole containing directory
+  *recursively* and read and hashed every `.py` file it found, even though
+  `tarvos run main.py` compiles exactly one file. A project that keeps a
+  `transformers` checkout beside its script made each command process 19,705
+  files before printing a single line: a 37-byte program took over 90 seconds
+  and had still not finished. The key now covers the program and its
+  same-directory siblings, which still catches an edited helper module, with a
+  budget of 512 files and 8 MB so no single directory can dominate a command.
+  Directory symlinks are skipped instead of followed, so a virtualenv's
+  `lib64 -> lib` is no longer traversed twice. Measured on that project:
+  `tarvos run main.py` went from "still running after 90 s" to 180 ms, and
+  `tarvos compile --format exe` and `tarvos build` both settled at ~270 ms.
+
 - **`tarvos build` and `tarvos compile --format exe` paid for `rustc` on every
   invocation.** The generated Rust was written to the cache and hashed, but the
   compiled binary was never kept or reused, so each call ran a full fat-LTO

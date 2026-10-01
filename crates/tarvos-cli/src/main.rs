@@ -1766,43 +1766,73 @@ fn tarvos_cache_dir() -> Result<PathBuf> {
         .join("tarvos-cache-v1.0-r12"))
 }
 
-fn hash_project_sources(root: &Path, hasher: &mut impl Hasher) -> Result<()> {
-    let mut files = Vec::new();
-    collect_python_sources(root, &mut files)?;
-    files.sort();
-    for path in files {
-        path.to_string_lossy().hash(hasher);
-        let content = fs::read(&path)
-            .with_context(|| format!("failed to read project source {}", path.display()))?;
-        content.hash(hasher);
-    }
-    Ok(())
-}
+/// Most sibling files whose content will go into a translation-cache key.
+///
+/// A directory with more Python files than this is a library checkout, not a
+/// script, and the key stops there instead of reading all of it.
+const SIBLING_SOURCE_LIMIT: usize = 512;
 
-fn collect_python_sources(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    if !root.is_dir() {
-        return Ok(());
-    }
+/// Most sibling bytes hashed for one cache key.
+const SIBLING_BYTE_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// Fold the program that is about to be compiled, and the modules sitting
+/// beside it, into the translation-cache key.
+///
+/// This used to walk the whole containing directory *recursively* and hash
+/// every `.py` file underneath it. `tarvos run main.py` compiles exactly one
+/// file, so that walk bought nothing the compiler does not already see, and it
+/// was ruinously expensive: on a project that keeps a `transformers` checkout
+/// next to the script, every single command read and hashed 19,705 files
+/// before printing a single line — minutes of CPU for a 37-byte program. It
+/// also followed directory symlinks, so a `lib64 -> lib` link in a virtualenv
+/// was traversed a second time through its own alias.
+///
+/// Only same-directory siblings are hashed now. That still covers the reason
+/// the key exists — edit a helper module, get a fresh translation — while the
+/// cost is bounded and independent of what else is checked out nearby.
+fn hash_project_sources(root: &Path, hasher: &mut impl Hasher) -> Result<()> {
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
     for entry in fs::read_dir(root)
         .with_context(|| format!("failed to read project directory {}", root.display()))?
     {
-        let entry = entry?;
-        let path = entry.path();
+        let path = entry?.path();
+        // `Path::is_file` follows symlinks. A link is skipped explicitly so a
+        // directory that points at an ancestor can never be traversed twice,
+        // and so a broken link is not mistaken for a source file.
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("py") {
+            continue;
+        }
         let name = path
             .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("");
-        if path.is_dir()
-            && !matches!(
-                name,
-                ".git" | ".venv" | "target" | "__pycache__" | "node_modules"
-            )
-        {
-            collect_python_sources(&path, files)?;
-        } else if path.is_file() && path.extension().and_then(|value| value.to_str()) == Some("py")
-        {
-            files.push(path);
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        files.push((name, path));
+    }
+    // Sorted by name, not by path, so the key does not depend on the order the
+    // filesystem happens to return entries in.
+    files.sort();
+    let mut hashed_files = 0usize;
+    let mut hashed_bytes = 0u64;
+    for (name, path) in files {
+        if hashed_files >= SIBLING_SOURCE_LIMIT || hashed_bytes >= SIBLING_BYTE_LIMIT {
+            // Past the budget the key is still correct, just less sensitive to
+            // an edit in one of the files that were not read. Stopping is the
+            // right trade: a stale key costs one recompile, an unbounded walk
+            // costs minutes on every command.
+            break;
         }
+        let content = fs::read(&path)
+            .with_context(|| format!("failed to read project source {}", path.display()))?;
+        hashed_bytes += content.len() as u64;
+        hashed_files += 1;
+        name.hash(hasher);
+        content.hash(hasher);
     }
     Ok(())
 }
@@ -2730,6 +2760,89 @@ mod tests {
             "expected actionable type error, got: {}",
             err_msg
         );
+    }
+
+    /// A cache key must not depend on what happens to be checked out next to
+    /// the script. Walking the whole tree once made `tarvos run main.py` read
+    /// and hash 19,705 files in a project that kept a `transformers` checkout
+    /// beside it — minutes of CPU before the first line of output. The key now
+    /// covers the program and its same-directory siblings, so a nested tree is
+    /// both ignored and never opened.
+    #[test]
+    fn translation_cache_key_ignores_nested_trees() {
+        let dir = std::env::temp_dir().join(format!(
+            "tarvos-project-key-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let nested = dir.join("vendored").join("deep");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(dir.join("main.py"), "print(1)\n").unwrap();
+        fs::write(dir.join("helper.py"), "VALUE = 1\n").unwrap();
+        fs::write(nested.join("library.py"), "print('vendored')\n").unwrap();
+
+        let key = || {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hash_project_sources(&dir, &mut hasher).unwrap();
+            hasher.finish()
+        };
+        let before = key();
+
+        // Editing a sibling module must still invalidate the translation: that
+        // is the whole reason the key looks at anything besides the file.
+        fs::write(dir.join("helper.py"), "VALUE = 2\n").unwrap();
+        let after_sibling_edit = key();
+        assert_ne!(
+            before, after_sibling_edit,
+            "editing a same-directory module must change the cache key"
+        );
+
+        // Editing a file in a nested tree must change nothing. The old walk
+        // hashed it, which is both the cost and the reason the key needed a
+        // budget at all.
+        fs::write(nested.join("library.py"), "print('vendored, changed')\n").unwrap();
+        assert_eq!(
+            after_sibling_edit,
+            key(),
+            "a nested tree beside the script must not affect the cache key"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A directory link must not be followed. A virtualenv's `lib64 -> lib` is
+    /// the common case, and the recursive walk used to traverse the target a
+    /// second time through the alias.
+    #[test]
+    #[cfg(unix)]
+    fn translation_cache_key_skips_symlinks() {
+        let dir = std::env::temp_dir().join(format!(
+            "tarvos-symlink-key-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let target = dir.join("lib");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(dir.join("main.py"), "print(1)\n").unwrap();
+        fs::write(target.join("module.py"), "VALUE = 1\n").unwrap();
+        std::os::unix::fs::symlink("lib", dir.join("lib64")).unwrap();
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hash_project_sources(&dir, &mut hasher).unwrap();
+        let with_link = hasher.finish();
+
+        // Adding a file inside the link target changes nothing: the link is not
+        // followed, so the aliased tree contributes nothing to the key.
+        fs::write(target.join("extra.py"), "VALUE = 2\n").unwrap();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hash_project_sources(&dir, &mut hasher).unwrap();
+        assert_eq!(
+            with_link,
+            hasher.finish(),
+            "a directory symlink must not pull its target into the cache key"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A cache entry is only usable when the stamp names that exact key and the
