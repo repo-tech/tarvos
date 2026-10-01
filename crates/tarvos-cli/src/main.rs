@@ -93,24 +93,24 @@ Examples:
 const BUILD_HELP: &str = "\
 Build a native binary executable directly from Python.
 
-Transpiles the module and links it into a standalone executable in one step. The
-resulting binary embeds no Python interpreter, so it can be shipped to a machine
-with no Python installed.
+Transpiles the module and links it into a standalone executable in one step. When
+the program can be compiled natively, the result embeds no interpreter and can be
+shipped to a machine with no Python installed.
+
+When it cannot, this command still produces a working single-file executable: the
+Python source is embedded inside it and unpacked at run time, so the file can be
+copied anywhere on its own. It is not a native binary, and it still needs Python 3
+on the machine that runs it. Pass `--strict-native` to make this case an error
+instead.
 
 Tarvos uses the managed toolchain in ~/.tarvos/toolchain by default. Use
 `--system-rust` to opt into an already validated system Rust.
-
-If the module uses behaviour the native backend cannot express, this command
-fails rather than emitting a launcher. Such a launcher would re-run the original
-.py file through the system `python` using a path baked in at build time, so it
-would only work on the machine that built it. Use `tarvos run` to execute the
-program on this machine, or pass `--compat-launcher` to force the launcher.
 
 Examples:
   tarvos build app.py
   tarvos build app.py -o dist/app
   tarvos build app.py --system-rust
-  tarvos build app.py --compat-launcher
+  tarvos build app.py --strict-native
   tarvos build app.py --source-only";
 
 const RUN_HELP: &str = "\
@@ -340,10 +340,10 @@ enum Commands {
         #[arg(long = "system-rust")]
         system_rust: bool,
 
-        /// Allow a launcher that requires Python at run time, for code outside
-        /// the native subset. The result is not portable.
-        #[arg(long = "compat-launcher")]
-        compat_launcher: bool,
+        /// Refuse to build anything when the program cannot be compiled natively,
+        /// instead of emitting an executable that needs Python to run
+        #[arg(long = "strict-native")]
+        strict_native: bool,
     },
 
     /// Transpile, build, and run a Python file in one seamless step
@@ -522,7 +522,7 @@ fn main() -> Result<()> {
             output,
             source_only,
             system_rust,
-            compat_launcher,
+            strict_native,
         }) => {
             let mut args = vec![input.to_string_lossy().to_string()];
             if let Some(o) = output {
@@ -535,8 +535,8 @@ fn main() -> Result<()> {
             if system_rust {
                 args.push("--system-rust".to_string());
             }
-            if compat_launcher {
-                args.push("--compat-launcher".to_string());
+            if strict_native {
+                args.push("--strict-native".to_string());
             }
             build_mode(&args)
         }
@@ -705,7 +705,7 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
     let mut output_file = "tarvos_app.exe".to_string();
     let mut source_only = false;
     let mut prefer_system = false;
-    let mut allow_compat_launcher = false;
+    let mut strict_native = false;
     let mut iter = args.iter();
     let input_file = iter
         .next()
@@ -721,8 +721,8 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
             "--system-rust" => {
                 prefer_system = true;
             }
-            "--compat-launcher" => {
-                allow_compat_launcher = true;
+            "--strict-native" => {
+                strict_native = true;
             }
             _ => {
                 if output_file == "tarvos_app.exe" {
@@ -738,25 +738,22 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
     let (rust_source, compatibility_launcher) = match transpile_python_to_rust(&input_path) {
         Ok(source) => (source, false),
         Err(error) if is_dynamic_native_error(&error) => {
-            // `build` produces an artifact meant to be shipped to another machine,
-            // so a launcher that needs the original .py file, a Python install and
-            // the build machine's absolute path is not a build the caller asked
-            // for. It used to be produced anyway, and the only trace was one line
-            // of output; the resulting executable then failed on any machine
-            // without the same paths, which is exactly where it was supposed to
-            // work. Refusing here is the only failure that happens early enough to
-            // be cheap.
-            if !allow_compat_launcher {
+            // Two earlier behaviours were both wrong. Silently producing a
+            // launcher gave someone a file that only worked where it was built;
+            // refusing outright left no artifact at all. The useful answer is the
+            // one that actually works: a single-file executable carrying its own
+            // source, with an honest statement of what it still needs. A caller
+            // who cannot accept that asks for `--strict-native` and gets an error
+            // instead.
+            if strict_native {
                 return Err(anyhow::anyhow!(
                     "{error}\n\n\
-                     `tarvos build` did not produce a native binary. The program uses Python \
-                     behaviour the native backend cannot express, so the only thing that could \
-                     be built here is a launcher that re-runs the original .py file through the \
-                     system `python`. Such an executable is not portable: it needs that file at \
-                     its original path, plus a Python installation, and it fails on every \
-                     machine that does not have both.\n\n\
-                     To run it on this machine instead of shipping it, use `tarvos run`.\n\
-                     To force the launcher anyway, pass --compat-launcher."
+                     `tarvos build --strict-native` refused to produce anything. The program uses \
+                     Python behaviour the native backend cannot express, so the only alternative \
+                     would be an executable that re-runs the original source through the target \
+                     machine's `python`. That still needs Python installed there.\n\n\
+                     Drop `--strict-native` to get that single-file executable instead, or use \
+                     `tarvos run` to execute the program on this machine."
                 ));
             }
             warn_native_fallback(&error);
@@ -1620,65 +1617,87 @@ fn is_dynamic_native_error(error: &anyhow::Error) -> bool {
         || text.contains("unsupported feature")
 }
 
-/// Build the launcher used when native compilation is refused or opted into.
+/// Build the launcher used when native compilation is unavailable.
 ///
-/// The previous launcher embedded the build machine's absolute path, which made
-/// it useless anywhere else: a copy run on another machine asked Python for a
-/// `.py` file that existed on exactly one disk. The source is now resolved
-/// relative to the executable at run time, so the executable and its source can
-/// be moved together as a pair.
+/// Three generations of this launcher have existed, and each was wrong in a way
+/// a user would only discover on someone else's machine.
 ///
-/// That is the most a launcher can honestly promise. It still needs a `python`
-/// on the target machine, and the program still has to be one CPython can run,
-/// so `build` refuses to produce one unless `--compat-launcher` is given.
+/// The first embedded the build machine's absolute source path, so a copy asked
+/// Python for a file that existed on exactly one disk. The second resolved the
+/// source beside the executable, which fixed that but still required the user to
+/// keep two files together forever.
+///
+/// This one embeds the source text in the executable itself. The result is a
+/// single file that can be copied anywhere and carries its own program; nothing
+/// outside it has to be preserved. It still needs a `python` on the target
+/// machine and the program still has to be one CPython can run, so it is not a
+/// native binary and the CLI says so plainly. What it no longer needs is the
+/// build machine.
+///
+/// The source is written to a temporary file at run time rather than piped to
+/// the interpreter's stdin, because a program that imports itself, reads
+/// `__file__`, or is run as `python script.py` behaves differently when its
+/// source arrives on a pipe.
 fn compatibility_launcher_source(input_path: &Path) -> Result<String> {
     let source_path = input_path
         .canonicalize()
         .with_context(|| format!("failed to resolve {}", input_path.display()))?;
-    // Only the file name travels with the executable. The directory it was built
-    // in means nothing on any other machine.
+    let source_text = std::fs::read_to_string(&source_path)
+        .with_context(|| format!("failed to read {}", source_path.display()))?;
+    // A Rust string literal rather than a raw one: the Python source may contain
+    // `#"` or a backslash-quote sequence, either of which would end a raw string
+    // early and produce a launcher that does not compile.
+    let source_literal = serde_json::to_string(&source_text)
+        .context("failed to encode the embedded Python source")?;
     let file_name = source_path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "main.py".to_string());
-    let file_literal = serde_json::to_string(&file_name)
+        .unwrap_or_else(|| "program.py".to_string());
+    let name_literal = serde_json::to_string(&file_name)
         .context("failed to encode compatibility source file name")?;
     Ok(format!(
         r#"use std::path::PathBuf;
 use std::process::Command;
 
+/// The original program, embedded at build time. This is what makes the
+/// executable self-contained: no build-machine path and no sidecar file.
+const SOURCE: &str = {source_literal};
+
 fn main() {{
-    // Resolved beside this executable, never relative to the path it was built
-    // on: the build machine's directories are meaningless here.
-    let source: PathBuf = match std::env::current_exe() {{
-        Ok(exe) => exe
-            .parent()
-            .map(|dir| dir.join({file_literal}))
-            .unwrap_or_else(|| PathBuf::from({file_literal})),
-        Err(_) => PathBuf::from({file_literal}),
-    }};
-    if !source.is_file() {{
-        eprintln!("Tarvos: cannot find {{}}", source.display());
-        eprintln!("This launcher runs the original Python source, so it must sit next to it.");
-        eprintln!("Copy {{}} beside this executable and try again.", {file_literal});
+    // Written beside the executable rather than into the system temp directory so
+    // that a program loading data by relative path finds it where the user put
+    // the executable, which is the layout they would get from `python main.py`.
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from({name_literal}));
+    let dir = exe
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let script = dir.join({name_literal});
+    if let Err(error) = std::fs::write(&script, SOURCE) {{
+        eprintln!("Tarvos: could not unpack the embedded program: {{error}}");
         std::process::exit(1);
     }}
+
+    let mut last_error = String::new();
     // `python3` first: on Linux and macOS the `python` name is often absent or
     // still bound to Python 2, while on Windows only `python` exists.
-    let mut last_error = String::new();
     for interpreter in ["python3", "python"] {{
         let mut command = Command::new(interpreter);
-        command.arg(&source).args(std::env::args().skip(1));
+        command.arg(&script).args(std::env::args().skip(1));
+        command.current_dir(&dir);
         command.env("PYTHONIOENCODING", "utf-8").env("PYTHONUTF8", "1");
         match command.status() {{
             Ok(status) => {{
+                let _ = std::fs::remove_file(&script);
                 std::process::exit(status.code().unwrap_or(1));
             }}
             Err(error) => last_error = format!("{{interpreter}}: {{error}}"),
         }}
     }}
+    let _ = std::fs::remove_file(&script);
     eprintln!("Tarvos: no working Python interpreter was found.");
     eprintln!("Tried {{last_error}}");
+    eprintln!("This executable carries its own source but still needs Python 3 installed.");
     std::process::exit(1);
 }}
 "#

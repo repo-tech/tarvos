@@ -8,17 +8,30 @@ All notable changes to Tarvos are documented here. The format follows
 
 ### Fixed
 
-- **The compatibility launcher carried the build machine's absolute path.** It
-  embedded `C:/Users/<builder>/.../main_app.py` and asked Python for that exact
-  file, so a copy of the executable on any other machine asked for a source file
-  that existed on exactly one disk. Reported as `can't open file
-  'C:\Users\<someone else>\...\main_app.py': [Errno 2]`. The launcher now resolves
-  its source beside its own executable, so the pair can be moved together, and it
-  names the file it cannot find instead of failing inside an interpreter panic.
+- **The compatibility launcher is now a single file that carries its own
+  source.** It previously embedded the build machine's absolute path and asked
+  Python for that exact file, so a copy run anywhere else failed with `can't
+  open file 'C:\Users\<someone else>\...\main_app.py': [Errno 2]`. The Python
+  source is now embedded in the executable and unpacked beside it at run time,
+  so the executable can be copied on its own and carries its own program. The
+  working directory is set to the executable's own directory so a program that
+  loads data by relative path finds it where the user put the file, and the
+  temporary script is removed afterwards. The launcher still needs Python 3 on
+  the machine that runs it, and says so when it cannot find one.
 - **The launcher only ever tried `python`.** On Linux and macOS that name is
   often absent or still bound to Python 2, so a launcher that could have worked
   reported "Python was not found". It now tries `python3` then `python`, and if
   neither starts it names both failures instead of panicking.
+
+### Changed
+
+- **`tarvos build` produces a working executable instead of refusing.** A native
+  build is still preferred and still reported as such. When the program is
+  outside the native subset the command now emits the single-file launcher
+  described above, because that artifact runs, and states plainly what it needs.
+  The previous change made this case a hard error, which left the caller with no
+  artifact and no obvious next step. `--strict-native` restores the error for
+  callers who cannot ship anything that needs an interpreter.
 - **`tarvos build` could emit an executable that was not a build of the program.**
   When a module used behaviour the native backend cannot express, the command
   fell back to a launcher: a tiny Rust program that re-ran the original `.py`
