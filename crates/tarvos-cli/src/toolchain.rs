@@ -815,6 +815,8 @@ struct Progress {
     interactive: bool,
     last_reported: u8,
     drawn: bool,
+    /// Characters written by the last in-place line, so it can be erased exactly.
+    last_width: usize,
 }
 
 impl Progress {
@@ -826,6 +828,7 @@ impl Progress {
             interactive: std::io::stderr().is_terminal(),
             last_reported: 0,
             drawn: false,
+            last_width: 0,
         }
     }
 
@@ -894,13 +897,16 @@ impl Progress {
         );
         self.write(&line);
         self.drawn = true;
+        self.last_width = line.chars().count();
     }
 
     /// Final line: the transfer as a whole, once the bar is no longer useful.
     fn finish(&mut self, done: u64, elapsed: Duration) {
         if self.drawn {
-            // Erase the in-place line so the summary is not written over it.
-            self.write(&format!("\r{0:80}\r", ""));
+            // Erase exactly the line that was drawn. A fixed width left the tail
+            // of a longer line behind, so the previous transfer's rate and ETA
+            // stayed on screen next to the next transfer's summary.
+            self.write(&format!("\r{0:1$}\r", "", self.last_width));
         }
         let rate = done as f64 / elapsed.as_secs_f64().max(0.001);
         self.line(&format!(
@@ -1198,23 +1204,38 @@ fn extract_components(
     triple: &str,
 ) -> Result<()> {
     let dist_dir = format!("rust-{PINNED_CHANNEL}-{triple}");
-    let status = Command::new("tar")
-        .arg("-xzf")
+    let mut cmd = Command::new("tar");
+    cmd.arg("-xzf")
         .arg(archive)
         .arg("-C")
         .arg(dest)
-        .arg(format!("{dist_dir}/rustc"))
-        .arg(format!("{dist_dir}/cargo"))
-        .arg(format!("{dist_dir}/rust-std-{triple}"))
+        .arg(&dist_dir);
+    // Excluding the documentation trees is what keeps this fast, but the whole
+    // distribution directory is still extracted rather than only the three
+    // components a build drives. Selecting members instead is faster on paper
+    // and was wrong in practice: install.sh lives at the top level of the
+    // archive next to `components`, `manifest.in` and `rust-installer-version`,
+    // and reads all three. A first attempt at this extracted the components
+    // alone and every Unix install then died with "cannot open .../install.sh:
+    // No such file or directory" after a full download. The documentation
+    // components are the bulk of the archive, so excluding them is where the
+    // saving was all along.
+    for component in [
+        "rust-docs",
+        "rust-docs-json-preview",
+        "rust-html",
+        "rustc-docs",
+        "rustc-docs-json-preview",
+    ] {
+        cmd.arg(format!("--exclude={dist_dir}/{component}"));
+    }
+    let status = cmd
         .status()
         .with_context(|| format!("failed to unpack {}", archive.display()))?;
     if !status.success() {
-        // A missing member makes tar exit non-zero even when everything else was
-        // unpacked, so the message names the components rather than implying the
-        // whole download was bad.
         return Err(anyhow::anyhow!(
-            "failed to unpack the compiler components from {}; the archive does not contain \
-             rustc, cargo and rust-std for {triple}",
+            "failed to unpack the compiler components from {}; the archive is not a Rust \
+             distribution for {triple}",
             archive.display()
         ));
     }

@@ -35,6 +35,20 @@ All notable changes to Tarvos are documented here. The format follows
 
 ### Fixed
 
+- **The Unix install failed after a full download.** The component-selection
+  change below extracted only `rustc`, `cargo` and `rust-std`, but `install.sh`
+  lives at the top level of the distribution archive beside `components`,
+  `manifest.in` and `rust-installer-version`, and reads the first and third. Every
+  Unix install therefore ended with
+  `sh: 0: cannot open .../rust-1.98.0-<triple>/install.sh: No such file or
+  directory` after transferring all 364 MB. The extraction now takes the whole
+  distribution directory and excludes the documentation components, which is
+  where the saving was anyway.
+- The progress meter left the tail of its own bar on screen. The final line was
+  erased with a fixed width, so when the drawn line was wider than that width —
+  the rate and ETA at the end of it — the fragments stayed behind and appeared
+  beside the next transfer's summary. The meter now erases exactly the number of
+  characters it drew.
 - A truncated download is now rejected. `curl` can exit successfully when a
   connection drops cleanly at a boundary, and the short file was handed to the
   checksum step as though it were complete. The installer now compares the byte
