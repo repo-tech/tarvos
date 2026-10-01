@@ -66,3 +66,8 @@ tmp_fair.rs
 output_rust_out*
 fair_no_fold_rust*
 *_release.pdb
+
+# The release job regenerates this from the distribution repository's own
+# notes. A committed copy would only ever be a stale duplicate of the notes it
+# was extracted from.
+/engine-body.md
