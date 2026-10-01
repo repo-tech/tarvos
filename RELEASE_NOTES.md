@@ -110,16 +110,16 @@ that subset, not what the subset contains.
 Windows, without administrator rights:
 
 ```powershell
-irm https://raw.githubusercontent.com/repo-tech/tarvos-engine/main/install.ps1 | iex
-tarvos toolchain install
+irm https://github.com/repo-tech/tarvos-engine/releases/download/v1.0.0/install.ps1 | iex
+tarvos toolchain --install
 tarvos --version
 ```
 
 Linux and macOS:
 
 ```bash
-curl --fail --location https://raw.githubusercontent.com/repo-tech/tarvos-engine/main/install.sh | bash
-tarvos toolchain install
+curl --fail --location https://github.com/repo-tech/tarvos-engine/releases/download/v1.0.0/install.sh | bash
+tarvos toolchain --install
 tarvos --version
 ```
 
@@ -154,7 +154,7 @@ available.
 
 ## Highlights
 
-- **Managed toolchain, no system Rust required.** `tarvos toolchain install`
+- **Managed toolchain, no system Rust required.** `tarvos toolchain --install`
   fetches the pinned channel into `~/.tarvos/toolchain` and verifies its SHA-256.
   Nothing silently falls back from managed to system: the mode is explicit and
   labelled on every build.
@@ -178,7 +178,7 @@ available.
 - **A build no longer uses whatever `rustc` is on `PATH`.** If a managed
   toolchain is installed it is used. If none is installed and you did not pass
   `--system-rust`, the build fails with a message naming
-  `tarvos toolchain install`. This is the intended consequence of making the
+  `tarvos toolchain --install`. This is the intended consequence of making the
   toolchain explicit; a silently substituted compiler is worse.
 - **`--system-rust` is now the only way to select a system compiler.** It is
   validated before use and never silently receives a managed compiler.
@@ -249,16 +249,16 @@ Known limitations that are deliberately not papered over:
 Windows, without administrator rights:
 
 ```powershell
-irm https://raw.githubusercontent.com/repo-tech/tarvos-engine/main/install.ps1 | iex
-tarvos toolchain install
+irm https://github.com/repo-tech/tarvos-engine/releases/download/v1.0.0/install.ps1 | iex
+tarvos toolchain --install
 tarvos --version
 ```
 
 Linux and macOS:
 
 ```bash
-curl --fail --location https://raw.githubusercontent.com/repo-tech/tarvos-engine/main/install.sh | bash
-tarvos toolchain install
+curl --fail --location https://github.com/repo-tech/tarvos-engine/releases/download/v1.0.0/install.sh | bash
+tarvos toolchain --install
 tarvos --version
 ```
 
