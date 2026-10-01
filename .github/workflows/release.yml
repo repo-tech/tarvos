@@ -271,6 +271,13 @@ jobs:
       # that can fault on older hardware, which is unacceptable in a download.
       RUSTFLAGS: "-C opt-level=z -C strip=symbols"
       CARGO_INCREMENTAL: "0"
+      # The user-facing version line, which is independent of the compiler tag
+      # above. Left empty, the binary reports the compiler version and the
+      # release verification below compares it to RELEASE_TAG as before. A
+      # distribution cut sets this to the engine version (for example 1.0.0) so
+      # the published binaries report the product release a user installed,
+      # rather than the compiler candidate they were built from.
+      TARBOS_PRODUCT_VERSION: ${{ vars.TARVOS_PRODUCT_VERSION || '' }}
 
     steps:
       - name: Check out the release tag
@@ -324,10 +331,14 @@ jobs:
           set -euo pipefail
           reported="$(./target/release/tarvos --version)"
           echo "$reported"
+          # A distribution cut pins the product line to the engine version, which
+          # by design is not the compiler tag, so the comparison is made against
+          # whichever version line this build was asked to report.
+          expected="${TARBOS_PRODUCT_VERSION:-${RELEASE_TAG#v}}"
           case "$reported" in
-            *"$RELEASE_TAG"|*"${RELEASE_TAG#v}") ;;
+            *"$expected") ;;
             *)
-              echo "::error title=Version mismatch::binary reports '$reported' but the release tag is $RELEASE_TAG"
+              echo "::error title=Version mismatch::binary reports '$reported' but this build was asked for '$expected'"
               exit 1
               ;;
           esac

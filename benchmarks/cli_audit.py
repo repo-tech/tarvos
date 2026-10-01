@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,20 @@ COMMANDS = {
     "scan", "benchmark", "init", "export", "package", "clean", "install",
     "validate",
 }
+
+
+def workspace_version() -> str:
+    """Return the version declared once in the root `Cargo.toml`.
+
+    Every member crate inherits it, so this is the only place the compiler's
+    own version is written down.
+    """
+    text = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+    section = text.split("[workspace.package]", 1)[1]
+    match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', section)
+    if match is None:
+        raise SystemExit("Cargo.toml [workspace.package] has no version")
+    return match.group(1)
 
 
 def run(args, cwd=None, timeout=600, env=None):
@@ -72,7 +87,12 @@ def _cli_surface(a: Audit, work: pathlib.Path) -> pathlib.Path:
             + (f" missing={sorted(COMMANDS - listed)}" if listed != COMMANDS else ""))
 
     proc = run(["--version"])
-    a.check("--version", proc.returncode == 0 and "1.1.0-rc.6" in proc.stdout,
+    # Read the expected version from the workspace rather than repeating it
+    # here, so cutting a release cannot leave this audit asserting a version the
+    # binary no longer reports. A packaging build may pin a different product
+    # line, so only the shape is required unless TARVOS_PRODUCT_VERSION is unset.
+    expected = os.environ.get("TARBOS_PRODUCT_VERSION") or workspace_version()
+    a.check("--version", proc.returncode == 0 and expected in proc.stdout,
             proc.stdout.strip()[:60])
 
     bad = [c for c in sorted(COMMANDS) if run([c, "--help"]).returncode != 0]

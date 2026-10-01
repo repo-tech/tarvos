@@ -251,11 +251,24 @@ a release.
 Example:
   tarvos validate";
 
+/// Version reported by `--version` and by the clap help footer.
+///
+/// The compiler and the public distribution are released on independent version
+/// lines: the compiler ships many release candidates, while the packaged engine
+/// is cut when there is something worth publishing. A build can therefore pin
+/// the user-facing line with `TARBOS_PRODUCT_VERSION`; without it the crate
+/// version is used, so a plain `cargo build` still reports the compiler version
+/// and the version-consistency gate keeps passing.
+const PRODUCT_VERSION: &str = match option_env!("TARBOS_PRODUCT_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 /// Tarvos — Ultra-fast Python to Native Rust Transpiler & Compiler
 #[derive(Parser, Debug)]
 #[command(name = "tarvos", disable_version_flag = true)]
 #[command(author = "Himanshu & Repo-Tech Team")]
-#[command(version = "1.1.0-rc.6")]
+#[command(version = PRODUCT_VERSION)]
 #[command(about = "Transpiles and compiles Python code to native high-performance Rust executables", long_about = LONG_ABOUT, after_help = AFTER_HELP, after_long_help = AFTER_HELP)]
 struct Cli {
     /// Print the Tarvos version and exit
@@ -462,7 +475,7 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.version {
-        println!("tarvos 1.1.0-rc.6");
+        println!("tarvos {PRODUCT_VERSION}");
         return Ok(());
     }
 

@@ -104,19 +104,6 @@ def declarations() -> list[tuple[str, str, str | None]]:
             extract("installer/Tarvos.iss", r'MyAppVersion\s+"([^"]+)"'),
         ),
         (
-            "crates/tarvos-cli/src/main.rs",
-            "clap version",
-            extract(
-                "crates/tarvos-cli/src/main.rs",
-                r'#\[command\(version = "([^"]+)"\)\]',
-            ),
-        ),
-        (
-            "crates/tarvos-cli/src/main.rs",
-            "version flag",
-            extract("crates/tarvos-cli/src/main.rs", r'println!\("tarvos ([^"]+)"\)'),
-        ),
-        (
             "crates/tarvos-server/src/main.rs",
             "gateway banner",
             extract(
@@ -196,6 +183,19 @@ def required_tag_failures(tag: str, expected: str) -> list[str]:
     return failures
 
 
+def cli_version_is_derived() -> bool:
+    """Report whether the CLI reads its version from the crate metadata.
+
+    The version used to be written into `main.rs` twice, so it had to be kept in
+    step with the workspace by hand and drifted silently whenever a release was
+    cut. It now falls back to `CARGO_PKG_VERSION` and only a packaging build
+    overrides it, which is why there is no literal left here to compare: the
+    only way for this to fail is for the CLI to hard-code a version again.
+    """
+    text = read_text("crates/tarvos-cli/src/main.rs")
+    return 'env!("CARGO_PKG_VERSION")' in text and 'PRODUCT_VERSION' in text
+
+
 def main(argv: list[str]) -> int:
     version = canonical_version()
     expected = normalize(version)
@@ -219,6 +219,14 @@ def main(argv: list[str]) -> int:
         if status != "ok":
             failures.append(f"{path} [{label}]: {found!r} != {version!r}")
         print(f"{status:8} {path:42} {label:20} {found}")
+
+    derived = cli_version_is_derived()
+    print(
+        f"{'ok' if derived else 'DRIFT':8} {'crates/tarvos-cli/src/main.rs':42} "
+        f"{'version flag':20} {'CARGO_PKG_VERSION' if derived else 'hard-coded'}"
+    )
+    if not derived:
+        failures.append("crates/tarvos-cli/src/main.rs: version is not derived from CARGO_PKG_VERSION")
 
     for crate in member_crates_inherit():
         failures.append(f"{crate}: package version does not inherit from the workspace")
