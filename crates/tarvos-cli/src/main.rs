@@ -1620,26 +1620,66 @@ fn is_dynamic_native_error(error: &anyhow::Error) -> bool {
         || text.contains("unsupported feature")
 }
 
+/// Build the launcher used when native compilation is refused or opted into.
+///
+/// The previous launcher embedded the build machine's absolute path, which made
+/// it useless anywhere else: a copy run on another machine asked Python for a
+/// `.py` file that existed on exactly one disk. The source is now resolved
+/// relative to the executable at run time, so the executable and its source can
+/// be moved together as a pair.
+///
+/// That is the most a launcher can honestly promise. It still needs a `python`
+/// on the target machine, and the program still has to be one CPython can run,
+/// so `build` refuses to produce one unless `--compat-launcher` is given.
 fn compatibility_launcher_source(input_path: &Path) -> Result<String> {
     let source_path = input_path
         .canonicalize()
         .with_context(|| format!("failed to resolve {}", input_path.display()))?;
-    let mut source_text = source_path.to_string_lossy().into_owned();
-    if source_text.starts_with(r"\\?\") {
-        source_text = source_text[4..].to_string();
-    }
-    let source_literal = serde_json::to_string(&source_text.replace('\\', "/"))
-        .context("failed to encode compatibility source path")?;
+    // Only the file name travels with the executable. The directory it was built
+    // in means nothing on any other machine.
+    let file_name = source_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "main.py".to_string());
+    let file_literal = serde_json::to_string(&file_name)
+        .context("failed to encode compatibility source file name")?;
     Ok(format!(
-        r#"use std::process::Command;
+        r#"use std::path::PathBuf;
+use std::process::Command;
 
 fn main() {{
-    let source = {source_literal};
-    let mut command = Command::new("python");
-    command.arg(source).args(std::env::args().skip(1));
-    command.env("PYTHONIOENCODING", "utf-8").env("PYTHONUTF8", "1");
-    let status = command.status().expect("failed to start Python compatibility runtime");
-    std::process::exit(status.code().unwrap_or(1));
+    // Resolved beside this executable, never relative to the path it was built
+    // on: the build machine's directories are meaningless here.
+    let source: PathBuf = match std::env::current_exe() {{
+        Ok(exe) => exe
+            .parent()
+            .map(|dir| dir.join({file_literal}))
+            .unwrap_or_else(|| PathBuf::from({file_literal})),
+        Err(_) => PathBuf::from({file_literal}),
+    }};
+    if !source.is_file() {{
+        eprintln!("Tarvos: cannot find {{}}", source.display());
+        eprintln!("This launcher runs the original Python source, so it must sit next to it.");
+        eprintln!("Copy {{}} beside this executable and try again.", {file_literal});
+        std::process::exit(1);
+    }}
+    // `python3` first: on Linux and macOS the `python` name is often absent or
+    // still bound to Python 2, while on Windows only `python` exists.
+    let mut last_error = String::new();
+    for interpreter in ["python3", "python"] {{
+        let mut command = Command::new(interpreter);
+        command.arg(&source).args(std::env::args().skip(1));
+        command.env("PYTHONIOENCODING", "utf-8").env("PYTHONUTF8", "1");
+        match command.status() {{
+            Ok(status) => {{
+                std::process::exit(status.code().unwrap_or(1));
+            }}
+            Err(error) => last_error = format!("{{interpreter}}: {{error}}"),
+        }}
+    }}
+    eprintln!("Tarvos: no working Python interpreter was found.");
+    eprintln!("Tried {{last_error}}");
+    std::process::exit(1);
 }}
 "#
     ))

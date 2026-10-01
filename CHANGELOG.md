@@ -8,6 +8,17 @@ All notable changes to Tarvos are documented here. The format follows
 
 ### Fixed
 
+- **The compatibility launcher carried the build machine's absolute path.** It
+  embedded `C:/Users/<builder>/.../main_app.py` and asked Python for that exact
+  file, so a copy of the executable on any other machine asked for a source file
+  that existed on exactly one disk. Reported as `can't open file
+  'C:\Users\<someone else>\...\main_app.py': [Errno 2]`. The launcher now resolves
+  its source beside its own executable, so the pair can be moved together, and it
+  names the file it cannot find instead of failing inside an interpreter panic.
+- **The launcher only ever tried `python`.** On Linux and macOS that name is
+  often absent or still bound to Python 2, so a launcher that could have worked
+  reported "Python was not found". It now tries `python3` then `python`, and if
+  neither starts it names both failures instead of panicking.
 - **`tarvos build` could emit an executable that was not a build of the program.**
   When a module used behaviour the native backend cannot express, the command
   fell back to a launcher: a tiny Rust program that re-ran the original `.py`
