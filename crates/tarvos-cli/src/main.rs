@@ -1656,7 +1656,7 @@ fn compatibility_launcher_source(input_path: &Path) -> Result<String> {
     let name_literal = serde_json::to_string(&file_name)
         .context("failed to encode compatibility source file name")?;
     Ok(format!(
-        r#"use std::path::PathBuf;
+        r#"use std::path::{{Path, PathBuf}};
 use std::process::Command;
 
 /// The original program, embedded at build time. This is what makes the
@@ -1672,7 +1672,21 @@ fn main() {{
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    let script = dir.join({name_literal});
+
+    // The original file name on its own is not a safe name to write. Almost
+    // every program is called `main.py`, so two launchers built from different
+    // programs and started at the same time would write to the same path; the
+    // first one to finish deleted the script the second was still running, which
+    // surfaced as `can't open file '.../main.py': [Errno 2]`. The process id
+    // makes the name unique per run while keeping the extension Python needs and
+    // keeping the file beside the executable.
+    let base = Path::new({name_literal});
+    let stem = base
+        .file_stem()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "program".to_string());
+    let script = dir.join(format!("{{stem}}.tarvos-{{}}.py", std::process::id()));
+
     if let Err(error) = std::fs::write(&script, SOURCE) {{
         eprintln!("Tarvos: could not unpack the embedded program: {{error}}");
         std::process::exit(1);
@@ -1813,6 +1827,65 @@ fn compile_rust_binary_opt(output_path: &Path, rust_source: &str, fast_dev: bool
     compile_rust_binary_toolchain(output_path, rust_source, fast_dev, false)
 }
 
+/// Extension a compiled artifact carries on this platform.
+fn artifact_suffix() -> &'static str {
+    if cfg!(windows) {
+        ".exe"
+    } else {
+        ""
+    }
+}
+
+/// Identity of one native artifact.
+///
+/// Every field is load-bearing, and the reasons are specific:
+///
+/// * the generated source, because the artifact *is* that program;
+/// * the exact compiler, its version, and its target, because a binary
+///   produced by a different toolchain is not the same artifact;
+/// * `fast_dev`, because the fast and release profiles pass different
+///   optimisation flags and therefore produce genuinely different binaries;
+/// * this Tarvos build, because a change in codegen must not be served from
+///   an artifact the previous build produced.
+///
+/// The output path is deliberately *not* part of the key. It does not reach
+/// the binary (symbols are stripped), so including it would give every rename
+/// a fresh cache entry and the miss that follows.
+fn compiled_artifact_key(
+    rust_source: &str,
+    fast_dev: bool,
+    resolved: &toolchain::ResolvedToolchain,
+) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rust_source.hash(&mut hasher);
+    fast_dev.hash(&mut hasher);
+    resolved.rustc.hash(&mut hasher);
+    resolved.version.hash(&mut hasher);
+    resolved.target.hash(&mut hasher);
+    native_cache_epoch().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// A cached binary counts only if the stamp names it *and* its size still
+/// matches what was written.
+///
+/// The stamp is written after the binary is fully stored, so a build that was
+/// interrupted mid-copy leaves a binary with no stamp and the next invocation
+/// compiles again instead of handing a truncated file to the user.
+fn compiled_artifact_is_complete(binary: &Path, stamp: &Path, key: &str) -> bool {
+    let Ok(metadata) = fs::metadata(binary) else {
+        return false;
+    };
+    let Ok(payload) = fs::read_to_string(stamp) else {
+        return false;
+    };
+    let mut lines = payload.lines();
+    lines.next() == Some(key)
+        && lines.next().and_then(|size| size.parse::<u64>().ok()) == Some(metadata.len())
+}
+
 /// Compile with an explicitly resolved toolchain.
 ///
 /// `prefer_system` is only true for `--system-rust`. The managed path never
@@ -1857,13 +1930,44 @@ fn compile_rust_binary_toolchain(
             }
         }
     })?;
-    let rustc = resolved.rustc;
+    let rustc = resolved.rustc.clone();
     println!(
         "Toolchain: {} ({} {})",
         resolved.mode.label(),
         resolved.version,
         resolved.target
     );
+
+    // An unchanged program must not pay for `rustc` twice. Compiling with fat
+    // LTO costs several seconds, and it was being paid in full on *every*
+    // `tarvos build` and `tarvos compile --format exe` even when the previous
+    // invocation had already produced exactly this binary. That is what made
+    // these commands feel slower than the Python they replace. `tarvos run`
+    // already had a cache; the artifact produced here is the same kind of
+    // thing, keyed on the compiler that built it rather than assumed.
+    let artifact_dir = tarvos_cache_dir()?.join("rustc-bin");
+    fs::create_dir_all(&artifact_dir).with_context(|| {
+        format!(
+            "failed to create user cache directory {}",
+            artifact_dir.display()
+        )
+    })?;
+    let artifact_key = compiled_artifact_key(rust_source, fast_dev, &resolved);
+    let cached_binary = artifact_dir.join(format!("{artifact_key}{}", artifact_suffix()));
+    let cached_stamp = artifact_dir.join(format!("{artifact_key}.ok"));
+    if compiled_artifact_is_complete(&cached_binary, &cached_stamp, &artifact_key) {
+        // A failed copy is not a failed build: the artifact is still valid in
+        // the cache, so fall through and compile rather than report an error
+        // for what is only a full disk or a locked destination.
+        if fs::copy(&cached_binary, output_path).is_ok() {
+            println!(
+                "Using cached native binary: {}",
+                cached_binary.display()
+            );
+            return Ok(());
+        }
+    }
+
     let cache_dir = tarvos_cache_dir()?.join("rustc");
     fs::create_dir_all(&cache_dir).with_context(|| {
         format!(
@@ -1907,6 +2011,20 @@ fn compile_rust_binary_toolchain(
         // binary of the same commit.
     }
 
+    // Build into the cache first, then publish. Compiling straight into
+    // `output_path` meant a failed build could leave a partial file where the
+    // caller expects either a whole program or nothing.
+    let staged_binary = artifact_dir.join(format!("{artifact_key}.staged{}", artifact_suffix()));
+    let discard_staging = || {
+        let _ = fs::remove_file(&staged_binary);
+        // MSVC `rustc` also writes a PDB beside the output. Nothing reads it —
+        // the profile strips symbols and aborts on panic — so leaving it in
+        // place would add roughly a megabyte to the cache on every build,
+        // forever, for material no one asked for.
+        let _ = fs::remove_file(staged_binary.with_extension("pdb"));
+    };
+    discard_staging();
+
     let status = cmd
         .arg("-C")
         .arg(if rust_source.contains("catch_unwind") {
@@ -1915,16 +2033,37 @@ fn compile_rust_binary_toolchain(
             "panic=abort"
         })
         .arg("-o")
-        .arg(output_path)
+        .arg(&staged_binary)
         .arg(&rust_file)
         .status()
         .with_context(|| format!("failed to compile Rust target {}", output_path.display()))?;
     if !status.success() {
+        discard_staging();
         return Err(anyhow::anyhow!(
             "native Rust compilation failed for {}",
             output_path.display()
         ));
     }
+    if let Err(error) = fs::copy(&staged_binary, output_path) {
+        discard_staging();
+        return Err(anyhow::anyhow!(
+            "failed to write {}: {error}",
+            output_path.display()
+        ));
+    }
+    // Store the artifact and only then certify it. If this process dies between
+    // the copy and the stamp, the next run sees a binary with no stamp and
+    // rebuilds rather than trusting a half-written cache entry.
+    match fs::copy(&staged_binary, &cached_binary) {
+        Ok(size) => {
+            let _ = fs::write(&cached_stamp, format!("{artifact_key}\n{size}\n"));
+        }
+        Err(_) => {
+            let _ = fs::remove_file(&cached_binary);
+            let _ = fs::remove_file(&cached_stamp);
+        }
+    }
+    discard_staging();
     Ok(())
 }
 
@@ -2590,6 +2729,96 @@ mod tests {
                 || err_msg.contains("changes from"),
             "expected actionable type error, got: {}",
             err_msg
+        );
+    }
+
+    /// A cache entry is only usable when the stamp names that exact key and the
+    /// stored size still matches. A binary left behind by an interrupted build,
+    /// or one whose stamp belongs to another program, must be rejected rather
+    /// than copied to the caller's output path.
+    #[test]
+    fn cached_artifact_requires_matching_stamp_and_size() {
+        let dir = std::env::temp_dir().join(format!(
+            "tarvos-artifact-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("artifact");
+        let stamp = dir.join("artifact.ok");
+
+        fs::write(&binary, b"binary").unwrap();
+        assert!(
+            !compiled_artifact_is_complete(&binary, &stamp, "key-a"),
+            "a binary with no stamp must not be trusted"
+        );
+
+        fs::write(&stamp, "key-a\n6\n").unwrap();
+        assert!(
+            compiled_artifact_is_complete(&binary, &stamp, "key-a"),
+            "a stamped binary of the recorded size is complete"
+        );
+
+        assert!(
+            !compiled_artifact_is_complete(&binary, &stamp, "key-b"),
+            "a stamp for a different program must not be reused"
+        );
+
+        fs::write(&binary, b"truncated").unwrap();
+        assert!(
+            !compiled_artifact_is_complete(&binary, &stamp, "key-a"),
+            "a size that no longer matches the stamp means a partial write"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The key must separate everything that can change the binary, and nothing
+    /// else. Merging two programs into one entry would hand a caller the wrong
+    /// executable, which is far worse than a slow rebuild.
+    #[test]
+    fn compiled_artifact_key_separates_programs_compilers_and_profiles() {
+        let toolchain = toolchain::ResolvedToolchain {
+            mode: toolchain::ToolchainMode::Managed,
+            rustc: PathBuf::from("/toolchain/bin/rustc"),
+            version: "1.98.0".to_string(),
+            target: "x86_64-unknown-linux-gnu".to_string(),
+            source: "managed toolchain".to_string(),
+        };
+        let other_compiler = toolchain::ResolvedToolchain {
+            rustc: PathBuf::from("/other/bin/rustc"),
+            ..toolchain.clone()
+        };
+        let other_version = toolchain::ResolvedToolchain {
+            version: "1.97.0".to_string(),
+            ..toolchain.clone()
+        };
+
+        let release = compiled_artifact_key("fn main() {}", false, &toolchain);
+        assert_eq!(
+            release,
+            compiled_artifact_key("fn main() {}", false, &toolchain),
+            "the same program, compiler, and profile must produce the same key"
+        );
+        assert_ne!(
+            release,
+            compiled_artifact_key("fn main() { println!(\"other\"); }", false, &toolchain),
+            "a different program must not share an artifact"
+        );
+        assert_ne!(
+            release,
+            compiled_artifact_key("fn main() {}", true, &toolchain),
+            "the fast and release profiles must not share an artifact"
+        );
+        assert_ne!(
+            release,
+            compiled_artifact_key("fn main() {}", false, &other_compiler),
+            "a different compiler must not share an artifact"
+        );
+        assert_ne!(
+            release,
+            compiled_artifact_key("fn main() {}", false, &other_version),
+            "a different compiler version must not share an artifact"
         );
     }
 }

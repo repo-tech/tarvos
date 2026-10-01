@@ -8,6 +8,37 @@ All notable changes to Tarvos are documented here. The format follows
 
 ### Fixed
 
+- **`tarvos build` and `tarvos compile --format exe` paid for `rustc` on every
+  invocation.** The generated Rust was written to the cache and hashed, but the
+  compiled binary was never kept or reused, so each call ran a full fat-LTO
+  `rustc` even when the previous call had already produced exactly that program:
+  5.6 s per invocation, every time. A program built once took several seconds
+  to build again unchanged. The compiled artifact is now stored in
+  `~/.tarvos/cache/tarvos-cache-*/rustc-bin` and copied straight to the output
+  path on a repeat, which is ~190 ms. `tarvos run` already cached its
+  executable and was unaffected.
+  The cache is keyed on the generated source, the exact compiler and its
+  version, the host target, the optimisation profile, and this Tarvos build, so
+  a changed program, a different toolchain, or a Tarvos rebuild all still
+  compile. Each entry is certified by a stamp written only after the binary is
+  fully stored, and the recorded size is re-checked on read, so an interrupted
+  build is recompiled rather than handed to the caller. Renaming the output
+  reuses the cached binary, since symbols are stripped and the name does not
+  reach the program.
+- **A failed native build could leave a partial executable behind.** `rustc`
+  wrote directly to the output path, so a build that died mid-link left a
+  truncated file where the caller expects a whole program or nothing. The
+  binary is now linked inside the cache and copied to the destination only
+  after it succeeds.
+- **Two compatibility launchers run at the same time deleted each other's
+  script.** Every launcher wrote its embedded program beside the executable
+  under the *original* file name, so every project in the world collided on
+  `main.py`. Starting two of them together made the first one to exit remove
+  the file the second was still running, which surfaced as
+  `python3: can't open file '.../main.py': [Errno 2]`. The unpacked script is
+  now named after the program plus the process id, so concurrent runs can
+  never share a path.
+
 - **The compatibility launcher is now a single file that carries its own
   source.** It previously embedded the build machine's absolute path and asked
   Python for that exact file, so a copy run anywhere else failed with `can't
