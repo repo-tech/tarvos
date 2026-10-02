@@ -61,6 +61,27 @@ impl CompilePipeline {
         Ok(Self::finish_from_ir(&ir, input_path)?.rust)
     }
 
+    /// Parse a file into the AST the lowering stage sees, with local project
+    /// imports already inlined.
+    ///
+    /// Exposed so a caller that needs to *inspect* a program before deciding what
+    /// to do with it sees exactly what the compiler would see. A separate parse
+    /// path here would be a second opinion about the same file, and the two
+    /// would disagree about which modules a project imports.
+    pub fn inspect_module(input_path: &Path) -> Result<tarvos_ast::Module> {
+        let source = fs::read_to_string(input_path)
+            .with_context(|| format!("failed to read {}", input_path.display()))?;
+        let mut module = Self::parse_source(&source)?;
+        let root = input_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let mut visiting = vec![Self::canonical_or_original(input_path)];
+        Self::inline_local_imports(&mut module, input_path, &root, &mut visiting)?;
+        Ok(module)
+    }
+
     /// Resume the pipeline from a cached IR, skipping parse, import inlining
     /// and lowering.
     ///
