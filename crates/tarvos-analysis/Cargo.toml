@@ -9,3 +9,9 @@ thiserror = "2"
 tarvos-types = { path = "../tarvos-types" }
 tarvos-ast = { path = "../tarvos-ast" }
 tarvos-ir = { path = "../tarvos-ir" }
+
+# Only for the dependency-classification tests, which parse real Python to check
+# the classification against an actual import statement rather than a hand-built
+# AST. The parser depends on `tarvos-ast` alone, so this adds no cycle.
+[dev-dependencies]
+tarvos-parser = { path = "../tarvos-parser" }
