@@ -199,6 +199,99 @@ jobs:
           path: .build-tmp/linux-verify
           if-no-files-found: ignore
           retention-days: 7
+# The standalone contract, on a machine that has the build toolchain but not
+  # the artifact's dependencies. A native Tarvos binary embeds its own Rust and
+  # must run with nothing installed: no Python, no packages, no Tarvos. This job
+  # builds such a binary, copies *only* that file into an empty directory, runs it
+  # there, and fails if a Python source file appeared or the output is wrong.
+  #
+  # It cannot test a *second* machine from GitHub-hosted runners, so it makes no
+  # such claim. What it does prove is that nothing about the build machine leaks
+  # into the artifact: an unrelated directory, no inherited PYTHONPATH or
+  # VIRTUAL_ENV, and no interpreter on the lookup path.
+  standalone:
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.0
+    name: Standalone artifact
+    needs: quality
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ windows-latest, ubuntu-latest, macos-latest ]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.0
+
+      # Deliberately NOT installed: Python, any third-party package, and the
+      # Tarvos CLI itself. The build uses the managed toolchain under
+      # ~/.tarvos/toolchain, so the only compiler present is the one Tarvos
+      # manages. If the artifact needed any of the omitted pieces, this job fails
+      # rather than passing quietly on a runner that happens to have them.
+      - name: Build the release CLI
+        run: cargo build --release -p tarvos-cli
+
+      - name: Build a standalone program
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarvos="target/release/tarvos"
+          if [ -f "target/release/tarvos.exe" ]; then tarvos="target/release/tarvos.exe"; fi
+          mkdir -p .build-tmp/standalone/src
+          cat > .build-tmp/standalone/src/hello.py <<'PY'
+          total = 0
+          for value in range(5):
+              total = total + value
+          print("sum", total)
+          PY
+          "$tarvos" build .build-tmp/standalone/src/hello.py -o .build-tmp/standalone/hello
+
+      - name: Validate the artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarvos="target/release/tarvos"
+          if [ -f "target/release/tarvos.exe" ]; then tarvos="target/release/tarvos.exe"; fi
+          "$tarvos" validate-artifact .build-tmp/standalone/hello*
+
+      # Only the artifact crosses over. No source, no manifest, no virtualenv,
+      # no interpreter: exactly what a user would email to someone else.
+      - name: Run the artifact alone on this machine
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .build-tmp/isolated
+          mkdir -p .build-tmp/isolated
+          cp .build-tmp/standalone/hello* .build-tmp/isolated/
+          ls -l .build-tmp/isolated
+          cd .build-tmp/isolated
+          # Remove every environment hint that the build machine is special.
+          unset PYTHONPATH VIRTUAL_ENV PYTHONHOME || true
+          exe="$(ls hello*)"
+          output="$(./"$exe")"
+          echo "output: $output"
+          test "$output" = "sum 10"
+          test ! -f hello.py
+          # Nothing may be reconstructed on a second run either.
+          ./"$exe" > /dev/null
+          test -z "$(find . -name '*.tarvos-*.py' -o -name '*.py' | head -n 1)"
+
+      - name: Upload the artifact and its manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-${{ matrix.os }}
+          path: |
+            .build-tmp/standalone
+            .build-tmp/isolated
+          if-no-files-found: ignore
+          retention-days: 7
+
+
 
   native:
     env:
