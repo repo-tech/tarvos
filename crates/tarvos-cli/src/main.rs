@@ -9,7 +9,9 @@ use std::{
 };
 
 mod ai_probe;
+mod artifact;
 mod commands;
+mod manifest;
 mod toolchain;
 use commands::{
     analyze_command, benchmark_command, clean_command, doctor_command, export_command,
@@ -93,15 +95,21 @@ Examples:
 const BUILD_HELP: &str = "\
 Build a native binary executable directly from Python.
 
-Transpiles the module and links it into a standalone executable in one step. When
-the program can be compiled natively, the result embeds no interpreter and can be
-shipped to a machine with no Python installed.
+Transpiles the module and links it into a standalone executable in one step. Every
+import is classified before anything is compiled, so a program that needs something
+the native backend cannot lower is refused by name instead of producing an
+executable that quietly depends on it.
 
-When it cannot, this command still produces a working single-file executable: the
-Python source is embedded inside it and unpacked at run time, so the file can be
-copied anywhere on its own. It is not a native binary, and it still needs Python 3
-on the machine that runs it. Pass `--strict-native` to make this case an error
-instead.
+When the program's dependencies can all be lowered, the result embeds no
+interpreter: no Python, no packages, and no Tarvos are needed on the machine that
+runs it. A manifest is written beside the artifact recording exactly that, and
+`tarvos validate-artifact` reads it back.
+
+When a dependency cannot be lowered, the build stops and names it. Passing
+`--compat-launcher` produces a single-file executable that carries its own source
+and runs it through the target machine's Python instead. That file is NOT a native
+binary: it needs Python 3 and every module the program imports installed there. It
+is only ever produced when asked for by name.
 
 Tarvos uses the managed toolchain in ~/.tarvos/toolchain by default. Use
 `--system-rust` to opt into an already validated system Rust.
@@ -111,7 +119,23 @@ Examples:
   tarvos build app.py -o dist/app
   tarvos build app.py --system-rust
   tarvos build app.py --strict-native
+  tarvos build app.py --compat-launcher
   tarvos build app.py --source-only";
+
+const VALIDATE_ARTIFACT_HELP: &str = "\
+Report what a built executable is and what it requires on the target machine.
+
+Reads the artifact's own header to identify the format, so a file named for one
+platform but built for another is reported as the mismatch it is. Combines that
+with the manifest `tarvos build` writes beside the artifact to answer the
+question a binary cannot answer by looking at it: does running this need Python,
+Tarvos, Rust, or any third-party package installed first.
+
+Exits non-zero when the artifact turns out to need a Python runtime, so a script
+or CI job can gate on the result.
+
+Example:
+  tarvos validate-artifact dist/hello.exe";
 
 const RUN_HELP: &str = "\
 Transpile, build, and run a Python file in one seamless step.
@@ -344,6 +368,19 @@ enum Commands {
         /// instead of emitting an executable that needs Python to run
         #[arg(long = "strict-native")]
         strict_native: bool,
+
+        /// Allow the compatibility launcher when a dependency cannot be lowered,
+        /// producing an executable that runs Python on the target machine
+        #[arg(long = "compat-launcher")]
+        compat_launcher: bool,
+    },
+
+    /// Report what a built executable is and what it needs on the target machine
+    #[command(long_about = VALIDATE_ARTIFACT_HELP)]
+    ValidateArtifact {
+        /// Path to the built executable or compatibility launcher
+        #[arg(value_name = "ARTIFACT")]
+        artifact: PathBuf,
     },
 
     /// Transpile, build, and run a Python file in one seamless step
@@ -523,6 +560,7 @@ fn main() -> Result<()> {
             source_only,
             system_rust,
             strict_native,
+            compat_launcher,
         }) => {
             let mut args = vec![input.to_string_lossy().to_string()];
             if let Some(o) = output {
@@ -538,8 +576,12 @@ fn main() -> Result<()> {
             if strict_native {
                 args.push("--strict-native".to_string());
             }
+            if compat_launcher {
+                args.push("--compat-launcher".to_string());
+            }
             build_mode(&args)
         }
+        Some(Commands::ValidateArtifact { artifact }) => validate_artifact_mode(&artifact),
         Some(Commands::Run {
             input,
             python_fallback,
@@ -702,10 +744,11 @@ pub(crate) fn compile_mode(args: &[String]) -> Result<()> {
 }
 
 pub(crate) fn build_mode(args: &[String]) -> Result<()> {
-    let mut output_file = "tarvos_app.exe".to_string();
+    let mut output_file: Option<String> = None;
     let mut source_only = false;
     let mut prefer_system = false;
     let mut strict_native = false;
+    let mut compat_launcher = false;
     let mut iter = args.iter();
     let input_file = iter
         .next()
@@ -713,7 +756,7 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--output" | "-o" => {
-                output_file = iter.next().cloned().unwrap_or_else(|| output_file.clone());
+                output_file = iter.next().cloned().or(output_file);
             }
             "--source-only" => {
                 source_only = true;
@@ -724,9 +767,12 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
             "--strict-native" => {
                 strict_native = true;
             }
+            "--compat-launcher" => {
+                compat_launcher = true;
+            }
             _ => {
-                if output_file == "tarvos_app.exe" {
-                    output_file = arg.clone();
+                if output_file.is_none() {
+                    output_file = Some(arg.clone());
                 }
             }
         }
@@ -734,34 +780,75 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
 
     let working_dir = env::current_dir()?;
     let input_path = secure_input_path(input_file, &working_dir)?;
-    let output_path = secure_output_path(&output_file, &working_dir)?;
-    let (rust_source, compatibility_launcher) = match transpile_python_to_rust(&input_path) {
-        Ok(source) => (source, false),
-        Err(error) if is_dynamic_native_error(&error) => {
-            // Two earlier behaviours were both wrong. Silently producing a
-            // launcher gave someone a file that only worked where it was built;
-            // refusing outright left no artifact at all. The useful answer is the
-            // one that actually works: a single-file executable carrying its own
-            // source, with an honest statement of what it still needs. A caller
-            // who cannot accept that asks for `--strict-native` and gets an error
-            // instead.
-            if strict_native {
-                return Err(anyhow::anyhow!(
-                    "{error}\n\n\
+    // The name is derived from the input and the target's own convention rather
+    // than defaulted to `tarvos_app.exe`. On Linux that default produced a PE
+    // binary with a name suggesting it was the only executable around, and every
+    // `tarvos build app.py` in a directory silently overwrote the last one.
+    let host_format = artifact::ArtifactFormat::host();
+    let default_name = format!(
+        "{}{}",
+        input_path.file_stem().unwrap_or_default().to_string_lossy(),
+        artifact::extension_for(host_format)
+    );
+    let output_path = secure_output_path(
+        output_file.as_deref().unwrap_or(&default_name),
+        &working_dir,
+    )?;
+    let rust_output = output_path.with_extension("rs");
+
+    // Answer "what does this program need at run time" before compiling
+    // anything, so an unbuildable dependency is reported as such rather than
+    // discovered after a launcher has already been produced.
+    let closure = dependency_closure_of(&input_path)?;
+    report_dependency_closure(&closure);
+    if !closure.is_native_buildable() && !source_only && !compat_launcher {
+        return Err(unsupported_dependency_error(&closure, &input_path));
+    }
+
+    // A program with a dependency the backend cannot lower can only become a
+    // launcher, and only when that was asked for by name. Going straight there
+    // rather than trying to lower it first avoids surfacing the lowering stage's
+    // own error ("import 'flask' is not supported") as the outcome of a command
+    // whose whole point was to produce the launcher instead.
+    let (rust_source, compatibility_launcher) = if compat_launcher && !closure.is_native_buildable()
+    {
+        if strict_native {
+            return Err(unsupported_dependency_error(&closure, &input_path));
+        }
+        warn_native_fallback(&anyhow::anyhow!(
+            "{} of the program's imports cannot be lowered to native code",
+            closure.external().len()
+        ));
+        (compatibility_launcher_source(&input_path)?, true)
+    } else {
+        match transpile_python_to_rust(&input_path) {
+            Ok(source) => (source, false),
+            Err(error) if is_dynamic_native_error(&error) => {
+                // The program is inside the native dependency set but uses Python
+                // behaviour the backend cannot express. Two earlier behaviours were
+                // both wrong. Silently producing a launcher gave someone a file that
+                // only worked where it was built; refusing outright left no artifact
+                // at all. The useful answer is the one that actually works: a
+                // single-file executable carrying its own source, with an honest
+                // statement of what it still needs. A caller who cannot accept that
+                // asks for `--strict-native` and gets an error instead.
+                if strict_native {
+                    return Err(anyhow::anyhow!(
+                        "{error}\n\n\
                      `tarvos build --strict-native` refused to produce anything. The program uses \
                      Python behaviour the native backend cannot express, so the only alternative \
                      would be an executable that re-runs the original source through the target \
                      machine's `python`. That still needs Python installed there.\n\n\
                      Drop `--strict-native` to get that single-file executable instead, or use \
                      `tarvos run` to execute the program on this machine."
-                ));
+                    ));
+                }
+                warn_native_fallback(&error);
+                (compatibility_launcher_source(&input_path)?, true)
             }
-            warn_native_fallback(&error);
-            (compatibility_launcher_source(&input_path)?, true)
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
     };
-    let rust_output = output_path.with_extension("rs");
 
     if source_only {
         write_rust_output(&rust_output, &rust_source)?;
@@ -770,19 +857,8 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    match compile_rust_binary_toolchain(&output_path, &rust_source, false, prefer_system) {
-        Ok(()) => {
-            if compatibility_launcher {
-                println!(
-                    "Compatibility launcher built: {} (requires Python at execution time)",
-                    output_path.display()
-                );
-            } else {
-                println!("Build complete: {}", output_path.display());
-            }
-            Ok(())
-        }
-        Err(err) => {
+    compile_rust_binary_toolchain(&output_path, &rust_source, false, prefer_system).map_err(
+        |err| {
             eprintln!(
                 "Rust native build unavailable; generated Rust remains in the user cache for this invocation."
             );
@@ -792,9 +868,200 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
             // points at a problem they do not have. Name the toolchain that
             // actually ran and the real reason instead.
             eprintln!("The toolchain above did compile; the generated Rust did not.");
-            eprintln!("Use `tarvos compile <file.py> --source-only` to emit Rust without native compilation.");
-            Err(err)
+            eprintln!(
+                "Use `tarvos compile <file.py> --source-only` to emit Rust without native compilation."
+            );
+            err
+        },
+    )?;
+
+    // Read the artifact back and check it is what this target executes, rather
+    // than trusting the file name. A PE binary named `app` uploads cleanly and
+    // fails on the Linux machine it was meant for.
+    let produced = artifact::ArtifactFormat::of(&output_path).map_err(|error| {
+        anyhow::anyhow!(
+            "could not read the produced artifact {}: {error}",
+            output_path.display()
+        )
+    })?;
+    if produced != host_format {
+        let _ = fs::remove_file(&output_path);
+        return Err(anyhow::anyhow!(
+            "BUILD ERROR: target format mismatch.\nExpected {} ({}) executable.\nProduced {} executable.\nThe artifact was removed rather than published.",
+            host_format.label(),
+            host_format.target_os(),
+            produced.label()
+        ));
+    }
+
+    let manifest = manifest::write(&output_path, &closure, compatibility_launcher)?;
+
+    if compatibility_launcher {
+        println!(
+            "Compatibility launcher built: {} — NOT a native binary. It runs Python on the \
+             target machine and needs Python plus every module listed above.",
+            output_path.display()
+        );
+    } else {
+        println!("Build complete: {}", output_path.display());
+        println!("Standalone: no Python, no Tarvos, and no Rust needed on the target machine.");
+    }
+    println!("Manifest: {}", manifest.display());
+    println!(
+        "Verify with: tarvos validate-artifact {}",
+        output_path.display()
+    );
+    Ok(())
+}
+
+/// Classify every import the program makes.
+///
+/// This parses the source through the same front end the compiler uses. It runs
+/// before compilation on purpose: a dependency that cannot be lowered is a build
+/// input to reject, not something to discover while writing Rust for it.
+fn dependency_closure_of(input_path: &Path) -> Result<manifest::Closure> {
+    // A program the native backend cannot parse is exactly the program most
+    // likely to need this list, so giving up here would leave the launcher
+    // claiming it needs nothing. The scan is a lexical fallback, not a second
+    // parser: it reads import lines and classifies them, which is all a manifest
+    // needs and all it can honestly say about source that did not compile.
+    let module = match CompilePipeline::inspect_module(input_path) {
+        Ok(module) => manifest::Closure::of(&module),
+        Err(_) => manifest::Closure::from_import_lines(input_path),
+    };
+    Ok(module)
+}
+
+fn report_dependency_closure(closure: &manifest::Closure) {
+    if closure.imports.is_empty() {
+        println!("Dependencies: none (the program imports nothing)");
+        return;
+    }
+    println!("Dependencies:");
+    print!("{closure}");
+    if !closure.external().is_empty() {
+        println!("  (marked above need a Python interpreter on the target machine; they are not bundled)");
+    }
+}
+
+/// The error a build reports when a program imports something native cannot serve.
+fn unsupported_dependency_error(closure: &manifest::Closure, input_path: &Path) -> anyhow::Error {
+    use std::fmt::Write as _;
+    let mut message = String::from("TARVOS NATIVE COMPILATION BLOCKED\n\n");
+    let _ = writeln!(message, "Source: {}", input_path.display());
+    message.push_str("\nUnbuildable dependencies:\n\n");
+    for use_ in &closure.imports {
+        if !use_.class.allows_native_build() {
+            let _ = writeln!(message, "  {}  {}", use_.class.label(), use_.module);
         }
+    }
+    message.push_str(
+        "\nReason:\n  The native backend lowers a fixed set of modules to Rust it writes itself.\n  \
+         These are not in that set, and Tarvos does not bundle them: doing so would mean shipping\n  \
+         an interpreter inside every binary, which is a different product from a compiler.\n\n\
+         Choose:\n  \
+         1. Rewrite this part with a native module (math, time, os, os.path, json, statistics)\n  \
+         2. Run it as Python on a machine that has these packages installed: `tarvos run`\n  \
+         3. Build a compatibility launcher and accept that it needs Python at run time:\n  \
+         `tarvos build --compat-launcher`\n",
+    );
+    anyhow::anyhow!(message)
+}
+
+/// `tarvos validate-artifact <path>`
+///
+/// Audits a file the user was given rather than one this machine just built, so a
+/// downloaded or CI-produced artifact can be checked before it is trusted.
+pub(crate) fn validate_artifact_mode(path: &Path) -> Result<()> {
+    if !path.is_file() {
+        return Err(anyhow::anyhow!("not a file: {}", path.display()));
+    }
+    let format = artifact::ArtifactFormat::of(path)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    let size = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let manifest_path = manifest::path_for(path);
+
+    println!("Artifact:          {}", path.display());
+    println!("Format:            {}", format.label());
+    println!("Target:            {}-{}", format.target_os(), host_arch());
+    println!("Size:              {size} bytes");
+    println!("Runs on this host: {}", yes_no(format.runs_on_host()));
+    println!("Rust required:     NO");
+    println!("Tarvos required:   NO");
+
+    let Some(value) = manifest::read(path) else {
+        println!("Manifest:          none");
+        println!("Status:            UNVERIFIED");
+        println!(
+            "\nNo manifest beside the artifact, so its dependencies cannot be confirmed from the \
+             file alone. Re-run `tarvos build` on the source to produce one."
+        );
+        return Ok(());
+    };
+    let flag = |key: &str| value.get(key).and_then(serde_json::Value::as_bool);
+    let external = value
+        .get("external_python_packages")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    println!("Manifest:          {}", manifest_path.display());
+    println!(
+        "Native:            {}",
+        yes_no(flag("native").unwrap_or(false))
+    );
+    println!(
+        "Python required:   {}",
+        yes_no(flag("python_runtime_required").unwrap_or(false))
+    );
+    println!(
+        "Temporary .py:     {}",
+        yes_no(flag("temporary_python_source_required").unwrap_or(false))
+    );
+    println!(
+        "External packages: {}",
+        if external.is_empty() {
+            "NONE".to_string()
+        } else {
+            external.join(", ")
+        }
+    );
+
+    let standalone = flag("native") == Some(true)
+        && flag("python_runtime_required") == Some(false)
+        && external.is_empty();
+    if standalone {
+        println!("Status:            PASS");
+        Ok(())
+    } else {
+        println!("Status:            COMPATIBILITY");
+        Err(anyhow::anyhow!(
+            "this artifact requires a Python runtime on the target machine; it is not a \
+             standalone native binary"
+        ))
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "YES"
+    } else {
+        "NO"
+    }
+}
+
+fn host_arch() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "unknown"
     }
 }
 
@@ -2003,10 +2270,7 @@ fn compile_rust_binary_toolchain(
         // the cache, so fall through and compile rather than report an error
         // for what is only a full disk or a locked destination.
         if fs::copy(&cached_binary, output_path).is_ok() {
-            println!(
-                "Using cached native binary: {}",
-                cached_binary.display()
-            );
+            println!("Using cached native binary: {}", cached_binary.display());
             return Ok(());
         }
     }
@@ -2783,10 +3047,8 @@ mod tests {
     /// both ignored and never opened.
     #[test]
     fn translation_cache_key_ignores_nested_trees() {
-        let dir = std::env::temp_dir().join(format!(
-            "tarvos-project-key-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("tarvos-project-key-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let nested = dir.join("vendored").join("deep");
         fs::create_dir_all(&nested).unwrap();
@@ -2829,10 +3091,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn translation_cache_key_skips_symlinks() {
-        let dir = std::env::temp_dir().join(format!(
-            "tarvos-symlink-key-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("tarvos-symlink-key-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let target = dir.join("lib");
         fs::create_dir_all(&target).unwrap();
@@ -2864,10 +3124,7 @@ mod tests {
     /// than copied to the caller's output path.
     #[test]
     fn cached_artifact_requires_matching_stamp_and_size() {
-        let dir = std::env::temp_dir().join(format!(
-            "tarvos-artifact-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("tarvos-artifact-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let binary = dir.join("artifact");
