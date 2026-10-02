@@ -613,3 +613,281 @@ fn fallback_executes_cpython_and_preserves_runtime_argument() {
     );
     cleanup(project);
 }
+// ---------------------------------------------------------------------------
+// Artifact contract: what `tarvos build` produces and what it claims.
+// ---------------------------------------------------------------------------
+
+fn build_tarvos(project: &Path, args: &[&str]) -> std::process::Output {
+    run_tarvos(project, args)
+}
+
+fn stdout_of(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn stderr_of(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn artifact_suffix() -> &'static str {
+    if cfg!(windows) {
+        ".exe"
+    } else {
+        ""
+    }
+}
+
+/// A built executable, and the manifest `tarvos build` must leave beside it.
+fn built_artifact(project: &Path, stem: &str) -> (PathBuf, serde_json::Value) {
+    let artifact = project.join(format!("{stem}{}", artifact_suffix()));
+    assert!(artifact.is_file(), "no artifact at {}", artifact.display());
+    let manifest = project.join(format!("{stem}{}.tarvos-manifest.json", artifact_suffix()));
+    assert!(
+        manifest.is_file(),
+        "a build must leave a manifest; {} is missing",
+        manifest.display()
+    );
+    let text = fs::read_to_string(&manifest).expect("read artifact manifest");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("manifest must be JSON");
+    (artifact, value)
+}
+
+/// `print("hello")` is the smallest genuinely standalone program.
+#[test]
+fn a_hello_program_builds_a_native_standalone_executable() {
+    let project = temporary_project("artifact-hello");
+    write_program(&project, "print('hello')\n");
+    let output = build_tarvos(&project, &["build", "main.py"]);
+    assert!(
+        output.status.success(),
+        "build failed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+
+    let (artifact, manifest) = built_artifact(&project, "main");
+    assert_eq!(manifest["native"], serde_json::json!(true));
+    assert_eq!(
+        manifest["python_runtime_required"],
+        serde_json::json!(false),
+        "a native build must not claim it needs Python:\n{manifest}"
+    );
+    assert_eq!(
+        manifest["temporary_python_source_required"],
+        serde_json::json!(false),
+        "a native build must not reconstruct source at run time:\n{manifest}"
+    );
+    assert_eq!(
+        manifest["external_python_packages"],
+        serde_json::json!([]),
+        "nothing external may be listed for a program with no imports:\n{manifest}"
+    );
+    assert_eq!(manifest["rust_runtime_required"], serde_json::json!(false));
+
+    // The header has to match this platform. A file named `.exe` that is not a
+    // PE image is the exact artifact this check exists to catch.
+    let bytes = fs::read(&artifact).expect("read built artifact");
+    if cfg!(windows) {
+        assert!(
+            bytes.starts_with(b"MZ"),
+            "a Windows build must produce a PE executable"
+        );
+    } else if cfg!(target_os = "macos") {
+        assert_eq!(&bytes[..4], &[0xfe, 0xed, 0xfa, 0xcf]);
+    } else {
+        assert!(
+            bytes.starts_with(b"\x7fELF"),
+            "a Linux build must produce an ELF executable"
+        );
+    }
+
+    cleanup(project);
+}
+
+/// Running the built program must not leave Python source behind, however many
+/// times it runs.
+#[test]
+fn repeated_execution_never_generates_python_source() {
+    let project = temporary_project("artifact-repeat");
+    write_program(&project, "x = 2\nprint(x * 21)\n");
+    let build = build_tarvos(&project, &["build", "main.py"]);
+    assert!(
+        build.status.success(),
+        "build failed:\n{}\n{}",
+        stdout_of(&build),
+        stderr_of(&build)
+    );
+    let (artifact, _) = built_artifact(&project, "main");
+
+    for _ in 0..10 {
+        let output = Command::new(&artifact)
+            .current_dir(&project)
+            .output()
+            .expect("run the built executable");
+        assert!(
+            output.status.success(),
+            "the built executable must keep working on repeat runs"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+    }
+
+    let generated: Vec<String> = fs::read_dir(&project)
+        .expect("read project directory")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".py") && name != "main.py")
+        .collect();
+    assert!(
+        generated.is_empty(),
+        "native execution must not write Python source; found {generated:?}"
+    );
+
+    cleanup(project);
+}
+
+/// A package Tarvos cannot lower must stop the build. Producing an executable
+/// that quietly needs `flask` installed is the failure this prevents.
+#[test]
+fn an_unbuildable_dependency_stops_the_build_and_names_the_package() {
+    let project = temporary_project("artifact-blocked");
+    write_program(&project, "import flask\nprint('hi')\n");
+    let output = build_tarvos(&project, &["build", "main.py"]);
+    let combined = format!("{}{}", stdout_of(&output), stderr_of(&output));
+
+    assert!(
+        !output.status.success(),
+        "a build that needs an uninstalled package must not succeed:\n{combined}"
+    );
+    assert!(
+        combined.contains("TARVOS NATIVE COMPILATION BLOCKED"),
+        "the refusal must be explicit:\n{combined}"
+    );
+    assert!(
+        combined.contains("flask"),
+        "the refusal must name the package to install:\n{combined}"
+    );
+    assert!(
+        !project.join(format!("main{}", artifact_suffix())).exists(),
+        "no executable may be produced for a blocked build"
+    );
+
+    cleanup(project);
+}
+
+/// An unknown name is not an installable package and must not be reported as one.
+#[test]
+fn an_unknown_import_is_reported_as_unsupported_not_as_installable() {
+    let project = temporary_project("artifact-unknown");
+    write_program(&project, "import some_unknown_package\nprint(1)\n");
+    let output = build_tarvos(&project, &["build", "main.py"]);
+    let combined = format!("{}{}", stdout_of(&output), stderr_of(&output));
+    assert!(
+        combined.contains("UNSUPPORTED"),
+        "an unknown module must be classified UNSUPPORTED:\n{combined}"
+    );
+    assert!(
+        !combined.contains("EXTERNAL_RUNTIME"),
+        "an unknown module must not be presented as installable:\n{combined}"
+    );
+    cleanup(project);
+}
+
+/// The compatibility launcher stays available, but only by name, and labels
+/// itself in both the build output and the manifest.
+#[test]
+fn the_compatibility_launcher_requires_opt_in_and_declares_itself() {
+    let project = temporary_project("artifact-launcher");
+    write_program(&project, "import flask\nprint('hi')\n");
+
+    let refused = build_tarvos(&project, &["build", "main.py"]);
+    assert!(
+        !refused.status.success(),
+        "without --compat-launcher nothing may be built"
+    );
+
+    let output = build_tarvos(&project, &["build", "main.py", "--compat-launcher"]);
+    assert!(
+        output.status.success(),
+        "--compat-launcher must build:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let (_, manifest) = built_artifact(&project, "main");
+    assert_eq!(
+        manifest["native"],
+        serde_json::json!(false),
+        "a launcher is not a native binary:\n{manifest}"
+    );
+    assert_eq!(manifest["python_runtime_required"], serde_json::json!(true));
+    assert_eq!(
+        manifest["external_python_packages"],
+        serde_json::json!(["flask"]),
+        "the launcher must record what the target needs:\n{manifest}"
+    );
+
+    cleanup(project);
+}
+
+/// `tarvos validate-artifact` has to work as a gate in a script.
+#[test]
+fn validate_artifact_gates_on_whether_python_is_required() {
+    let project = temporary_project("artifact-validate");
+    write_program(&project, "print('gated')\n");
+    let build = build_tarvos(&project, &["build", "main.py"]);
+    assert!(build.status.success());
+    let (artifact, _) = built_artifact(&project, "main");
+
+    let validated = run_tarvos(&project, &["validate-artifact", artifact.to_str().unwrap()]);
+    let text = format!("{}{}", stdout_of(&validated), stderr_of(&validated));
+    assert!(
+        validated.status.success(),
+        "a native artifact must validate:\n{text}"
+    );
+    for expected in [
+        "Native:            YES",
+        "Python required:   NO",
+        "Temporary .py:     NO",
+        "External packages: NONE",
+        "Status:            PASS",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+    }
+
+    // An artifact with no manifest cannot be vouched for. UNVERIFIED is the
+    // honest answer; PASS would be a guess.
+    let orphan = project.join("orphan.exe");
+    fs::write(&orphan, b"MZ not really a program").expect("write orphan artifact");
+    let report = run_tarvos(&project, &["validate-artifact", orphan.to_str().unwrap()]);
+    let text = format!("{}{}", stdout_of(&report), stderr_of(&report));
+    assert!(report.status.success(), "reported, not failed:\n{text}");
+    assert!(
+        text.contains("Status:            UNVERIFIED"),
+        "an artifact with no manifest must never be reported PASS:\n{text}"
+    );
+
+    cleanup(project);
+}
+
+/// The default output name follows the input's name and the target's
+/// convention, so builds stop overwriting each other and Linux stops being
+/// handed a `.exe`.
+#[test]
+fn the_default_output_name_is_derived_from_the_input() {
+    let project = temporary_project("artifact-name");
+    fs::write(project.join("greeting.py"), "print('named')\n").expect("write source");
+    let output = build_tarvos(&project, &["build", "greeting.py"]);
+    assert!(
+        output.status.success(),
+        "build failed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        project
+            .join(format!("greeting{}", artifact_suffix()))
+            .is_file(),
+        "expected greeting{} beside the source",
+        artifact_suffix()
+    );
+    cleanup(project);
+}
