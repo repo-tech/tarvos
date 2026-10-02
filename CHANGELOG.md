@@ -6,6 +6,53 @@ All notable changes to Tarvos are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`tarvos validate-artifact <path>`.** Reports what a built executable is and
+  what it needs on the machine that runs it: the real format, read from the file's
+  own header rather than its name, plus the manifest `tarvos build` writes beside
+  the artifact. Exits non-zero when the artifact turns out to need a Python
+  runtime, so a script or CI job can gate on it. An artifact with no manifest
+  beside it is reported as `UNVERIFIED`, never as a pass.
+- **A build manifest for every artifact.** `tarvos build` now writes
+  `<artifact>.tarvos-manifest.json` next to what it produced, recording the format
+  and size measured from the file, and whether the artifact is native, needs a
+  Python runtime, or needs particular third-party packages. Every field comes from
+  this build or from the file itself; none of it is asserted.
+- **Dependency classification before compilation.** Every import a program makes
+  is classified as natively lowered, partially lowered, externally provided, or
+  unknown, and the classification is printed before anything is compiled. This is a
+  property of the compiler, not of one machine's environment: nothing consults the
+  developer's `site-packages`, so a build classifies a program the same way on any
+  machine. `numpy` and `pandas` are classified *partially*, because only the
+  recognized loop shapes compile, rather than being declared fully supported.
+
+### Fixed
+
+- **`tarvos build` no longer produces an executable that quietly needs Python.**
+  When the native backend could not lower a dependency, the build emitted a
+  launcher that unpacked the program to a temporary `.tarvos-*.py` file and ran it
+  through the target machine's interpreter. The file was named `.exe`, printed
+  "Build complete", and failed with `ModuleNotFoundError` on any machine that did
+  not already have `flask`, `numpy`, or `pandas` installed — a failure a user
+  could only diagnose by hand. A build now stops and names the dependency instead,
+  and the launcher is produced only when `--compat-launcher` asks for it by name.
+  Its manifest says plainly that it is not native and lists what the target
+  machine needs.
+- **A mislabelled artifact can no longer be published.** The format of a produced
+  executable is read back from its header and checked against the target platform.
+  A PE file named for Linux, or the reverse, is reported as a build error and the
+  artifact is removed rather than written to the user's output path.
+- **`tarvos build app.py` names its output after the input.** It used to default
+  to `tarvos_app.exe` on every platform, so two builds in one directory
+  overwrote each other and a Linux build was handed a `.exe` name. The default is
+  now the input's stem plus the convention of the target format.
+- **A compatibility launcher's manifest no longer claims the program needs
+  nothing.** When the compiler could not parse a program, the manifest came out
+  empty, because the imports were read from the parsed module. Imports are now
+  also read from the source text when parsing fails, which is exactly the case
+  that most needs them recorded.
+
 ### Fixed
 
 - **The fallback broke any program that reads a file next to its own source.**
