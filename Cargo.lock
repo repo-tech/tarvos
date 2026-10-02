@@ -1608,6 +1608,7 @@ dependencies = [
  "anyhow",
  "tarvos-ast",
  "tarvos-ir",
+ "tarvos-parser",
  "tarvos-types",
  "thiserror 2.0.20",
 ]
