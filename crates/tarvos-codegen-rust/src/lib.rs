@@ -1355,10 +1355,9 @@ impl RustCodegen {
             // from inside the tagged runtime rather than from user code. Emitting
             // both would define the same helper twice, so this only fires when
             // the other block will not.
-            if !runtime_calls
-                .iter()
-                .any(|name| name.starts_with("__tarvos_parse_") || name.starts_with("__tarvos_truthy_"))
-            {
+            if !runtime_calls.iter().any(|name| {
+                name.starts_with("__tarvos_parse_") || name.starts_with("__tarvos_truthy_")
+            }) {
                 out.push_str(CONVERSION_RUNTIME);
             }
         }
@@ -1997,7 +1996,7 @@ impl RustCodegen {
         indent: usize,
         declared: &mut HashSet<String>,
         ctx: &mut EmitCtx,
-        ) -> Result<()> {
+    ) -> Result<()> {
         let ind = "    ".repeat(indent);
 
         match stmt {
@@ -3371,7 +3370,9 @@ impl RustCodegen {
                         let right_str = Self::box_dynamic(right)?;
                         return Ok(format!(
                             "__tarvos_binop(&{}, &{}, tarvos_binop::Op::{})",
-                            left_str, right_str, RustCodegen::right_op_name(runtime_op)
+                            left_str,
+                            right_str,
+                            RustCodegen::right_op_name(runtime_op)
                         ));
                     }
                 }
@@ -4554,96 +4555,98 @@ impl RustCodegen {
                 // `validate_assignments` does. A `while` body therefore widens
                 // against the module scope only, and cannot silently retype an
                 // unrelated name from a sibling statement.
-                _ => Self::statements_use_dynamic(
-                    std::slice::from_ref(stmt),
-                    &mut module_variables,
-                ),
+                _ => {
+                    Self::statements_use_dynamic(std::slice::from_ref(stmt), &mut module_variables)
+                }
             }
         }
-        in_function || module_variables.values().any(|ty| matches!(ty, Type::Dynamic))
+        in_function
+            || module_variables
+                .values()
+                .any(|ty| matches!(ty, Type::Dynamic))
     }
 
     /// Widen any name whose second binding has an incompatible type.
     fn statements_use_dynamic(stmts: &[Stmt], variables: &mut HashMap<String, Type>) {
-    for stmt in stmts {
-        match stmt {
-            Stmt::Let { name, ty, value } => {
-                let inferred = Self::value_type(value, variables);
-                variables.insert(
-                    name.clone(),
-                    if matches!(ty, Type::Unknown) {
-                        inferred
-                    } else {
-                        ty.clone()
-                    },
-                );
-            }
-            Stmt::Assign { name, value } => {
-                let actual = Self::value_type(value, variables);
-                match variables.get(name) {
-                    // The case that widens: a name already bound to a concrete
-                    // type is now handed a different one. This is what makes
-                    // `x = 0` followed by `x = "cecece"` work. `Dynamic` is
-                    // sticky, so a third assignment does not narrow it back.
-                    Some(expected)
-                        if !matches!(expected, Type::Dynamic)
-                            && !RustCodegen::types_compatible(expected, &actual) =>
-                    {
-                        variables.insert(name.clone(), Type::Dynamic);
-                    }
-                    Some(_) => {}
-                    None => {
-                        if !matches!(actual, Type::Unknown) {
-                            variables.insert(name.clone(), actual);
+        for stmt in stmts {
+            match stmt {
+                Stmt::Let { name, ty, value } => {
+                    let inferred = Self::value_type(value, variables);
+                    variables.insert(
+                        name.clone(),
+                        if matches!(ty, Type::Unknown) {
+                            inferred
+                        } else {
+                            ty.clone()
+                        },
+                    );
+                }
+                Stmt::Assign { name, value } => {
+                    let actual = Self::value_type(value, variables);
+                    match variables.get(name) {
+                        // The case that widens: a name already bound to a concrete
+                        // type is now handed a different one. This is what makes
+                        // `x = 0` followed by `x = "cecece"` work. `Dynamic` is
+                        // sticky, so a third assignment does not narrow it back.
+                        Some(expected)
+                            if !matches!(expected, Type::Dynamic)
+                                && !RustCodegen::types_compatible(expected, &actual) =>
+                        {
+                            variables.insert(name.clone(), Type::Dynamic);
+                        }
+                        Some(_) => {}
+                        None => {
+                            if !matches!(actual, Type::Unknown) {
+                                variables.insert(name.clone(), actual);
+                            }
                         }
                     }
                 }
-            }
-            Stmt::If { body, orelse, .. } => {
-                Self::statements_use_dynamic(body, variables);
-                Self::statements_use_dynamic(orelse, variables);
-            }
-            Stmt::While { body, .. } | Stmt::With { body, .. } => {
-                Self::statements_use_dynamic(body, variables)
-            }
-            Stmt::For { body, .. } => Self::statements_use_dynamic(body, variables),
-            Stmt::Try {
-                body,
-                handlers,
-                orelse,
-                finalbody,
-                ..
-            } => {
-                Self::statements_use_dynamic(body, variables);
-                for handler in handlers {
-                    Self::statements_use_dynamic(&handler.body, variables);
+                Stmt::If { body, orelse, .. } => {
+                    Self::statements_use_dynamic(body, variables);
+                    Self::statements_use_dynamic(orelse, variables);
                 }
-                Self::statements_use_dynamic(orelse, variables);
-                Self::statements_use_dynamic(finalbody, variables);
+                Stmt::While { body, .. } | Stmt::With { body, .. } => {
+                    Self::statements_use_dynamic(body, variables)
+                }
+                Stmt::For { body, .. } => Self::statements_use_dynamic(body, variables),
+                Stmt::Try {
+                    body,
+                    handlers,
+                    orelse,
+                    finalbody,
+                    ..
+                } => {
+                    Self::statements_use_dynamic(body, variables);
+                    for handler in handlers {
+                        Self::statements_use_dynamic(&handler.body, variables);
+                    }
+                    Self::statements_use_dynamic(orelse, variables);
+                    Self::statements_use_dynamic(finalbody, variables);
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
-}
 
-/// A name seen only in an assignment, with no prior `let`.
-///
-/// The value is overwritten immediately on the next line, so the initial one
-/// only has to satisfy the type checker. `None` is the honest choice: it is the
-/// one variant that carries no data and cannot be mistaken for real content if
-/// the program ever reads the name before assigning it.
-fn empty_dynamic() -> &'static str {
-    "__TarvosValue::None"
-}
+    /// A name seen only in an assignment, with no prior `let`.
+    ///
+    /// The value is overwritten immediately on the next line, so the initial one
+    /// only has to satisfy the type checker. `None` is the honest choice: it is the
+    /// one variant that carries no data and cannot be mistaken for real content if
+    /// the program ever reads the name before assigning it.
+    fn empty_dynamic() -> &'static str {
+        "__TarvosValue::None"
+    }
 
-/// Wrap a statically typed IR value as a tagged runtime value.
-///
-/// This is the inverse of what the native emitter does, and every arm mirrors
-/// one of its branches. That is why a missing arm returns an error instead of
-/// guessing: emitting the wrong thing here produces Rust that fails to
-/// compile, which is a far worse outcome than declining the program.
-fn box_dynamic(value: &Value) -> Result<String> {
-    Ok(match value {
+    /// Wrap a statically typed IR value as a tagged runtime value.
+    ///
+    /// This is the inverse of what the native emitter does, and every arm mirrors
+    /// one of its branches. That is why a missing arm returns an error instead of
+    /// guessing: emitting the wrong thing here produces Rust that fails to
+    /// compile, which is a far worse outcome than declining the program.
+    fn box_dynamic(value: &Value) -> Result<String> {
+        Ok(match value {
         Value::Int(v) => format!("__TarvosValue::Int({})", v),
         // A 128-bit constant only reaches here through a compile-time
         // reduction, and it has already been checked to fit.
@@ -4724,186 +4727,196 @@ Value::Binary { left, op, right, .. } => {
             ))
         }
     })
-}
-
-/// Whether a value reads a name that is emitted as a tagged value.
-///
-/// Only a bare name can be dynamic today. A larger expression that happens to
-/// mention one is emitted in its own type first and then boxed by
-/// `box_dynamic`, which is why the check stops at the name.
-fn is_dynamic_operand(value: &Value) -> bool {
-    matches!(value, Value::Name(name) if Self::is_dynamic(name))
-}
-
-/// The runtime operation matching an IR one, or `None` when there is no
-/// arithmetic equivalent.
-///
-/// Comparisons and bitwise operators are handled separately: the first have
-/// their own runtime helper, and the second have no tagged-value form at all.
-fn dynamic_binop(op: &BinaryOp) -> Option<tarvos_ir::BinaryOp> {
-    use tarvos_ir::BinaryOp as Ir;
-    Some(match op {
-        BinaryOp::Add => Ir::Add,
-        BinaryOp::Sub => Ir::Sub,
-        BinaryOp::Mul => Ir::Mul,
-        BinaryOp::Div => Ir::Div,
-        BinaryOp::Mod => Ir::Mod,
-        BinaryOp::Pow => Ir::Pow,
-        BinaryOp::FloorDiv => Ir::FloorDiv,
-        _ => return None,
-    })
-}
-
-/// Whether a value is emitted as a tagged value rather than a native one.
-///
-/// A bare dynamic name is one, and so is any expression built from one: the
-/// binary operator on it produces another tagged value. Checking only the name
-/// would leave `x + 'b'` printed through the typed display helper, which has no
-/// impl for `__TarvosValue`.
-fn value_is_dynamic(value: &Value) -> bool {
-    match value {
-        Value::Name(name) => Self::is_dynamic(name),
-        // An operation involving a tagged value is itself tagged, and `ty` is
-        // what lowering inferred, so checking it covers both sides at once.
-        Value::Binary { ty, .. } | Value::Unary { ty, .. } => matches!(ty, Type::Dynamic),
-        _ => false,
     }
-}
 
-/// The variant name of a runtime operation, without the enum prefix.
-///
-/// `format!("{:?}", op)` would emit `Op::Add`, but the emitted call site is
-/// already inside `tarvos_binop::Op::Ã¢â‚¬Â¦`, so the bare name is what belongs there.
-fn right_op_name(op: tarvos_ir::BinaryOp) -> &'static str {
-    use tarvos_ir::BinaryOp as Ir;
-    match op {
-        Ir::Add => "Add",
-        Ir::Sub => "Sub",
-        Ir::Mul => "Mul",
-        Ir::Div => "Div",
-        Ir::Mod => "Mod",
-        Ir::Pow => "Pow",
-        Ir::FloorDiv => "FloorDiv",
-        // Unreachable: `dynamic_binop` only produces the seven above.
-        other => panic!("no runtime operation named for {:?}", other),
+    /// Whether a value reads a name that is emitted as a tagged value.
+    ///
+    /// Only a bare name can be dynamic today. A larger expression that happens to
+    /// mention one is emitted in its own type first and then boxed by
+    /// `box_dynamic`, which is why the check stops at the name.
+    fn is_dynamic_operand(value: &Value) -> bool {
+        matches!(value, Value::Name(name) if Self::is_dynamic(name))
     }
-}
 
-/// The rendered form of a literal, used when a dict key must become a string.
-fn literal_text(value: &Value) -> Result<String> {
-    Ok(match value {
-        Value::Int(v) => v.to_string(),
-        Value::Int128(v) => v.to_string(),
-        Value::Float(v) => v.to_string(),
-        Value::Bool(v) => (if *v { "True" } else { "False" }).to_string(),
-        Value::String(v) => v.clone(),
-        other => {
-            return Err(anyhow::anyhow!(
-                "dictionary key {} is not a literal that can be used natively",
-                Self::value_kind(other)
-            ))
+    /// The runtime operation matching an IR one, or `None` when there is no
+    /// arithmetic equivalent.
+    ///
+    /// Comparisons and bitwise operators are handled separately: the first have
+    /// their own runtime helper, and the second have no tagged-value form at all.
+    fn dynamic_binop(op: &BinaryOp) -> Option<tarvos_ir::BinaryOp> {
+        use tarvos_ir::BinaryOp as Ir;
+        Some(match op {
+            BinaryOp::Add => Ir::Add,
+            BinaryOp::Sub => Ir::Sub,
+            BinaryOp::Mul => Ir::Mul,
+            BinaryOp::Div => Ir::Div,
+            BinaryOp::Mod => Ir::Mod,
+            BinaryOp::Pow => Ir::Pow,
+            BinaryOp::FloorDiv => Ir::FloorDiv,
+            _ => return None,
+        })
+    }
+
+    /// Whether a value is emitted as a tagged value rather than a native one.
+    ///
+    /// A bare dynamic name is one, and so is any expression built from one: the
+    /// binary operator on it produces another tagged value. Checking only the name
+    /// would leave `x + 'b'` printed through the typed display helper, which has no
+    /// impl for `__TarvosValue`.
+    fn value_is_dynamic(value: &Value) -> bool {
+        match value {
+            Value::Name(name) => Self::is_dynamic(name),
+            // An operation involving a tagged value is itself tagged, and `ty` is
+            // what lowering inferred, so checking it covers both sides at once.
+            Value::Binary { ty, .. } | Value::Unary { ty, .. } => matches!(ty, Type::Dynamic),
+            _ => false,
         }
-    })
-}
-
-/// A short description of an IR value, used only in error messages.
-fn value_kind(value: &Value) -> &'static str {
-    match value {
-        Value::Int(_) | Value::Int128(_) => "an integer",
-        Value::Float(_) => "a float",
-        Value::String(_) => "a string",
-        Value::Bool(_) => "a boolean",
-        Value::Name(_) => "a variable",
-        Value::Call { .. } => "a function call",
-        Value::ListComp { .. } => "a list comprehension",
-        Value::Index { .. } => "a subscript",
-        Value::Slice { .. } => "a slice",
-        Value::Field { .. } => "an attribute",
-        Value::FormatString { .. } => "a format string",
-        _ => "this expression",
     }
-}
-/// Every name whose binding changes type anywhere in the program.
-///
-/// This has to be collected up front rather than while emitting, because a
-/// name declared `i64` on its first line cannot be re-declared as a tagged
-/// value on the line that discovers the change: Rust would already have fixed
-/// the type. So the decision is made for the whole program first, and emission
-/// just follows it.
-fn dynamic_names(module: &Module) -> HashSet<String> {
-    fn walk(stmts: &[Stmt], variables: &mut HashMap<String, Type>, found: &mut HashSet<String>) {
-        for stmt in stmts {
-            match stmt {
-                Stmt::Let { name, ty, value } => {
-                    let inferred = RustCodegen::value_type(value, variables);
-                    variables.insert(
-                        name.clone(),
-                        if matches!(ty, Type::Unknown) {
-                            inferred
-                        } else {
-                            ty.clone()
-                        },
-                    );
-                }
-                Stmt::Assign { name, value } => {
-                    let actual = RustCodegen::value_type(value, variables);
-                    match variables.get(name) {
-                        Some(expected)
-                            if !matches!(expected, Type::Dynamic)
-                                && !RustCodegen::types_compatible(expected, &actual) =>
-                        {
-                            variables.insert(name.clone(), Type::Dynamic);
-                            found.insert(name.clone());
-                        }
-                        Some(_) => {}
-                        None => {
-                            if !matches!(actual, Type::Unknown) {
-                                variables.insert(name.clone(), actual);
+
+    /// The variant name of a runtime operation, without the enum prefix.
+    ///
+    /// `format!("{:?}", op)` would emit `Op::Add`, but the emitted call site is
+    /// already inside `tarvos_binop::Op::Ã¢â‚¬Â¦`, so the bare name is what belongs there.
+    fn right_op_name(op: tarvos_ir::BinaryOp) -> &'static str {
+        use tarvos_ir::BinaryOp as Ir;
+        match op {
+            Ir::Add => "Add",
+            Ir::Sub => "Sub",
+            Ir::Mul => "Mul",
+            Ir::Div => "Div",
+            Ir::Mod => "Mod",
+            Ir::Pow => "Pow",
+            Ir::FloorDiv => "FloorDiv",
+            // Unreachable: `dynamic_binop` only produces the seven above.
+            other => panic!("no runtime operation named for {:?}", other),
+        }
+    }
+
+    /// The rendered form of a literal, used when a dict key must become a string.
+    fn literal_text(value: &Value) -> Result<String> {
+        Ok(match value {
+            Value::Int(v) => v.to_string(),
+            Value::Int128(v) => v.to_string(),
+            Value::Float(v) => v.to_string(),
+            Value::Bool(v) => (if *v { "True" } else { "False" }).to_string(),
+            Value::String(v) => v.clone(),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "dictionary key {} is not a literal that can be used natively",
+                    Self::value_kind(other)
+                ))
+            }
+        })
+    }
+
+    /// A short description of an IR value, used only in error messages.
+    fn value_kind(value: &Value) -> &'static str {
+        match value {
+            Value::Int(_) | Value::Int128(_) => "an integer",
+            Value::Float(_) => "a float",
+            Value::String(_) => "a string",
+            Value::Bool(_) => "a boolean",
+            Value::Name(_) => "a variable",
+            Value::Call { .. } => "a function call",
+            Value::ListComp { .. } => "a list comprehension",
+            Value::Index { .. } => "a subscript",
+            Value::Slice { .. } => "a slice",
+            Value::Field { .. } => "an attribute",
+            Value::FormatString { .. } => "a format string",
+            _ => "this expression",
+        }
+    }
+    /// Every name whose binding changes type anywhere in the program.
+    ///
+    /// This has to be collected up front rather than while emitting, because a
+    /// name declared `i64` on its first line cannot be re-declared as a tagged
+    /// value on the line that discovers the change: Rust would already have fixed
+    /// the type. So the decision is made for the whole program first, and emission
+    /// just follows it.
+    fn dynamic_names(module: &Module) -> HashSet<String> {
+        fn walk(
+            stmts: &[Stmt],
+            variables: &mut HashMap<String, Type>,
+            found: &mut HashSet<String>,
+        ) {
+            for stmt in stmts {
+                match stmt {
+                    Stmt::Let { name, ty, value } => {
+                        let inferred = RustCodegen::value_type(value, variables);
+                        variables.insert(
+                            name.clone(),
+                            if matches!(ty, Type::Unknown) {
+                                inferred
+                            } else {
+                                ty.clone()
+                            },
+                        );
+                    }
+                    Stmt::Assign { name, value } => {
+                        let actual = RustCodegen::value_type(value, variables);
+                        match variables.get(name) {
+                            Some(expected)
+                                if !matches!(expected, Type::Dynamic)
+                                    && !RustCodegen::types_compatible(expected, &actual) =>
+                            {
+                                variables.insert(name.clone(), Type::Dynamic);
+                                found.insert(name.clone());
+                            }
+                            Some(_) => {}
+                            None => {
+                                if !matches!(actual, Type::Unknown) {
+                                    variables.insert(name.clone(), actual);
+                                }
                             }
                         }
                     }
-                }
-                Stmt::If { body, orelse, .. } => {
-                    walk(body, variables, found);
-                    walk(orelse, variables, found);
-                }
-                Stmt::While { body, .. } | Stmt::With { body, .. } => walk(body, variables, found),
-                Stmt::For { body, .. } => walk(body, variables, found),
-                Stmt::Try {
-                    body,
-                    handlers,
-                    orelse,
-                    finalbody,
-                    ..
-                } => {
-                    walk(body, variables, found);
-                    for handler in handlers {
-                        walk(&handler.body, variables, found);
+                    Stmt::If { body, orelse, .. } => {
+                        walk(body, variables, found);
+                        walk(orelse, variables, found);
                     }
-                    walk(orelse, variables, found);
-                    walk(finalbody, variables, found);
+                    Stmt::While { body, .. } | Stmt::With { body, .. } => {
+                        walk(body, variables, found)
+                    }
+                    Stmt::For { body, .. } => walk(body, variables, found),
+                    Stmt::Try {
+                        body,
+                        handlers,
+                        orelse,
+                        finalbody,
+                        ..
+                    } => {
+                        walk(body, variables, found);
+                        for handler in handlers {
+                            walk(&handler.body, variables, found);
+                        }
+                        walk(orelse, variables, found);
+                        walk(finalbody, variables, found);
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
-    }
 
-    let mut found = HashSet::new();
-    let mut module_variables = HashMap::new();
-    for stmt in &module.statements {
-        match stmt {
-            Stmt::Function { params, body, .. } => {
-                let mut variables = params.iter().cloned().collect::<HashMap<_, _>>();
-                walk(body, &mut variables, &mut found);
+        let mut found = HashSet::new();
+        let mut module_variables = HashMap::new();
+        for stmt in &module.statements {
+            match stmt {
+                Stmt::Function { params, body, .. } => {
+                    let mut variables = params.iter().cloned().collect::<HashMap<_, _>>();
+                    walk(body, &mut variables, &mut found);
+                }
+                Stmt::StructDef { .. } => {}
+                _ => walk(
+                    std::slice::from_ref(stmt),
+                    &mut module_variables,
+                    &mut found,
+                ),
             }
-            Stmt::StructDef { .. } => {}
-            _ => walk(std::slice::from_ref(stmt), &mut module_variables, &mut found),
         }
+        found
     }
-    found
-}
 
-fn validate_module_assignments(module: &Module) -> Result<()> {
+    fn validate_module_assignments(module: &Module) -> Result<()> {
         let mut module_variables = HashMap::new();
         for stmt in &module.statements {
             match stmt {

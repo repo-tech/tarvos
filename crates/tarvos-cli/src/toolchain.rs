@@ -145,9 +145,14 @@ fn host_target_of(rustc: &Path) -> Option<String> {
 /// paying the link on every command.
 fn probe_stamp_path(rustc: &Path) -> Option<PathBuf> {
     let home = user_home().ok()?;
+    // `as_encoded_bytes` called as an associated function, not through a
+    // reference to it. The previous spelling passed `&rustc.as_os_str()
+    // .as_encoded_bytes()`, which binds a reference to a temporary function
+    // value and immediately dereferences it; clippy rejects it under
+    // `-D warnings`.
     Some(managed_root(&home).join("cache").join(format!(
         "probe-ok-{:016x}",
-        fnv1a_64(&rustc.as_os_str().as_encoded_bytes())
+        fnv1a_64(rustc.as_os_str().as_encoded_bytes())
     )))
 }
 

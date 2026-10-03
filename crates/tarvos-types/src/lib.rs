@@ -14,7 +14,10 @@ pub enum Type {
     // Composite types (future)
     Array(Box<Type>),
     Tuple(Vec<Type>),
-    Dict { key: Box<Type>, value: Box<Type> },
+    Dict {
+        key: Box<Type>,
+        value: Box<Type>,
+    },
     Object(String),
 
     // Special

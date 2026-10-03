@@ -304,9 +304,13 @@ mod tests {
 
     #[test]
     fn a_native_program_needs_nothing_from_python() {
-        let report = closure(&format!(
-            r#"{{"body":[{{"type":"import","names":[{{"name":"math"}}]}},{{"type":"import","names":[{{"name":"os.path"}}]}}]}}"#
-        ));
+        // `to_string()` rather than `format!`: the literal has no placeholders, so
+        // `format!` builds a fresh `String` and then throws the argument away. Clippy
+        // rejects it under `-D warnings`, which is why CI is red on a commit that only
+        // touched an unrelated file.
+        let report = closure(
+            r#"{"body":[{"type":"import","names":[{"name":"math"}]},{"type":"import","names":[{"name":"os.path"}]}]}"#,
+        );
         assert!(report.is_native_buildable());
         assert!(report.external().is_empty());
     }

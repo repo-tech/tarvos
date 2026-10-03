@@ -216,8 +216,7 @@ impl Optimizer {
                     // rewritten to the literal `"a"`, which looks right until the
                     // program also did `x = 1` earlier, at which point the folded
                     // value is simply the wrong one.
-                    let trackable = !dynamic.contains(name)
-                        && Self::is_constant_value(&new_val);
+                    let trackable = !dynamic.contains(name) && Self::is_constant_value(&new_val);
                     if trackable {
                         env.insert(name.clone(), new_val.clone());
                     } else {
@@ -438,109 +437,111 @@ impl Optimizer {
     }
 
     /// Whether a value carries a type that is not fixed at compile time.
-///
-/// Such a value is a tagged runtime value in the generated program. Folding or
-/// tracking it as a constant would replace a name with whatever it happened to
-/// hold at that point in the source, which is the one thing a dynamic name is
-/// not allowed to mean.
-fn value_is_tagged(value: &Value) -> bool {
-    match value {
-        Value::Field { ty, .. }
-        | Value::Unary { ty, .. }
-        | Value::Binary { ty, .. }
-        | Value::Call { return_type: ty, .. } => matches!(ty, Type::Dynamic),
-        Value::ListComp { element_type, .. } => matches!(element_type, Type::Dynamic),
-        _ => false,
-    }
-}
-
-/// Names that must not be tracked as known constants.
-///
-/// Two things put a name here. A binding whose type is `Dynamic` is a tagged
-/// value in the generated program, and folding it to a literal would replace
-/// the name with whatever it held at that line. A name bound to two different
-/// types is a dynamic name even though neither binding says so on its own, so
-/// it is detected by replaying the block: the first binding records a type and
-/// a later, different one marks the name.
-fn dynamic_names(stmts: &[Stmt]) -> HashSet<String> {
-    let mut seen: HashMap<String, Type> = HashMap::new();
-    let mut names: HashSet<String> = HashSet::new();
-    Self::collect_dynamic(stmts, &mut seen, &mut names);
-    names
-}
-
-fn collect_dynamic(
-    stmts: &[Stmt],
-    seen: &mut HashMap<String, Type>,
-    names: &mut HashSet<String>,
-) {
-    for stmt in stmts {
-        match stmt {
-            Stmt::Let { name, ty, value } => {
-                if matches!(ty, Type::Dynamic) {
-                    names.insert(name.clone());
-                    continue;
-                }
-                let bound = Self::value_type_of(value);
-                match seen.get(name) {
-                    Some(previous) if *previous != bound => {
-                        names.insert(name.clone());
-                    }
-                    Some(_) => {}
-                    None => {
-                        seen.insert(name.clone(), bound);
-                    }
-                }
-            }
-            Stmt::Assign { name, value } => {
-                if matches!(Self::value_type_of(value), Type::Dynamic) {
-                    names.insert(name.clone());
-                }
-                let bound = Self::value_type_of(value);
-                match seen.get(name) {
-                    Some(previous) if *previous != bound => {
-                        names.insert(name.clone());
-                    }
-                    Some(_) => {}
-                    None => {
-                        seen.insert(name.clone(), bound);
-                    }
-                }
-            }
-            Stmt::If { body, orelse, .. } => {
-                Self::collect_dynamic(body, seen, names);
-                Self::collect_dynamic(orelse, seen, names);
-            }
-            Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::With { body, .. } => {
-                Self::collect_dynamic(body, seen, names)
-            }
-            _ => {}
+    ///
+    /// Such a value is a tagged runtime value in the generated program. Folding or
+    /// tracking it as a constant would replace a name with whatever it happened to
+    /// hold at that point in the source, which is the one thing a dynamic name is
+    /// not allowed to mean.
+    fn value_is_tagged(value: &Value) -> bool {
+        match value {
+            Value::Field { ty, .. }
+            | Value::Unary { ty, .. }
+            | Value::Binary { ty, .. }
+            | Value::Call {
+                return_type: ty, ..
+            } => matches!(ty, Type::Dynamic),
+            Value::ListComp { element_type, .. } => matches!(element_type, Type::Dynamic),
+            _ => false,
         }
     }
-}
 
-/// The type a value carries, as far as the IR records it.
-fn value_type_of(value: &Value) -> Type {
-    match value {
-        Value::Int(_) | Value::Int128(_) => Type::Int,
-        Value::Float(_) => Type::Float,
-        Value::String(_) => Type::String,
-        Value::Bool(_) => Type::Bool,
-        Value::Field { ty, .. }
-        | Value::Unary { ty, .. }
-        | Value::Binary { ty, .. }
-        | Value::Call { return_type: ty, .. } => ty.clone(),
-        Value::List { element_type, .. } => Type::Array(Box::new(element_type.clone())),
-        Value::Index {
-            element_type, ..
-        } => element_type.clone(),
-        // A name reads whatever it was last bound to, which the caller is
-        // already tracking; treating it as unknown avoids a false second type.
-        _ => Type::Unknown,
+    /// Names that must not be tracked as known constants.
+    ///
+    /// Two things put a name here. A binding whose type is `Dynamic` is a tagged
+    /// value in the generated program, and folding it to a literal would replace
+    /// the name with whatever it held at that line. A name bound to two different
+    /// types is a dynamic name even though neither binding says so on its own, so
+    /// it is detected by replaying the block: the first binding records a type and
+    /// a later, different one marks the name.
+    fn dynamic_names(stmts: &[Stmt]) -> HashSet<String> {
+        let mut seen: HashMap<String, Type> = HashMap::new();
+        let mut names: HashSet<String> = HashSet::new();
+        Self::collect_dynamic(stmts, &mut seen, &mut names);
+        names
     }
-}
 
-fn substitute_value(value: &Value, env: &HashMap<String, Value>) -> Value {
+    fn collect_dynamic(
+        stmts: &[Stmt],
+        seen: &mut HashMap<String, Type>,
+        names: &mut HashSet<String>,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Let { name, ty, value } => {
+                    if matches!(ty, Type::Dynamic) {
+                        names.insert(name.clone());
+                        continue;
+                    }
+                    let bound = Self::value_type_of(value);
+                    match seen.get(name) {
+                        Some(previous) if *previous != bound => {
+                            names.insert(name.clone());
+                        }
+                        Some(_) => {}
+                        None => {
+                            seen.insert(name.clone(), bound);
+                        }
+                    }
+                }
+                Stmt::Assign { name, value } => {
+                    if matches!(Self::value_type_of(value), Type::Dynamic) {
+                        names.insert(name.clone());
+                    }
+                    let bound = Self::value_type_of(value);
+                    match seen.get(name) {
+                        Some(previous) if *previous != bound => {
+                            names.insert(name.clone());
+                        }
+                        Some(_) => {}
+                        None => {
+                            seen.insert(name.clone(), bound);
+                        }
+                    }
+                }
+                Stmt::If { body, orelse, .. } => {
+                    Self::collect_dynamic(body, seen, names);
+                    Self::collect_dynamic(orelse, seen, names);
+                }
+                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::With { body, .. } => {
+                    Self::collect_dynamic(body, seen, names)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The type a value carries, as far as the IR records it.
+    fn value_type_of(value: &Value) -> Type {
+        match value {
+            Value::Int(_) | Value::Int128(_) => Type::Int,
+            Value::Float(_) => Type::Float,
+            Value::String(_) => Type::String,
+            Value::Bool(_) => Type::Bool,
+            Value::Field { ty, .. }
+            | Value::Unary { ty, .. }
+            | Value::Binary { ty, .. }
+            | Value::Call {
+                return_type: ty, ..
+            } => ty.clone(),
+            Value::List { element_type, .. } => Type::Array(Box::new(element_type.clone())),
+            Value::Index { element_type, .. } => element_type.clone(),
+            // A name reads whatever it was last bound to, which the caller is
+            // already tracking; treating it as unknown avoids a false second type.
+            _ => Type::Unknown,
+        }
+    }
+
+    fn substitute_value(value: &Value, env: &HashMap<String, Value>) -> Value {
         match value {
             Value::Name(id) => {
                 if let Some(known) = env.get(id) {

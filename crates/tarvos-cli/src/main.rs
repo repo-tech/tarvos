@@ -857,8 +857,11 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    compile_rust_binary_toolchain(&output_path, &rust_source, false, prefer_system).map_err(
-        |err| {
+    // `inspect_err` rather than `map_err`: the error is logged and then returned
+    // unchanged, so mapping it to itself only to get the side effect is exactly
+    // what `inspect_err` exists for.
+    compile_rust_binary_toolchain(&output_path, &rust_source, false, prefer_system).inspect_err(
+        |_| {
             eprintln!(
                 "Rust native build unavailable; generated Rust remains in the user cache for this invocation."
             );
@@ -871,7 +874,6 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
             eprintln!(
                 "Use `tarvos compile <file.py> --source-only` to emit Rust without native compilation."
             );
-            err
         },
     )?;
 
@@ -2097,10 +2099,13 @@ fn hash_project_sources(root: &Path, hasher: &mut impl Hasher) -> Result<()> {
     // Sorted by name, not by path, so the key does not depend on the order the
     // filesystem happens to return entries in.
     files.sort();
-    let mut hashed_files = 0usize;
     let mut hashed_bytes = 0u64;
-    for (name, path) in files {
-        if hashed_files >= SIBLING_SOURCE_LIMIT || hashed_bytes >= SIBLING_BYTE_LIMIT {
+    // The index is the file counter. It was a separate `hashed_files` variable
+    // incremented by hand, which clippy flags as a loop counter in disguise;
+    // `enumerate` states the same thing and cannot drift out of step with the
+    // loop it counts.
+    for (position, (name, path)) in files.into_iter().enumerate() {
+        if position >= SIBLING_SOURCE_LIMIT || hashed_bytes >= SIBLING_BYTE_LIMIT {
             // Past the budget the key is still correct, just less sensitive to
             // an edit in one of the files that were not read. Stopping is the
             // right trade: a stale key costs one recompile, an unbounded walk
@@ -2110,7 +2115,6 @@ fn hash_project_sources(root: &Path, hasher: &mut impl Hasher) -> Result<()> {
         let content = fs::read(&path)
             .with_context(|| format!("failed to read project source {}", path.display()))?;
         hashed_bytes += content.len() as u64;
-        hashed_files += 1;
         name.hash(hasher);
         content.hash(hasher);
     }
