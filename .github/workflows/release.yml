@@ -144,6 +144,13 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@1.98.0
 
+      # Validation compiles Rust *through* the Tarvos CLI, which prefers its own
+      # managed toolchain. Without this the validation step measures the
+      # runner's toolchain state rather than the release, and a program that
+      # would compile natively falls back to CPython instead.
+      - name: Install the managed toolchain
+        run: cargo run --release -p tarvos-cli -- toolchain --install
+
       - name: Cache Cargo and build output
         uses: actions/cache@v4
         with:

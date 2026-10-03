@@ -72,6 +72,15 @@ jobs:
           python-version: "3.12"
 
 
+      # The gate tests compile Rust *through* the Tarvos CLI, and the CLI
+      # deliberately prefers its own managed toolchain over whatever rustup
+      # resolves. On a runner where that toolchain was never installed, every
+      # native-compilation test finds no managed rustc and falls back to CPython,
+      # which the tests then correctly report as a failure. Installing it here is
+      # what makes these tests measure the compiler rather than the runner.
+      - name: Install the managed toolchain
+        run: cargo run --release -p tarvos-cli -- toolchain --install
+
       - name: Cache Cargo and build output
         # First-party only. A third-party cache action would add a new
         # external trust boundary while the current failure is still
