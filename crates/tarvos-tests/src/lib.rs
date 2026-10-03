@@ -1,4 +1,4 @@
-﻿// tarvos-tests: Integration tests for the full compiler pipeline.
+// tarvos-tests: Integration tests for the full compiler pipeline.
 
 /// Re-export nothing â€” this crate is test-only.
 pub fn _placeholder() {}
@@ -193,17 +193,28 @@ mod pipeline {
         assert!(!code.contains("let mut is_prime = 0_i64;"));
     }
 
+    /// A name bound to two different types is boxed, not rejected.
+    ///
+    /// This is the exact program `x = 1` then `x = "dynamic"` produces, and
+    /// it used to be refused with a message telling the user to fall back to
+    /// CPython. It now compiles natively as a tagged value, so the test pins
+    /// the emitted code: what matters is that both bindings name one Rust type.
     #[test]
-    fn incompatible_native_reassignment_requests_python_fallback() {
+    fn mixed_native_reassignment_becomes_a_tagged_value() {
         let ast = r#"{"type":"module","body":[
           {"type":"assign","target":{"type":"name","id":"value"},"value":{"type":"int","value":1}},
           {"type":"assign","target":{"type":"name","id":"value"},"value":{"type":"string","value":"dynamic"}},
           {"type":"expr","value":{"type":"call","function":{"type":"name","id":"print"},
            "args":[{"type":"name","id":"value"}],"keywords":[]}}
         ]}"#;
-        let error = compile(ast).expect_err("mixed native reassignment must be explicit");
-        assert!(error.contains("changes from int to str"));
-        assert!(error.contains("--python-fallback"));
+        let code = compile(ast).expect("a type-changing name compiles natively");
+        assert_contains_all(
+            &code,
+            &[
+                "let mut value = __TarvosValue::",
+                "value = __TarvosValue::Str(",
+            ],
+        );
     }
 
     #[test]

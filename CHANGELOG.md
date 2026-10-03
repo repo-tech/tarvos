@@ -4,6 +4,61 @@ All notable changes to Tarvos are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-10-03
+
+First stable release. The release candidates accumulated a set of changes that
+together make the compiler usable on ordinary Python rather than only on code
+written to fit the subset.
+
+### Added
+
+- **Dynamic typing for names that change type.** `x = 0` followed by
+  `x = "cecece"` now compiles natively instead of being handed to CPython. A name
+  whose type genuinely changes is emitted as a tagged runtime value, so both
+  assignments agree on one Rust type. Arithmetic, comparison and concatenation on
+  such a name go through a runtime dispatcher that follows Python's numeric tower
+  (`int + float` widens, `/` yields a float, dividing by zero raises
+  `ZeroDivisionError`), so `x + 'b'` concatenates and `x + 1` raises the same
+  `TypeError` CPython raises.
+
+  Only names that actually change type are boxed. A program whose types are
+  fixed keeps its native `i64`/`f64`/`String` representation and never pays for
+  the tagged-value runtime, which is emitted only when one is reachable.
+
+### Fixed
+
+- **`tarvos run` no longer pays for link-time optimization.** The profile passed
+  `lto=thin` and `codegen-units=1`, chosen for producing a small shipped artifact.
+  But `run` compiles a program the caller is about to execute, so it optimizes for
+  time to first run instead. LTO pays off when a program is dominated by calls
+  between separately compiled units; a generated single file that mostly calls
+  the standard library gives the linker nothing to fold. Measured on a
+  3M-iteration loop with a cold cache, 4.7s to compile and run with LTO against
+  4.1s without; the program itself then ran in 0.021s against 0.020s, so the
+  runtime was a wash and the ~0.6s came back on the first run and every one after.
+  Binary size was 128512 bytes either way. `tarvos build` keeps fat LTO, where
+  the artifact is shipped and the compile is paid once for a permanent win.
+
+### Changed
+
+- **The Python package workflow now runs real tests.** It failed with pytest's
+  exit code 5, which means "collected nothing": the package shipped a launcher
+  that decides which release asset a platform gets and verifies a SHA-256 before
+  running it, and neither decision was checked. Both are silent when wrong — a
+  wrong asset name means `pip install tarvos` succeeds on every platform and the
+  command fails only when first run, on the machine that needed it. Coverage now
+  pins the asset mapping per platform, checksum verification, rejection and
+  cleanup on mismatch, and that the CLI reports failure with a usable message
+  instead of a traceback.
+
+  Writing those tests found a real gap: **macOS arm64 is refused outright**,
+  because no arm64 build is published. Serving an x86_64 binary to Apple silicon
+  promises emulation that costs memory the user may not have and fails outright
+  without Rosetta, so the refusal is now pinned by a test rather than left as
+  incidental behaviour.
+
+- **`setup-python` moved from the deprecated v3 to v5** in that workflow.
+
 ## [Unreleased]
 
 ### Added

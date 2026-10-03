@@ -19,6 +19,21 @@ pub enum Type {
 
     // Special
     Unknown,
+
+    /// A value whose type is not fixed at compile time.
+    ///
+    /// This is what Python's dynamic typing looks like from the outside: the
+    /// name `x` is bound to an `Int` on one line and a `String` on the next.
+    /// Tarvos keeps the native typed path for the overwhelming majority of
+    /// variables, so `Dynamic` is reserved for names that genuinely change type.
+    /// Those are compiled to a tagged runtime value instead of a bare `i64`,
+    /// which costs a tag word and a match on each operation, and buys the
+    /// ability to do what the source said.
+    ///
+    /// It is deliberately *not* a fallback for "the analyser could not work this
+    /// out". `Unknown` already means that, and silently treating the two the
+    /// same would hide real type changes behind a convenient guess.
+    Dynamic,
 }
 
 impl fmt::Display for Type {
@@ -43,6 +58,7 @@ impl fmt::Display for Type {
             Type::Dict { key, value } => write!(f, "Dict[{}, {}]", key, value),
             Type::Object(name) => write!(f, "{}", name),
             Type::Unknown => write!(f, "Unknown"),
+            Type::Dynamic => write!(f, "dynamic"),
         }
     }
 }

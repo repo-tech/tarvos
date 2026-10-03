@@ -50,6 +50,15 @@ impl Lowerer {
         // One pre-pass serves both the empty-list element types and the
         // unannotated parameter types, so they cannot disagree about a name.
         let variable_types = collect_variable_types(&module.body);
+
+        // A name bound to two different types in one module is tagged, so that
+        // both bindings can agree on one Rust type. This has to be known here
+        // rather than at codegen: inference below asks the type of `x + 1`,
+        // and if `x` is still believed to be an `Int` that expression is
+        // rejected as `int + str` before anything downstream can widen it.
+        for name in collect_type_changing_names(&module.body) {
+            self.type_context.declare(name, Type::Dynamic);
+        }
         self.empty_list_hints = variable_types
             .iter()
             .filter_map(|(name, ty)| match ty {
@@ -1817,6 +1826,13 @@ impl Lowerer {
             }
             (Type::String, Type::String, BinaryOp::Add) => Ok(Type::String),
             (Type::String, Type::String, BinaryOp::Eq) => Ok(Type::Bool),
+            // A tagged operand makes the whole expression tagged. Python allows
+            // `1 + "a"` to fail at run time rather than at compile time, and
+            // the runtime dispatcher is what raises that `TypeError`. Reporting
+            // it here instead would reject a program Python itself accepts.
+            // The third tuple slot is the operator, not a type, so only the
+            // operand positions are tested.
+            (Type::Dynamic, _, _) | (_, Type::Dynamic, _) => Ok(Type::Dynamic),
             _ => bail!("unsupported operation: {} {} {}", left, op.symbol(), right),
         }
     }
@@ -2507,6 +2523,86 @@ fn collect_variable_types(statements: &[tarvos_ast::Stmt]) -> HashMap<String, Ty
     collect_variable_types_into(statements, &mut names, 0);
     collect_empty_list_element_types(statements, &mut names);
     names
+}
+
+/// Names bound to two different types anywhere in the module.
+///
+/// A name that appears once keeps its concrete type. A name that appears with
+/// two different types is a Python program doing dynamic typing, and the
+/// lowering pass has to know that up front: it infers the type of expressions
+/// like `x + 1` from the declared type of `x`, so leaving `x` as `Int` would
+/// make `x = 'a'; print(x + 1)` fail inference as `int + str` before codegen
+/// ever had a chance to widen it.
+///
+/// Two different types is the trigger; a name bound twice with the *same* type
+/// is ordinary code and must not be tagged.
+fn collect_type_changing_names(statements: &[tarvos_ast::Stmt]) -> HashSet<String> {
+    let mut seen: HashMap<String, Type> = HashMap::new();
+    let mut changing: HashSet<String> = HashSet::new();
+    collect_type_changing_into(statements, &mut seen, &mut changing, 0);
+    changing
+}
+
+fn collect_type_changing_into(
+    statements: &[tarvos_ast::Stmt],
+    seen: &mut HashMap<String, Type>,
+    changing: &mut HashSet<String>,
+    depth: usize,
+) {
+    // The same guard as `collect_variable_types_into`: deeply nested source is
+    // skipped rather than risking unbounded recursion.
+    if depth > 8 {
+        return;
+    }
+    for statement in statements {
+        match statement {
+            tarvos_ast::Stmt::Assign { target, value } => {
+                let tarvos_ast::Expr::Name { id } = target else {
+                    continue;
+                };
+                let ty = expression_type_with_names(value, seen);
+                // `Unknown` is not a second type, it is the absence of one.
+                if ty == Type::Unknown {
+                    continue;
+                }
+                match seen.get(id) {
+                    Some(previous) if *previous != ty => {
+                        changing.insert(id.clone());
+                    }
+                    Some(_) => {}
+                    None => {
+                        seen.insert(id.clone(), ty);
+                    }
+                }
+            }
+            tarvos_ast::Stmt::For {
+                target, iter, body, ..
+            } => {
+                if let tarvos_ast::Expr::Name { id } = target {
+                    let ty = expression_type_with_names(iter, seen);
+                    if ty != Type::Unknown {
+                        seen.entry(id.clone()).or_insert(ty);
+                    }
+                }
+                collect_type_changing_into(body, seen, changing, depth + 1);
+            }
+            tarvos_ast::Stmt::If { body, orelse, .. } => {
+                collect_type_changing_into(body, seen, changing, depth + 1);
+                collect_type_changing_into(orelse, seen, changing, depth + 1);
+            }
+            tarvos_ast::Stmt::While { body, .. } | tarvos_ast::Stmt::With { body, .. } => {
+                collect_type_changing_into(body, seen, changing, depth + 1);
+            }
+            tarvos_ast::Stmt::FunctionDef { body, .. } => {
+                // A function has its own scope, so its names are walked against a
+                // fresh map rather than the module's. A local `x` is unrelated to
+                // a module-level one and must not make it look dynamic.
+                let mut inner_seen = HashMap::new();
+                collect_type_changing_into(body, &mut inner_seen, changing, depth + 1);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn collect_variable_types_into(

@@ -3035,25 +3035,111 @@ mod tests {
         );
     }
 
+    /// A name whose type changes is boxed into a tagged value so both
+    /// assignments agree on one Rust type.
+    ///
+    /// This used to be an error, and the test asserted that. It is the exact
+    /// program the dynamic-value work was written for, so the test now pins
+    /// the *generated code* rather than the refusal: what matters is that both
+    /// lines name the same Rust type, not that the program was declined.
     #[test]
-    fn incompatible_type_reassignment_fails_fast_without_success_shape() {
+    fn incompatible_type_reassignment_emits_one_consistent_rust_type() {
         let snippet = "x = 42\nx = 'now_a_string'\nprint(x)\n";
         let ast_json = export_python_ast(snippet).expect("ast export should succeed");
         let module = parse_python_ast(&ast_json).expect("ast parsing should succeed");
         let ir = lower_module(&module).expect("lowering produces typed IR");
         let ir = Optimizer::optimize(&ir).expect("optimizer succeeds");
-        let res = RustCodegen::generate(&ir);
+        let generated = RustCodegen::generate(&ir).expect("a type-changing name is supported");
+        let main = generated
+            .split("fn main()")
+            .nth(1)
+            .expect("generated program has a main");
+
+        // Every binding and reassignment must agree on one Rust type, or the
+        // emitted Rust declares `x` as one type and assigns another.
         assert!(
-            res.is_err(),
-            "incompatible reassignment must be rejected natively by codegen"
+            main.contains("let mut x = __TarvosValue::"),
+            "the name should be declared as a tagged value, got:\n{}",
+            main
         );
-        let err_msg = res.unwrap_err().to_string();
         assert!(
-            err_msg.contains("fallback")
-                || err_msg.contains("incompatible")
-                || err_msg.contains("changes from"),
-            "expected actionable type error, got: {}",
-            err_msg
+            main.contains("x = __TarvosValue::Int(42)"),
+            "the first binding should be tagged, got:\n{}",
+            main
+        );
+        assert!(
+            main.contains("x = __TarvosValue::Str("),
+            "the reassignment should be tagged with the new type, got:\n{}",
+            main
+        );
+        // The declaration has to precede every assignment, or the first use
+        // reads a name Rust has not bound yet.
+        let declared = main.find("let mut x =").expect("declaration");
+        let first_assign = main.find("x = __TarvosValue::Int").expect("assignment");
+        assert!(
+            declared < first_assign,
+            "the declaration must come before the first assignment, got:\n{}",
+            main
+        );
+    }
+
+    /// A name that changes type must survive every pass between the AST and the
+    /// generated Rust.
+    ///
+    /// Each of these was a real failure while the feature was built. The
+    /// lowering rejected `x + 'b'` as `int + str` because it still believed `x`
+    /// was an `Int`; the constant-propagation pass replaced `x` with the literal
+    /// `"a"`; and `print` routed a tagged value through the typed display
+    /// helper, which has no impl for it. A test per pass would only catch the
+    /// one that happened last, so all three are pinned together.
+    #[test]
+    fn a_type_changing_name_survives_lowering_optimisation_and_codegen() {
+        let snippet = "x = 1\nx = 'a'\nprint(x + 'b')\n";
+        let ast_json = export_python_ast(snippet).expect("ast export should succeed");
+        let module = parse_python_ast(&ast_json).expect("ast parsing should succeed");
+        let ir = lower_module(&module).expect("lowering must not reject the program");
+        let ir = Optimizer::optimize(&ir).expect("optimizer succeeds");
+        let generated = RustCodegen::generate(&ir).expect("codegen succeeds");
+        let main = generated
+            .split("fn main()")
+            .nth(1)
+            .expect("generated program has a main");
+
+        // Both bindings tagged, so one Rust type covers the whole name.
+        assert!(
+            main.contains("__TarvosValue::Int(1)") && main.contains("__TarvosValue::Str(\"a\""),
+            "both bindings should be tagged, got:\n{}",
+            main
+        );
+        // Constant propagation must not have rewritten the name away.
+        assert!(
+            !main.contains("\"a\".to_string() +"),
+            "the name must not be folded to the literal it last held, got:\n{}",
+            main
+        );
+        // The concatenation goes through the runtime dispatcher.
+        assert!(
+            main.contains("__tarvos_binop("),
+            "arithmetic on a tagged value should dispatch at run time, got:\n{}",
+            main
+        );
+    }
+    ///
+    /// It is a large block of helpers and a whole enum, and a program that
+    /// never changes a name's type must not carry it.
+    #[test]
+    fn a_static_program_does_not_pay_for_the_tagged_value_runtime() {
+        let snippet = "x = 42\ny = 'hello'\nprint(x)\nprint(y)\n";
+        let ast_json = export_python_ast(snippet).expect("ast export should succeed");
+        let module = parse_python_ast(&ast_json).expect("ast parsing should succeed");
+        let ir = lower_module(&module).expect("lowering produces typed IR");
+        let ir = Optimizer::optimize(&ir).expect("optimizer succeeds");
+        let generated = RustCodegen::generate(&ir).expect("static programs stay static");
+
+        assert!(
+            !generated.contains("__TarvosValue"),
+            "a program that never changes a name's type must not emit the \
+             tagged-value runtime"
         );
     }
 
