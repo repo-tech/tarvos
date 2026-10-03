@@ -249,6 +249,14 @@ jobs:
       - name: Build the release CLI
         run: cargo build --release -p tarvos-cli
 
+      # This job's whole premise is that the artifact is built with the managed
+      # toolchain and nothing else, so that is what has to be installed first.
+      # Without it there is no compiler at all under ~/.tarvos, and the build
+      # falls back to whatever the runner happens to provide — which is exactly
+      # the situation this job exists to rule out.
+      - name: Install the managed toolchain
+        run: cargo run --release -p tarvos-cli -- toolchain --install
+
       - name: Build a standalone program
         shell: bash
         run: |
@@ -361,6 +369,13 @@ jobs:
             ${{ runner.os }}-rust-1.98.0-
       - name: Build the CLI
         run: cargo build -p tarvos-cli
+
+      # Both this job and the standalone job compile through the Tarvos CLI,
+      # which prefers its own managed toolchain. Without it installed on the
+      # runner, every native build falls back to CPython and the differential
+      # comparison is comparing Python against Python.
+      - name: Install the managed toolchain
+        run: cargo run -p tarvos-cli -- toolchain --install
 
       - name: Report context
         shell: bash
