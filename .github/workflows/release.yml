@@ -638,10 +638,16 @@ jobs:
             exit 1
           }
           find release-assets -type f -printf '%f\n' | sort
+          # Derived from the list above rather than written down again. The hardcoded
+          # 8 was left behind when macOS was dropped from the release, so this step
+          # failed on a build that produced exactly the right files. Anything extra
+          # still fails: a stale file in the directory means an asset nobody
+          # accounted for would be published.
+          expected_count=$(( ${#expected[@]} * 2 ))
           count="$(find release-assets -maxdepth 1 -type f | wc -l)"
-          echo "asset count: $count (expected 8)"
-          if [ "$count" -ne 8 ]; then
-            echo "::error title=Unexpected artifact set::expected exactly 8 files, found $count"
+          echo "asset count: $count (expected $expected_count)"
+          if [ "$count" -ne "$expected_count" ]; then
+            echo "::error title=Unexpected artifact set::expected exactly $expected_count files, found $count"
             exit 1
           fi
 
