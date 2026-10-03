@@ -389,18 +389,23 @@ jobs:
           cp "$source" "$destination"
           chmod 0755 "$destination"
           # `shasum` is a Perl script that is not present on every Linux image,
-          # The Linux runner is the only Unix target left, so the tool that ships with\r\n          # coreutils is the one named here.
+          # so the tool that ships with coreutils is preferred and the other
+          # is used only if it is missing.
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$destination" > "$destination.sha256"
           else
             shasum -a 256 "$destination" > "$destination.sha256"
           fi
-          # Both tools write "<hash>  <name>", which is what the Windows staging
-          # step writes too, so all three platforms publish the same format. The
-          # launcher reads only the first field, but `sha256sum -c` needs the
-          # filename present.
+          # Both write "<hash>  <name>", the format `sha256sum -c` needs and
+          # the one the publish step verifies. The launcher reads only the
+          # first field, so the trailing newline is immaterial to it.
           cat "$destination.sha256"
-          "$destination" --version
+          # Run it as ./name, not name. A bare word is looked up in PATH, and the
+          # workspace root is not on PATH, so this failed with "command not
+          # found" on a binary that had already built and run fine two steps
+          # earlier. The earlier `shasum` failure happened to fail first and hid
+          # it.
+          "./$destination" --version
 
       - name: Upload staged binary
         uses: actions/upload-artifact@v4
