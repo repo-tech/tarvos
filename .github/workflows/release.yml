@@ -392,7 +392,19 @@ jobs:
           fi
           cp "$source" "$destination"
           chmod 0755 "$destination"
-          shasum -a 256 "$destination" > "$destination.sha256"
+          # `shasum` is a Perl script that is not present on every Linux image,
+          # and `sha256sum` does not exist on macOS. Preferring one and falling
+          # back to the other covers both without assuming which the runner has.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$destination" > "$destination.sha256"
+          else
+            shasum -a 256 "$destination" > "$destination.sha256"
+          fi
+          # Both tools write "<hash>  <name>", which is what the Windows staging
+          # step writes too, so all three platforms publish the same format. The
+          # launcher reads only the first field, but `sha256sum -c` needs the
+          # filename present.
+          cat "$destination.sha256"
           "$destination" --version
 
       - name: Upload staged binary
