@@ -45,12 +45,12 @@ jobs:
       # Tests compile Rust through the Tarvos CLI from a temporary directory
       # outside the checkout, where rust-toolchain.toml is not visible. Without
       # this the CLI's rustup lookup resolves whatever the runner default is,
-      # which on macOS runners is a channel the runner cannot self-update.
+      # so the same source would build differently on different days.
       RUSTUP_TOOLCHAIN: 1.98.0
     strategy:
       fail-fast: false
       matrix:
-        os: [ windows-latest, ubuntu-latest, macos-latest ]
+        os: [ windows-latest, ubuntu-latest ]
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -233,7 +233,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ windows-latest, ubuntu-latest, macos-latest ]
+        os: [ windows-latest, ubuntu-latest ]
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -321,7 +321,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ windows-latest, ubuntu-latest, macos-latest ]
+        os: [ windows-latest, ubuntu-latest ]
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -440,12 +440,6 @@ jobs:
             binary_name: tarvos.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            binary_name: tarvos
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            binary_name: tarvos
-          - os: macos-latest
-            target: aarch64-apple-darwin
             binary_name: tarvos
     steps:
       - name: Check out source

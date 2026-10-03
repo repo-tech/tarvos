@@ -266,10 +266,6 @@ jobs:
             os: ubuntu-latest
             asset_name: tarvos-linux-x86_64
             binary_name: tarvos
-          - platform: macos-x86_64
-            os: macos-latest
-            asset_name: tarvos-macos-x86_64
-            binary_name: tarvos
 
     env:
       RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
@@ -393,8 +389,7 @@ jobs:
           cp "$source" "$destination"
           chmod 0755 "$destination"
           # `shasum` is a Perl script that is not present on every Linux image,
-          # and `sha256sum` does not exist on macOS. Preferring one and falling
-          # back to the other covers both without assuming which the runner has.
+          # The Linux runner is the only Unix target left, so the tool that ships with\r\n          # coreutils is the one named here.
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$destination" > "$destination.sha256"
           else
@@ -617,7 +612,6 @@ jobs:
           expected=(
             "tarvos-windows-x86_64.exe"
             "tarvos-linux-x86_64"
-            "tarvos-macos-x86_64"
             "Tarvos-Setup-Windows-x86_64.exe"
           )
           for asset in "${expected[@]}"; do
@@ -671,8 +665,6 @@ jobs:
             release-assets/Tarvos-Setup-Windows-x86_64.exe.sha256
             release-assets/tarvos-linux-x86_64
             release-assets/tarvos-linux-x86_64.sha256
-            release-assets/tarvos-macos-x86_64
-            release-assets/tarvos-macos-x86_64.sha256
           # Re-running replaces the same asset names instead of accumulating
           # duplicates, and a missing file is an error rather than a silent skip.
           fail_on_unmatched_files: true
