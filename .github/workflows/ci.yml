@@ -173,9 +173,14 @@ jobs:
           python-version: "3.12"
 
       - name: Set up Rust for building the CLI
-        uses: dtolnay/rust-toolchain@master
+        # Pinned to the same tag as every other toolchain step in this workflow
+        # and to `rust-toolchain.toml`. This step used to say `@master` with the
+        # version in a `with:` block, which `scripts/check_toolchain_pin.py`
+        # reads as an unpinned install: the action could change what `@master`
+        # does at any time while the gates below it assumed 1.98.0.
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
-          toolchain: 1.98.0
+          components: rustfmt, clippy
 
       - name: Cache Cargo downloads
         uses: actions/cache@v4

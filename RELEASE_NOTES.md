@@ -1,3 +1,113 @@
+# Tarvos 1.3.0
+
+## Summary
+
+`1.3.0` is the **first stable release**. Everything up to `1.1.0-rc.6` was a
+release candidate: the compiler worked, but it declined ordinary Python and
+quietly handed the program to CPython instead.
+
+That fallback is the thing worth fixing in this release. It prints the right
+answer, so nothing looks broken — but the program is no longer native, the speed
+that justified the toolchain is gone, and the user has no signal that any of
+that happened. `x = 0` followed by `x = "cecece"` was enough to trigger it.
+
+## Highlights
+
+- **Dynamic typing for names that change type.** `x = 0` then `x = "cecece"` now
+  compiles natively. A name whose type genuinely changes is emitted as a tagged
+  runtime value, so both assignments agree on one Rust type instead of
+  conflicting. Arithmetic, comparison and concatenation on such a name follow
+  Python's numeric tower: `int + float` widens, `/` always yields a float,
+  dividing by zero raises `ZeroDivisionError`, and `"a" + 1` raises the same
+  `TypeError` CPython raises rather than being rejected at compile time.
+
+  This is a real Python program running as Rust, not a fallback.
+
+- **No cost for programs that do not need it.** Only names that actually change
+  type are boxed. Everything else keeps its native `i64`/`f64`/`String`
+  representation, and the tagged-value runtime is emitted only when one is
+  reachable — so a normal program compiles to the same code it always did.
+
+- **`tarvos run` is faster.** The run profile was passing `lto=thin` and
+  `codegen-units=1`, settings chosen for producing a small shipped artifact.
+  But `run` compiles a program the caller is about to execute, so it should
+  optimize for time to first run. LTO pays off when a program is dominated by
+  calls between separately compiled units; a generated single file that mostly
+  calls the standard library gives the linker nothing to fold.
+
+  Measured on a 3M-iteration loop with a cold cache: **4.7s to compile and run
+  with LTO, 4.1s without.** The program itself then ran in 0.021s against 0.020s
+  — a wash. Binary size was 128512 bytes either way. So the ~0.6s comes back on
+  the first run and every run after, and nothing was traded away for it.
+
+- **The Python package ships working tests.** The `pip` package workflow had been
+  failing with pytest's exit code 5, which means "collected nothing". The package
+  shipped a launcher that decides which release asset a platform gets and
+  verifies a SHA-256 before running it, and neither decision was tested. Both
+  are silent when wrong: a wrong asset name means `pip install tarvos` succeeds
+  on every platform and the command fails only when first run, on the machine
+  that needed it.
+
+## Breaking Changes
+
+- **macOS on Apple silicon is refused, and that refusal is now explicit.** No
+  arm64 build is published. Serving an x86_64 binary to arm64 would work only
+  under emulation, which costs memory the user may not have and fails outright
+  without Rosetta — promising it silently is worse than refusing. If you are on
+  macOS arm64, `tarvos` will tell you so and point at `TARVOS_VERSION` rather
+  than appear to install and then fail to run.
+
+- **`tarvos run` no longer applies link-time optimization.** Only affects how long
+  the first run takes, not what the program computes. `tarvos build` is unchanged
+  and still ships an LTO-optimized artifact.
+
+## Validation
+
+- **160 Rust tests pass** across 25 test binaries (`cargo test --workspace`), exit
+  code 0.
+- **20 of 20 CLI programs compiled natively with output byte-identical to
+  CPython**: arithmetic, loops, functions, list comprehensions, dicts, string
+  methods, `while`, conditionals, float division, and all seven dynamic-typing
+  cases (`int`→`str`, `str`→`int`, `int`→`float`, `bool`→`str`, `int`→`list`,
+  three successive type changes, concatenation, comparison, and a `TypeError`
+  that CPython also raises).
+- **A larger program was checked end to end**: a prime sieve, a multi-return
+  function, nested iteration over a matrix, and a name that changes type —
+  output identical to CPython.
+- **160 tests plus the CLI sweep run on Windows, Ubuntu and macOS** before this
+  release is published.
+- Version consistency is enforced across all ten places the version is written
+  down — Cargo, the installer, the server banner, the gateway's health payload
+  and its two cache namespaces, the launcher default, the PowerShell installer,
+  the sandbox image tag, the Python packaging metadata and the README badge.
+
+## Installation
+
+```powershell
+# Windows
+irm https://github.com/repo-tech/tarvos/releases/download/v1.3.0/install.ps1 | iex
+```
+
+```bash
+# Linux and macOS
+curl -fsSL https://github.com/repo-tech/tarvos/releases/download/v1.3.0/install.sh | sh
+```
+
+The Python launcher defaults to the published release tag; set `TARVOS_VERSION`
+to pin a specific one:
+
+```bash
+pip install tarvos
+TARVOS_VERSION=v1.3.0 tarvos build app.py
+```
+
+Upgrading from `1.1.0-rc.6`: no configuration changes are needed. The one
+behavioural difference is macOS arm64, described under Breaking Changes.
+
+## Full Changelog
+
+https://github.com/repo-tech/tarvos/compare/v1.1.0-rc.6...v1.3.0
+
 # Tarvos 1.1.0-rc.6
 
 ## Summary
