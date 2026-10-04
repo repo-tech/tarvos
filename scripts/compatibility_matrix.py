@@ -19,7 +19,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "tests" / "corpus"
 MATRIX = ROOT / "docs" / "compatibility.json"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 
 def workspace_version() -> str | None:
