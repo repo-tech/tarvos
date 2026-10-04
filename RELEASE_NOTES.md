@@ -1,10 +1,42 @@
-# Tarvos 1.3.0
+# Tarvos 1.3.1
 
 ## Summary
 
-`1.3.0` is the **first stable release**. Everything up to `1.1.0-rc.6` was a
-release candidate: the compiler worked, but it declined ordinary Python and
-quietly handed the program to CPython instead.
+A maintenance release. The headline work is in `1.3.0`; this one fixes two
+native-codegen bugs that made two ordinary Python programs fail to compile, and
+synchronizes the version across the compiler and `tarvos-engine`.
+
+## Fixed
+
+- **Float `/` with an integer divisor generated code that did not compile.**
+  `7.0 / 2` emitted its zero-guard as `2_i64 == 0.0_f64` — `error[E0308]:
+  mismatched types`, an `i64` compared against an `f64` literal. The guard tested
+  the raw divisor while the division promoted it. Both operands are now promoted
+  once and the guard tests the promoted value.
+
+- **`sum(range(...))` generated code that did not compile.** `sum` appended
+  `.iter()` unconditionally, but a range is already an iterator and Rust's
+  `Range` has no `iter()` method — `error[E0599]`. Only the dynamic-step form
+  lowers to a `Vec`, and that one still needs it.
+
+Both were found by the differential harness, which compares each case's output
+under CPython against a compiled native artifact. They were latent rather than
+new: the CI jobs that exercise them had been failing earlier, on the toolchain
+install, before ever reaching the test step. A clean-baseline check confirmed
+both predate the dynamic-typing work.
+
+## Validation
+
+- **160 Rust tests pass** across 25 test binaries, exit code 0.
+- **Differential suite is now 15 of 15** with `rustc_failed=0`, up from 13 of 15.
+- `cargo fmt --all` clean, `cargo clippy --workspace --all-targets` clean.
+- The engine package's 11 tests pass.
+
+## Upgrade notes
+
+None. This is a bug-fix release; no flag, artifact format, or output changed.
+
+## Highlights
 
 That fallback is the thing worth fixing in this release. It prints the right
 answer, so nothing looks broken — but the program is no longer native, the speed
@@ -85,12 +117,12 @@ that happened. `x = 0` followed by `x = "cecece"` was enough to trigger it.
 
 ```powershell
 # Windows
-irm https://github.com/repo-tech/tarvos/releases/download/v1.3.0/install.ps1 | iex
+irm https://github.com/repo-tech/tarvos/releases/download/v1.3.1/install.ps1 | iex
 ```
 
 ```bash
 # Linux and macOS
-curl -fsSL https://github.com/repo-tech/tarvos/releases/download/v1.3.0/install.sh | sh
+curl -fsSL https://github.com/repo-tech/tarvos/releases/download/v1.3.1/install.sh | sh
 ```
 
 The Python launcher defaults to the published release tag; set `TARVOS_VERSION`
@@ -98,7 +130,7 @@ to pin a specific one:
 
 ```bash
 pip install tarvos
-TARVOS_VERSION=v1.3.0 tarvos build app.py
+TARVOS_VERSION=v1.3.1 tarvos build app.py
 ```
 
 Upgrading from `1.1.0-rc.6`: no configuration changes are needed. The one
@@ -106,7 +138,7 @@ behavioural difference is macOS arm64, described under Breaking Changes.
 
 ## Full Changelog
 
-https://github.com/repo-tech/tarvos/compare/v1.1.0-rc.6...v1.3.0
+https://github.com/repo-tech/tarvos/compare/v1.1.0-rc.6...v1.3.1
 
 # Tarvos 1.1.0-rc.6
 

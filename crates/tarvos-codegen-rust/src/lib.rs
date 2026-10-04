@@ -3426,24 +3426,35 @@ impl RustCodegen {
                 // `except ZeroDivisionError` never runs.
                 if *op == BinaryOp::Div && *ty == Type::Float {
                     // Python's `/` is true division, so integer operands are
-                    // promoted. The cast is applied unconditionally because an
-                    // `as f64` on a value that is already `f64` is a no-op, and
-                    // without it an `i64` operand is passed where `f64` is
-                    // expected.
+                    // promoted. The cast is applied only where the operand is
+                    // not already statically a float; `as f64` on a value that
+                    // is already `f64` is a no-op, but emitting it blindly
+                    // wraps a dynamic or already-cast expression in a
+                    // redundant borrow.
+                    let left_f = if Self::value_is_float(left) {
+                        left_str
+                    } else {
+                        format!("({} as f64)", left_str)
+                    };
+                    let right_f = if Self::value_is_float(right) {
+                        right_str
+                    } else {
+                        format!("({} as f64)", right_str)
+                    };
+                    // The zero test has to use the promoted divisor. Testing the
+                    // raw one compares an `i64` against an `f64` literal, which
+                    // is not valid Rust: `7.0 / 2` with an integer denominator
+                    // generated `2_i64 == 0.0_f64` and failed to compile.
                     return Ok(Self::raise_aware(
                         ctx,
+                        &format!("__tarvos_div_f64({}, {})", left_f, right_f),
                         &format!(
-                            "__tarvos_div_f64({} as f64, {} as f64)",
-                            left_str, right_str
-                        ),
-                        &format!(
-                            "{{ if {} == 0.0_f64 {{ panic!(\"ZeroDivisionError: float division\") }} else {{ ({} as f64) / ({} as f64) }} }}",
-                            right_str, left_str, right_str
+                            "{{ if {} == 0.0_f64 {{ panic!(\"ZeroDivisionError: float division\") }} else {{ {} / {} }} }}",
+                            right_f, left_f, right_f
                         ),
                     ));
                 }
                 if *op == BinaryOp::FloorDiv && *ty == Type::Int {
-                    // Python `//` floors toward negative infinity; Rust `/` truncates.
                     // Python `//` floors toward negative infinity; Rust `/` truncates.
                     return Ok(Self::raise_aware(
                         ctx,
@@ -3877,7 +3888,25 @@ impl RustCodegen {
                         [a, b] => format!("({}).max({})", a, b),
                         _ => format!("std::cmp::max({})", args_str),
                     },
-                    "sum" => format!("{}.iter().sum::<i64>()", args_str),
+                    // `sum` needs `.iter()` for a Vec, but a range is emitted as an
+                    // iterator already (`(a..b)` or `(a..b).step_by(n)`), and Rust's
+                    // `Range` has no `iter()` method - calling it was E0599. Only the
+                    // dynamic-step form returns a `Vec`, and that one keeps it.
+                    // `sum(xs)` must not consume `xs`, so the Vec case borrows.
+                    "sum" => match args.first() {
+                        Some(Value::Call { function, args: range_args, .. })
+                            if function == "range" && range_args.len() < 3 =>
+                        {
+                            format!("{}.sum::<i64>()", args_str)
+                        }
+                        Some(Value::Call { function, args: range_args, .. })
+                            if function == "range"
+                                && Self::range_step_is_positive_literal(range_args.get(2)) =>
+                        {
+                            format!("{}.sum::<i64>()", args_str)
+                        }
+                        _ => format!("{}.iter().sum::<i64>()", args_str),
+                    },
                     name
                         if name.starts_with("__tarvos_list_from_")
                             | name.starts_with("__tarvos_sorted_from_") =>

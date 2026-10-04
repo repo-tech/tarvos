@@ -4,6 +4,47 @@ All notable changes to Tarvos are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.1] - 2026-10-10
+
+Version synchronization across the compiler and the `tarvos-engine` distribution
+repository. `TARVOS_PRODUCT_VERSION` is now pinned to `1.3.1` as a repository
+variable so the compiled binary reports the release it actually came from
+instead of a stale value.
+
+### Fixed
+
+- **The published binary reported the wrong version.** `--version` printed
+  `1.0.0` for a `1.3.0` release. The user-facing version comes from the
+  `TARVOS_PRODUCT_VERSION` compile-time variable, which the release workflow
+  feeds from a repository variable; that variable still held `1.0.0`, and it
+  takes precedence over `Cargo.toml`. The code was correct — only the reported
+  string was wrong.
+
+- **Float `/` with an integer divisor generated code that did not compile.**
+  `7.0 / 2` emitted its zero-guard as `2_i64 == 0.0_f64`, which is `error[E0308]:
+  mismatched types`: an `i64` compared against an `f64` literal. The guard tested
+  the raw divisor while the division itself promoted it, so the promotion was
+  applied to one side of the expression and not the other. Both operands are now
+  promoted once and the guard tests the promoted divisor, matching what the
+  neighbouring `//` branch already did.
+
+  Found by the differential harness (`benchmarks/difftest.py`), which runs each
+  case under CPython and under a compiled native artifact and compares stdout,
+  stderr, and exit code. The case is named `04_float` and is now passing.
+
+- **`sum(range(...))` generated code that did not compile.** `sum` appended
+  `.iter()` unconditionally, but a range is already emitted as an iterator —
+  `(a..b)`, or `(a..b).step_by(n)` for a positive literal step. Rust's `Range` is
+  an `Iterator` but has no `iter()` method, so this was `error[E0599]: no method
+  named 'iter'`. Only the dynamic-step form lowers to a `Vec`, and that one still
+  needs `.iter()`. `sum` now decides from the argument's static shape, which is
+  the same decision `range` emission makes. Case `43_sum_iteration`.
+
+Both fixes were latent rather than new: they were invisible while the CI jobs
+that exercise them failed earlier, on the toolchain install, before reaching the
+test step. Confirming them against a clean baseline showed both predate the
+dynamic-typing work; neither was introduced by it.
+
 ## [1.3.0] - 2026-10-03
 
 First stable release. The release candidates accumulated a set of changes that
