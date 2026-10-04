@@ -13,7 +13,13 @@ odd = [3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0]
 repeated = [1.0, 2.0, 2.0, 3.0, 3.0, 4.0]
 singletons = [7.0]
 negative = [-4.0, -1.0, 0.0, 2.0, 5.0]
-zeros = [0.0, 4.0, 16.0]
+# geometric_mean needs strictly positive input. A zero here would make this
+# case version-dependent: CPython 3.12 raises StatisticsError for a zero, while
+# 3.13 accepts it and returns 0.0. Tarvos targets 3.12, but the differential
+# harness also runs on whatever CPython the developer has, so a case that
+# encodes one version's behaviour fails on the other. The rejection path is
+# covered by a unit test instead, where the expected version is explicit.
+positives = [1.0, 4.0, 16.0]
 uneven = [1, 2, 3, 4, 5, 6, 7]
 modes_int = [1, 2, 2, 3, 3, 4]
 
@@ -33,7 +39,7 @@ print(statistics.mean(single_int))
 print(statistics.fmean(single_int))
 
 # geometric_mean / harmonic_mean
-print(statistics.geometric_mean(zeros))
+print(statistics.geometric_mean(positives))
 print(statistics.geometric_mean(floats))
 print(statistics.harmonic_mean(floats))
 

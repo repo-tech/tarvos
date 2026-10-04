@@ -556,22 +556,27 @@ fn tarvos_statistics_fmean<T: __TarvosNum>(data: &[T]) -> __TarvosResult<f64> {
 #[inline]
 fn tarvos_statistics_geometric_mean<T: __TarvosNum>(data: &[T]) -> __TarvosResult<f64> {
     __tarvos_statistics_require(data, "geometric_mean")?;
+    // `geometric_mean` requires every value to be strictly positive. CPython
+    // 3.12 rejects a zero with `StatisticsError`; 3.13 relaxed that and lets a
+    // zero through. Tarvos targets 3.12, so the older rule is the one emitted.
+    //
+    // The zero used to short-circuit to `Ok(0.0)`, which was both the wrong
+    // version's behaviour and order-dependent: a list such as [4.0, -1.0, 0.0]
+    // returned before the negative was ever seen, so a negative slipped past a
+    // check that exists to reject it. Validating the whole slice first removes
+    // that ordering question entirely.
+    if data.iter().any(|value| value.__tarvos_f64() <= 0.0) {
+        return Err(__TarvosError::new(
+            "StatisticsError",
+            "geometric mean requires a non-empty dataset containing positive numbers",
+        ));
+    }
     // CPython reduces through logarithms rather than taking the n-th root of
     // the product. The product form is less accurate: [1.0, 4.0, 16.0] gives
     // 3.9999999999999996 by `powf` where the log form gives exactly 4.0.
     let mut total = 0.0_f64;
     for value in data {
-        let value = value.__tarvos_f64();
-        if value < 0.0 {
-            return Err(__TarvosError::new(
-                "StatisticsError",
-                "geometric mean requires a non-negative product",
-            ));
-        }
-        if value == 0.0 {
-            return Ok(0.0);
-        }
-        total += value.ln();
+        total += value.__tarvos_f64().ln();
     }
     Ok((total / data.len() as f64).exp())
 }

@@ -278,7 +278,21 @@ jobs:
           set -euo pipefail
           tarvos="target/release/tarvos"
           if [ -f "target/release/tarvos.exe" ]; then tarvos="target/release/tarvos.exe"; fi
-          "$tarvos" validate-artifact .build-tmp/standalone/hello*
+          # Not a glob. `tarvos build` writes the executable and a sibling
+          # `<artifact>.tarvos-manifest.json`, so `hello*` expanded to two paths
+          # and `validate-artifact` accepts exactly one argument. It rejected the
+          # second with "unexpected argument" and exited 2 on both platforms, so
+          # this step never got as far as checking anything about the artifact.
+          artifact=""
+          for candidate in .build-tmp/standalone/hello.exe .build-tmp/standalone/hello; do
+            if [ -f "$candidate" ]; then artifact="$candidate"; break; fi
+          done
+          if [ -z "$artifact" ]; then
+            echo "::error title=Missing artifact::no standalone executable was produced"
+            exit 1
+          fi
+          echo "validating $artifact"
+          "$tarvos" validate-artifact "$artifact"
 
       # Only the artifact crosses over. No source, no manifest, no virtualenv,
       # no interpreter: exactly what a user would email to someone else.
@@ -288,12 +302,25 @@ jobs:
           set -euo pipefail
           rm -rf .build-tmp/isolated
           mkdir -p .build-tmp/isolated
-          cp .build-tmp/standalone/hello* .build-tmp/isolated/
+          # Resolve the executable explicitly. The glob also matched the
+          # sibling `*.tarvos-manifest.json`, so `ls hello*` returned two lines
+          # and `exe` ended up holding a newline-joined pair; `./"$exe"` then
+          # failed on a path that did not exist. Only the executable is copied:
+          # what is being tested here is that the binary stands alone.
+          artifact=""
+          for candidate in .build-tmp/standalone/hello.exe .build-tmp/standalone/hello; do
+            if [ -f "$candidate" ]; then artifact="$candidate"; break; fi
+          done
+          if [ -z "$artifact" ]; then
+            echo "::error title=Missing artifact::no standalone executable was produced"
+            exit 1
+          fi
+          exe="$(basename "$artifact")"
+          cp "$artifact" .build-tmp/isolated/
           ls -l .build-tmp/isolated
           cd .build-tmp/isolated
           # Remove every environment hint that the build machine is special.
           unset PYTHONPATH VIRTUAL_ENV PYTHONHOME || true
-          exe="$(ls hello*)"
           output="$(./"$exe")"
           echo "output: $output"
           test "$output" = "sum 10"
