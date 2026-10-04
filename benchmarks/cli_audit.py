@@ -43,8 +43,13 @@ def workspace_version() -> str:
     return match.group(1)
 
 
+# The most recent `run()` result. `check` reads this so that a failing check
+# can report the process's own stderr.
+_LAST_PROC = []
+
+
 def run(args, cwd=None, timeout=600, env=None):
-    return subprocess.run(
+    proc = subprocess.run(
         [str(CLI), *args],
         cwd=cwd,
         capture_output=True,
@@ -53,6 +58,8 @@ def run(args, cwd=None, timeout=600, env=None):
         errors="replace",
         env={**os.environ, **(env or {})},
     )
+    _LAST_PROC[:] = [proc]
+    return proc
 
 
 class Audit:
@@ -61,6 +68,19 @@ class Audit:
 
     def check(self, name, ok, detail=""):
         status = "PASS" if ok else "FAIL"
+        # A bare `exit=1` says that something failed and nothing about what. The
+        # stderr of the process that just ran is the only place the reason
+        # appears, so a failure carries it. `benchmark` failed on Linux for a
+        # whole run before this, and the report could not tell a missing
+        # interpreter from a bad path from a crash inside the benchmark script.
+        if not ok and _LAST_PROC:
+            proc = _LAST_PROC[-1]
+            err = (getattr(proc, "stderr", "") or "").strip()
+            out = (getattr(proc, "stdout", "") or "").strip()
+            if err:
+                detail = f"{detail} stderr={err[-600:]!r}"
+            elif out:
+                detail = f"{detail} stdout={out[-600:]!r}"
         self.results.append({"command": name, "status": status, "detail": detail})
         line = f"[{status:4s}] tarvos {name}"
         if detail:
