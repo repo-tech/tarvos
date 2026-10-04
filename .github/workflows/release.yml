@@ -638,12 +638,36 @@ jobs:
             exit 1
           }
           find release-assets -type f -printf '%f\n' | sort
+          # The documented install one-liners are
+          #
+          #   irm  https://github.com/<repo>/releases/download/v1.3.1/install.ps1 | iex
+          #   curl -fsSL https://github.com/<repo>/releases/download/v1.3.1/install.sh | sh
+          #
+          # so `install.ps1` and `install.sh` have to exist as release assets on
+          # the engine release. They never did: both files are tracked in the
+          # distribution repository, but nothing copied them into the asset set,
+          # so the two commands answered 404 from the moment they were written.
+          # The failure is silent in the worst way -- `irm` on a 404 writes an
+          # HTML error page to stdout and `iex` reports a parse error several
+          # seconds later, which reads like a broken one-liner rather than a
+          # missing asset.
+          #
+          # Staged before the count check below, and the expected count accounts
+          # for them, so a missing script fails the release here instead of
+          # shipping a release whose own documentation does not work.
+          for script in install.ps1 install.sh; do
+            if [ ! -f "distribution/$script" ]; then
+              echo "::error title=Missing installer script::distribution/$script is not present in ${{ env.DISTRIBUTION_REPO }}"
+              exit 1
+            fi
+            cp "distribution/$script" "release-assets/$script"
+          done
           # Derived from the list above rather than written down again. The hardcoded
           # 8 was left behind when macOS was dropped from the release, so this step
           # failed on a build that produced exactly the right files. Anything extra
           # still fails: a stale file in the directory means an asset nobody
           # accounted for would be published.
-          expected_count=$(( ${#expected[@]} * 2 ))
+          expected_count=$(( ${#expected[@]} * 2 + 2 ))
           count="$(find release-assets -maxdepth 1 -type f | wc -l)"
           echo "asset count: $count (expected $expected_count)"
           if [ "$count" -ne "$expected_count" ]; then
@@ -676,6 +700,8 @@ jobs:
             release-assets/Tarvos-Setup-Windows-x86_64.exe.sha256
             release-assets/tarvos-linux-x86_64
             release-assets/tarvos-linux-x86_64.sha256
+            release-assets/install.ps1
+            release-assets/install.sh
           # Re-running replaces the same asset names instead of accumulating
           # duplicates, and a missing file is an error rather than a silent skip.
           fail_on_unmatched_files: true
