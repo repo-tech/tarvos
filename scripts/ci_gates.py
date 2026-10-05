@@ -36,6 +36,11 @@ GATES: list[tuple[str, list[str], bool]] = [
     # The installer ships to users verbatim, and its last bug (`--tl1v1.2`
     # instead of `--tlsv1.2`) reached release before any test looked at it.
     ("installer", [sys.executable, "scripts/test_installer.py"], False),
+    # The benchmark harness builds a sanitized PATH, and the Linux CLI audit
+    # failed with `linker 'cc' not found` because that sanitization removed the
+    # system binary directories. The gate belongs here so the PATH the harness
+    # constructs is checked on every run, not only when a benchmark is run.
+    ("benchmark_path", [sys.executable, "scripts/test_benchmark_path.py"], False),
     ("compatibility", [sys.executable, "scripts/compatibility_matrix.py", "--check"], False),
 ]
 

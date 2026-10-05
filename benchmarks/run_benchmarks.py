@@ -53,6 +53,18 @@ def safe_tool_roots():
                 roots.append(Path(configured).expanduser())
     if os.name != "nt":
         roots.append(Path("/usr/local/cargo/bin"))
+        # The system tool directories, for the C toolchain rather than for Rust.
+        #
+        # rustc does not link by itself: it shells out to `cc` (or `gcc`), which
+        # lives in /usr/bin or /bin. Those directories are absent from the roots
+        # above, and `sanitize_environment` keeps only PATH entries that sit
+        # inside one of these roots, so stripping them took the linker off PATH
+        # and the Linux audit failed with `linker 'cc' not found` even though a
+        # working compiler was installed. On Windows the equivalent tool is
+        # link.exe from the MSVC Build Tools, which rustc locates through the
+        # registry rather than PATH, which is why only Linux tripped over this.
+        for system_dir in ("/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin", "/sbin"):
+            roots.append(Path(system_dir))
     deduped = []
     for root in roots:
         if root not in deduped:

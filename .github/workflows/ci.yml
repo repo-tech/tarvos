@@ -147,6 +147,15 @@ jobs:
       - name: Check the shipped shell scripts
         run: python scripts/test_installer.py
 
+      - name: Check the benchmark harness PATH
+        # The harness keeps only PATH entries inside its safe roots, and those
+        # roots did not include the system binary directories. On Linux that
+        # removed `cc` from PATH and every native benchmark build failed with
+        # `linker 'cc' not found`, so the audit failed on Linux and passed on
+        # Windows, where rustc finds link.exe through the registry instead of
+        # through PATH.
+        run: python scripts/test_benchmark_path.py
+
       # The acceptance question is "does Tarvos build with no Rust on PATH", and
       # only a real Linux runner can answer it. It downloads and installs the
       # managed toolchain, so it is kept out of `quality` and given its own job
