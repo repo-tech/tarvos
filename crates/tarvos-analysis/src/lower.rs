@@ -107,10 +107,30 @@ impl Lowerer {
                             .unwrap_or_else(|| inferred[index].clone())
                     })
                     .collect();
+                // The placeholder must be `Unknown`, not `None`.
+                //
+                // This pre-pass exists so a function's signature is visible before
+                // any body is lowered, which is what makes forward references and
+                // mutual recursion work at all. For a self-recursive function the
+                // placeholder is therefore exactly the value that the function's
+                // own body reads back, and it is read *before* the real inference
+                // at `infer_return_type_from_body` has run.
+                //
+                // `None` was wrong twice over. It asserts the function returns
+                // `None`, which is a claim the compiler has not earned, and it
+                // survives `merge_return_types` as a concrete type, so `fact(n)`
+                // came back `None` and the caller's `n * fact(n - 1)` was rejected
+                // as `int * None`. `Unknown` is the honest "not determined yet", it
+                // makes that expression `int * Unknown`, and `merge_return_types`
+                // then folds `Unknown` into `Int` from the base case, which is the
+                // answer the program actually has.
+                //
+                // The real inferred type overwrites this entry when the body is
+                // lowered, so the placeholder only ever affects recursion.
                 let return_type = returns
                     .as_ref()
                     .and_then(|s| self.parse_type_annotation(s))
-                    .unwrap_or(Type::None);
+                    .unwrap_or(tarvos_types::Type::Unknown);
                 self.function_signatures
                     .insert(name.clone(), (param_names, param_types, return_type));
             }
@@ -2217,14 +2237,49 @@ impl Lowerer {
 
     fn merge_return_types(left: &Type, right: &Type) -> Type {
         if left == right {
-            left.clone()
-        } else if matches!(left, Type::Unknown) {
-            right.clone()
-        } else if matches!(right, Type::Unknown) {
-            left.clone()
-        } else {
-            Type::Unknown
+            return left.clone();
         }
+        if matches!(left, Type::Unknown) {
+            return right.clone();
+        }
+        if matches!(right, Type::Unknown) {
+            return left.clone();
+        }
+        // `return 1` on one path and falling off the end on the other is `int`
+        // in Python, because the implicit return is `None` and `int` absorbs it
+        // for every consumer that matters: printing it, comparing it, and
+        // passing it to a numeric builtin all behave as they would for the
+        // `None`-free path.
+        //
+        // Merging to `Unknown` here instead is what made every recursive
+        // function fail to compile. `fact` returns `1` in its base case and calls
+        // itself in the other; the recursive call's return type was read before
+        // `fact`'s signature existed, so it came back `None`, the two paths
+        // merged to `Unknown`, and the multiplication at the call site became
+        // `int * None` and was rejected. `None` is a marker for "no value", so
+        // absorbing it into the other branch is the correct union, not a
+        // convenience.
+        if matches!(left, Type::None) {
+            return right.clone();
+        }
+        if matches!(right, Type::None) {
+            return left.clone();
+        }
+        // A numeric union collapses to the wider member, which is what CPython
+        // arithmetic produces anyway: `1 / 2` on one path and `3` on the other
+        // yields a `float` at runtime, not an error.
+        let numeric = |t: &Type| matches!(t, Type::Int | Type::Float | Type::Bool);
+        if numeric(left) && numeric(right) {
+            return if matches!(left, Type::Float) || matches!(right, Type::Float) {
+                Type::Float
+            } else {
+                Type::Int
+            };
+        }
+        // Two incompatible types cannot be represented by any single fixed Rust
+        // type. `Dynamic` is the honest answer: it is the tagged runtime value,
+        // which is exactly what the union requires.
+        Type::Dynamic
     }
 
     fn parse_type_annotation(&self, annotation: &str) -> Option<Type> {

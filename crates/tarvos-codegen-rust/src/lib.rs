@@ -941,8 +941,22 @@ impl std::fmt::Display for __TarvosStat {
     }
 }
 
-impl __TarvosDisplay for __TarvosStat {
-    fn __tarvos_display(&self) -> String {
+/// Inherent, not a `__TarvosDisplay` impl.
+///
+/// A statistics result is printed through the same `.__tarvos_display()` call as
+/// every other value, but the demand-driven emitter only declares the
+/// `__TarvosDisplay` trait when a value of a *known* type reaches `print`, and a
+/// statistics result is typed by the caller rather than by the runtime block. So
+/// the impl was written against a trait that this block could not guarantee was
+/// declared, and the generated Rust failed with E0405, `cannot find trait
+/// __TarvosDisplay in this scope`.
+///
+/// An inherent method resolves under exactly the same `.__tarvos_display()`
+/// syntax and does not require the trait to exist. Declaring the trait here
+/// instead would collide with the emitter's own declaration whenever both were
+/// present, which is a different error for the same program.
+impl __TarvosStat {
+    pub fn __tarvos_display(&self) -> String {
         match *self {
             __TarvosStat::Int(value) => value.to_string(),
             __TarvosStat::Float(value) => format!("{:?}", value),
@@ -1334,6 +1348,21 @@ thread_local! {
     /// safety. It is replaced wholesale at the start of each `generate`.
     static DYNAMIC_NAMES: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
+
+    /// Type of each module-level binding, keyed by name.
+    ///
+    /// A comprehension has to know whether its iterable is a list before it can
+    /// choose between borrowing it and consuming it, and that distinction is not
+    /// recoverable from the IR node alone: `Value::Name` names a `Vec` or an
+    /// `i64` equally well. The types are known at the module level, where the
+    /// `Let` statements and function signatures live, so they are recorded once
+    /// per program rather than threaded through every emit call.
+    ///
+    /// This follows the same reasoning as `DYNAMIC_NAMES` above: emission is
+    /// single-threaded and depth-first, and the map is identical for every
+    /// statement in one program.
+    static VALUE_TYPES: std::cell::RefCell<HashMap<String, Type>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
 impl RustCodegen {
@@ -1436,6 +1465,9 @@ impl RustCodegen {
         // other.
         DYNAMIC_NAMES.with(|names| {
             *names.borrow_mut() = RustCodegen::dynamic_names(module);
+        });
+        VALUE_TYPES.with(|types| {
+            *types.borrow_mut() = RustCodegen::module_value_types(module);
         });
         if module.statements.iter().any(Self::statement_uses_hash_map) {
             out.push_str("use std::collections::HashMap;\n\n");
@@ -3208,6 +3240,14 @@ impl RustCodegen {
                 Self::require_display(index, needs, names);
             }
             Value::FormatString { parts } => {
+                // The parts are not the only thing that needs an impl: the
+                // format expression itself evaluates to a `String`, and it is
+                // that `String` which reaches `print`'s `__tarvos_display`
+                // call. Requesting display only for the embedded parts left
+                // `impl __TarvosDisplay for String` unemitted, so
+                // `print(f"...")` generated Rust that failed with E0599, no
+                // method named `__tarvos_display` found for `&String`.
+                Self::require_type_display(&Type::String, needs);
                 for part in parts {
                     if let FormatPart::Value { value, .. } = part {
                         Self::require_display(value, needs, names);
@@ -3315,6 +3355,31 @@ impl RustCodegen {
             ),
             None => panicking.to_string(),
         }
+    }
+
+    /// Type of every module-level binding, for the cases where the IR node alone
+    /// cannot say what a name holds.
+    fn module_value_types(module: &Module) -> HashMap<String, Type> {
+        let mut types = HashMap::new();
+        for stmt in &module.statements {
+            match stmt {
+                Stmt::Let { name, ty, .. } => {
+                    types.insert(name.clone(), ty.clone());
+                }
+                Stmt::Function {
+                    name, return_type, ..
+                } => {
+                    types.insert(name.clone(), return_type.clone());
+                }
+                _ => {}
+            }
+        }
+        types
+    }
+
+    /// The recorded type of a name, or `None` when it was never bound.
+    fn name_type(name: &str) -> Option<Type> {
+        VALUE_TYPES.with(|types| types.borrow().get(name).cloned())
     }
 
     fn emit_value(value: &Value, ctx: &EmitCtx) -> Result<String> {
@@ -3973,13 +4038,46 @@ impl RustCodegen {
                     Value::Dict { .. } => format!("{iter_str}.keys().cloned()"),
                     _ => iter_str,
                 };
+                // Iterating a Python list does not consume it. Two comprehensions
+                // over the same list are two independent loops over one value, so
+                // the iterable is borrowed and each element copied out rather than
+                // moved.
+                //
+                // `into_iter()` moved the `Vec`, so the second comprehension
+                // generated `values.into_iter()` on a moved value and rustc
+                // rejected the program with E0382, `use of moved value: values`.
+                // That is a compile failure for a program CPython runs, so it is
+                // not an acceptable difference between the two.
+                //
+                // Only a list needs this. `String` and `dict` already produced an
+                // iterator expression above, and a `range` is not a container at
+                // all, so those keep `into_iter()` unchanged.
+                let (sequence, borrow) = match iter.as_ref() {
+                    Value::List { .. } | Value::ListComp { .. } => {
+                        (format!("({sequence}).iter().cloned()"), true)
+                    }
+                    Value::Name(name) => match Self::name_type(name) {
+                        Some(Type::Array(_)) => {
+                            (format!("({sequence}).iter().cloned()"), true)
+                        }
+                        _ => (sequence, false),
+                    },
+                    _ => (sequence, false),
+                };
+                // `borrowed` iterables are already iterators, so `.into_iter()`
+                // would be a redundant adapter on them.
+                let iterable = if borrow {
+                    sequence
+                } else {
+                    format!("{sequence}.into_iter()")
+                };
                 let mapped = if let Some(condition) = condition {
                     let condition_str = Self::emit_value(condition, ctx)?;
                     format!(
-                        "{sequence}.into_iter().filter_map(|{target}| if {condition_str} {{ Some({element_str}) }} else {{ None }})"
+                        "{iterable}.filter_map(|{target}| if {condition_str} {{ Some({element_str}) }} else {{ None }})"
                     )
                 } else {
-                    format!("{sequence}.into_iter().map(|{target}| {element_str})")
+                    format!("{iterable}.map(|{target}| {element_str})")
                 };
                 format!("{mapped}.collect::<Vec<_>>()")
             }
@@ -4550,6 +4648,23 @@ impl RustCodegen {
         match ty {
             Type::Unknown => Err(anyhow::anyhow!(
                 "dynamic type in native {context} is not supported; use --python-fallback"
+            )),
+            // `Dynamic` is a real, deliberate union: `merge_return_types` produces
+            // it when a function returns different types on different paths. The
+            // tagged runtime is what can represent such a value, but a *function
+            // signature* is not covered by that runtime yet: the body still emits
+            // its returns as the concrete types it found (`10_i64`,
+            // `"hello".to_string()`), so a `-> __TarvosValue` signature produces
+            // Rust that does not compile, with the runtime type not even emitted.
+            //
+            // Letting it through turns an honest diagnostic into invalid Rust,
+            // which is strictly worse: the program is rejected either way, but now
+            // the rejection is a confusing type error instead of a nameable
+            // limitation. Rejecting here keeps the boundary where it was until
+            // boxing returns into `__TarvosValue` is actually implemented.
+            Type::Dynamic => Err(anyhow::anyhow!(
+                "a function whose {context} is a union of different types is not \
+                 supported natively yet; use --python-fallback"
             )),
             Type::Array(inner) => Self::validate_native_type(inner, context),
             Type::Tuple(types) => {
