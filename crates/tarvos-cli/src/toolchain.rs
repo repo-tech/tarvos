@@ -219,36 +219,102 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 }
 
 fn proves_compilation(rustc: &Path) -> bool {
-    if probe_stamp_fresh(rustc) {
-        return true;
-    }
+    probe_stamp_fresh(rustc) || probe_compile(rustc).is_ok()
+}
+
+/// Run the probe for real and explain a failure.
+///
+/// `proves_compilation` answers a yes/no question, which is all `doctor` needs,
+/// but the installer has to tell a user *why* the compiler was rejected. A
+/// scratch program that compiles and links can still fail for reasons that have
+/// nothing to do with Tarvos: on Windows the `*-msvc` target needs `link.exe`
+/// from the Microsoft C Build Tools, which a clean Windows 11 machine does not
+/// have. Reporting only "refusing a partial install" in that case sends people
+/// looking for a Tarvos bug that is not there, so the probe keeps the compiler's
+/// own diagnostics and they are surfaced verbatim.
+fn probe_compile(rustc: &Path) -> std::result::Result<(), String> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("tarvos-tc-probe-{stamp}"));
     if std::fs::create_dir_all(&dir).is_err() {
-        return false;
+        return Err(format!(
+            "could not create the probe scratch directory {}",
+            dir.display()
+        ));
     }
     let source = dir.join("probe.rs");
     if std::fs::write(&source, "fn main() {}\n").is_err() {
         let _ = std::fs::remove_dir_all(&dir);
-        return false;
+        return Err(format!(
+            "could not write the probe program {}",
+            source.display()
+        ));
     }
     let binary = dir.join(exe("probe"));
-    let ok = Command::new(rustc)
+    let outcome = Command::new(rustc)
         .arg("--edition=2021")
         .arg("-o")
         .arg(&binary)
         .arg(&source)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .output();
     let _ = std::fs::remove_dir_all(&dir);
-    if ok {
+    let output = match outcome {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(format!("could not run {}: {error}", rustc.display()));
+        }
+    };
+    if output.status.success() {
         record_probe_stamp(rustc);
+        return Ok(());
     }
-    ok
+    Err(describe_probe_failure(rustc, &output))
+}
+
+/// Turn a failed probe into a message that names the actual cause.
+///
+/// The compiler's own stderr is the only authoritative source, so it is passed
+/// through rather than reinterpreted. Two cases get an extra hint because they
+/// account for nearly every probe failure on a fresh machine and neither is a
+/// Tarvos defect: a missing MSVC linker, and a probe that cannot start at all.
+fn describe_probe_failure(rustc: &Path, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut detail = String::new();
+    for stream in [&stderr, &stdout] {
+        let text = stream.trim();
+        if !text.is_empty() {
+            if !detail.is_empty() {
+                detail.push('\n');
+            }
+            detail.push_str(text);
+        }
+    }
+    if detail.is_empty() {
+        detail = format!("rustc exited with {}", output.status);
+    }
+    // `link.exe` is the MSVC linker. Its absence is the expected outcome on a
+    // clean Windows install, and it is worth naming because the download and
+    // checksum steps both succeeded, which makes "partial install" look like the
+    // wrong verdict.
+    let mentions_linker =
+        detail.contains("link.exe") || detail.contains("linker") || detail.contains("linking with");
+    let mut message = format!(
+        "{} cannot compile a probe program; refusing a partial install.\nCompiler said:\n{detail}",
+        rustc.display()
+    );
+    if mentions_linker {
+        message.push_str(
+            "\n\nThe compiler downloaded correctly; it is the Microsoft C Build Tools linker \
+             (link.exe) that is missing.\nThe x86_64-pc-windows-msvc target cannot produce a \
+             .exe without it.\nInstall the \"Desktop development with C++\" workload from the \
+             Microsoft C++ Build Tools (https://visualstudio.microsoft.com/visual-cpp-build-tools/), \
+             reopen the terminal, and run `tarvos toolchain --install` again.",
+        );
+    }
+    message
 }
 
 /// Resolve one toolchain. `prefer_system` is only true when the caller passed
@@ -531,18 +597,41 @@ fn verify_managed() -> Result<()> {
             detail: "rustc -vV reported no host triple".to_string(),
         }),
     }
-    if proves_compilation(&rustc) {
-        checks.push(Check {
+    match probe_stamp_fresh(&rustc) {
+        true => checks.push(Check {
             name: "probe compilation",
             state: CheckState::Ok,
             detail: "compiled and linked a scratch program".to_string(),
-        });
-    } else {
-        checks.push(Check {
-            name: "probe compilation",
-            state: CheckState::Error,
-            detail: "rustc exists but could not compile a scratch program".to_string(),
-        });
+        }),
+        false => match probe_compile(&rustc) {
+            Ok(()) => checks.push(Check {
+                name: "probe compilation",
+                state: CheckState::Ok,
+                detail: "compiled and linked a scratch program".to_string(),
+            }),
+            Err(reason) => {
+                let first_line = reason.lines().next().unwrap_or(&reason).to_string();
+                checks.push(Check {
+                    name: "probe compilation",
+                    state: CheckState::Error,
+                    detail: first_line,
+                });
+                // A single line says what failed; the compiler's own words say why.
+                // A doctor report that stops at the first line leaves the user
+                // with no way to tell a broken compiler from a missing linker.
+                for line in reason.lines().skip(1) {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    checks.push(Check {
+                        name: "probe detail",
+                        state: CheckState::Error,
+                        detail: line.to_string(),
+                    });
+                }
+            }
+        },
     }
     let failed = checks.iter().any(|c| c.state == CheckState::Error);
     report_checks(checks, failed)
@@ -691,10 +780,8 @@ fn install_managed() -> Result<()> {
             "installed rustc reports {version}, expected {PINNED_CHANNEL}; refusing a partial install"
         ));
     }
-    if !proves_compilation(&rustc) {
-        return Err(anyhow::anyhow!(
-            "installed rustc cannot compile a probe program; refusing a partial install"
-        ));
+    if let Err(reason) = probe_compile(&rustc) {
+        return Err(anyhow::anyhow!(reason));
     }
     // Every check that could reject the install has now passed, so pruning is
     // safe: if it fails, the staging tree is discarded with the rest and the
@@ -1503,6 +1590,86 @@ mod tests {
     fn a_bogus_managed_root_is_not_confused_with_a_toolchain() {
         let missing = PathBuf::from("definitely-not-a-home-dir");
         assert!(!managed_bin(&missing).join(exe("rustc")).exists());
+    }
+
+    /// The probe failure text has to carry the compiler's own diagnosis.
+    ///
+    /// The reported symptom on a fresh Windows 11 machine was `installed rustc
+    /// cannot compile a probe program; refusing a partial install` and nothing
+    /// else, which reads like a corrupt download. The download and checksum
+    /// steps had in fact both passed; the missing piece was the MSVC linker. A
+    /// message that keeps the compiler's stderr and names `link.exe` turns an
+    /// unactionable error into a fixable one.
+    #[test]
+    fn a_missing_linker_is_named_and_the_compiler_output_is_kept() {
+        let message = describe_probe_failure(
+            Path::new(r"C:\tarvos\toolchain\bin\rustc.exe"),
+            &failed_probe(b"error: linking with `link.exe` failed: linker `link.exe` not found"),
+        );
+        assert!(
+            message.contains("link.exe"),
+            "the missing linker must be named: {message}"
+        );
+        assert!(
+            message.contains("Build Tools"),
+            "the message must say where to get the linker: {message}"
+        );
+        assert!(
+            message.contains("linker `link.exe` not found"),
+            "the compiler's own diagnostic must survive: {message}"
+        );
+    }
+
+    /// A probe failure the linker hint does not explain must not invent one.
+    ///
+    /// Appending the MSVC advice to, say, a sysroot error from a broken compiler
+    /// would send the user installing Visual Studio for a compiler that is
+    /// actually corrupt.
+    #[test]
+    fn an_unrelated_probe_failure_gets_no_linker_advice() {
+        let message = describe_probe_failure(
+            Path::new("rustc"),
+            &failed_probe(b"error: failed to parse the sysroot"),
+        );
+        assert!(message.contains("failed to parse the sysroot"), "{message}");
+        assert!(
+            !message.contains("Build Tools"),
+            "no linker advice for a non-linker failure: {message}"
+        );
+    }
+
+    /// A compiler that fails silently still produces a usable report.
+    ///
+    /// Empty stdout and stderr are possible for a compiler the OS killed, and an
+    /// empty detail string would otherwise render as a bare refusal carrying no
+    /// diagnostic at all.
+    #[test]
+    fn a_silent_probe_failure_still_reports_the_exit_status() {
+        let message = describe_probe_failure(Path::new("rustc"), &failed_probe(b""));
+        assert!(message.contains("rustc"), "{message}");
+        assert!(
+            message.trim().lines().count() > 1,
+            "the report must say more than the refusal: {message}"
+        );
+    }
+
+    /// A failed `Output` carrying `stderr`, built without spawning a process.
+    fn failed_probe(stderr: &[u8]) -> std::process::Output {
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(1)
+        };
+        #[cfg(not(windows))]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(1 << 8)
+        };
+        std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr: stderr.to_vec(),
+        }
     }
 
     /// FIPS 180-4 test vector: a digest implementation that gets "abc" wrong

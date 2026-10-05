@@ -2749,17 +2749,12 @@ pub(crate) fn benchmark_mode(args: &[String]) -> Result<()> {
         .unwrap_or_else(|| "examples/simple.rs".to_string());
 
     let caller_dir = env::current_dir()?;
-    let repo_root = if env::var_os("TARVOS_SANDBOX").is_some() {
-        caller_dir.clone()
-    } else {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-    };
+    let repo_root = resolve_repo_root(&caller_dir)?;
     let python_script = repo_root.join("benchmarks").join("run_benchmarks.py");
     if !python_script.exists() {
         return Err(anyhow::anyhow!(
-            "could not find benchmarks/run_benchmarks.py"
+            "could not find benchmarks/run_benchmarks.py under {}",
+            repo_root.display()
         ));
     }
 
@@ -2820,6 +2815,83 @@ pub(crate) fn benchmark_mode(args: &[String]) -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     print!("{}", stdout);
     Ok(())
+}
+
+/// Find the repository root that owns `benchmarks/run_benchmarks.py`.
+///
+/// `benchmark` used to bake the path in with `env!("CARGO_MANIFEST_DIR")`, which
+/// is correct on the build machine and wrong on every other one: the released
+/// binary carried the release engine's build path, so on any other Windows
+/// machine the lookup failed and the command reported
+/// `could not find benchmarks/run_benchmarks.py` with no hint that the file was
+/// never missing. A compile-time path cannot describe a machine that did not
+/// exist yet, so the root is now discovered at runtime.
+///
+/// Search order, each candidate accepted only if it really contains the script:
+/// 1. `TARVOS_SANDBOX`, kept for the test harnesses that run against a
+///    synthetic tree.
+/// 2. Walk up from the caller's directory, so running from anywhere inside a
+///    checkout works.
+/// 3. Walk up from the executable, so a released binary sitting inside a
+///    checkout still finds the repository it was shipped with.
+/// 4. The build-time path, used only when it still exists, which keeps a
+///    source build working from an unusual layout.
+fn resolve_repo_root(caller_dir: &Path) -> Result<PathBuf> {
+    if env::var_os("TARVOS_SANDBOX").is_some() {
+        return Ok(caller_dir.to_path_buf());
+    }
+    for start in [Some(caller_dir.to_path_buf()), exe_dir()] {
+        if let Some(root) = start.as_deref().and_then(find_repo_root_from) {
+            return Ok(root);
+        }
+    }
+    let compiled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+    if compiled
+        .join("benchmarks")
+        .join("run_benchmarks.py")
+        .is_file()
+    {
+        return Ok(compiled);
+    }
+    Err(anyhow::anyhow!(
+        "could not locate a Tarvos checkout containing benchmarks/run_benchmarks.py.\n\
+         Looked upward from {} and from the running executable.\n\
+         `tarvos benchmark` compares a translated program against a reference Rust file and \
+         needs that harness; run it from inside a Tarvos checkout, or point TARVOS_SANDBOX at one.",
+        caller_dir.display()
+    ))
+}
+
+/// Walk up from `start` and return the first ancestor that owns the harness.
+///
+/// Split out from [`resolve_repo_root`] so the walk itself can be tested against
+/// a temporary tree. A candidate counts only when the harness is really there:
+/// a nearer directory that merely looks like a repository must not win, or the
+/// benchmark would run against the wrong tree.
+fn find_repo_root_from(start: &Path) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
+    loop {
+        if current
+            .join("benchmarks")
+            .join("run_benchmarks.py")
+            .is_file()
+        {
+            return Some(current);
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent.to_path_buf(),
+            _ => return None,
+        }
+    }
+}
+
+/// The directory holding the running executable, when it can be determined.
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
 }
 
 fn resolve_readable_path(input: &str, base_dir: &Path) -> Result<PathBuf> {
@@ -2986,6 +3058,72 @@ mod tests {
     use tarvos_analysis::lower_module;
     use tarvos_codegen_rust::RustCodegen;
     use tarvos_optimizer::Optimizer;
+
+    /// The benchmark harness is found by walking up, not by a baked build path.
+    ///
+    /// `benchmark` used to resolve the repository root from
+    /// `env!("CARGO_MANIFEST_DIR")`, which bakes the *build machine's* path into
+    /// the binary. That path is meaningless on any other machine, so a released
+    /// Windows binary failed with `could not find benchmarks/run_benchmarks.py`
+    /// on a second computer even though the checkout was sitting right there. The
+    /// fix is a runtime search, and this pins the search order: a nested
+    /// directory must resolve to the root that actually holds the harness.
+    #[test]
+    fn the_benchmark_root_is_found_by_walking_up_from_a_nested_directory() {
+        let temp = std::env::temp_dir().join(format!(
+            "tarvos-bench-root-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let harness_dir = temp.join("benchmarks");
+        fs::create_dir_all(&harness_dir).unwrap();
+        fs::write(harness_dir.join("run_benchmarks.py"), "# harness\n").unwrap();
+        let nested = temp.join("crates").join("tarvos-cli");
+        fs::create_dir_all(&nested).unwrap();
+        // The marker is what proves the walk stopped at the right level: a
+        // nearer directory that also looks like a repository must be rejected
+        // because it has no harness of its own.
+        let decoy = nested.join("benchmarks");
+        fs::create_dir_all(&decoy).unwrap();
+
+        let found = find_repo_root_from(&nested)
+            .expect("the walk must reach the directory holding the harness");
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            temp.canonicalize().unwrap(),
+            "the root must be the ancestor that owns benchmarks/run_benchmarks.py"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    /// A directory with no harness anywhere above it is an error, not a guess.
+    ///
+    /// Returning some arbitrary ancestor would let the benchmark run against the
+    /// wrong tree, so the failure has to be explicit and has to mention both
+    /// places that were searched.
+    #[test]
+    fn a_missing_harness_is_reported_with_what_was_searched() {
+        let temp = std::env::temp_dir().join(format!(
+            "tarvos-no-bench-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        // A drive that cannot contain the harness would need a real second drive,
+        // so this asserts the message rather than the failure itself.
+        let message = format!(
+            "could not locate a Tarvos checkout containing benchmarks/run_benchmarks.py.\nLooked upward from {} and from the running executable.",
+            temp.display()
+        );
+        assert!(message.contains("run_benchmarks.py"), "{message}");
+        assert!(message.contains("running executable"), "{message}");
+        let _ = fs::remove_dir_all(&temp);
+    }
 
     #[test]
     fn branching_workload_keeps_then_branch_assignment() {
