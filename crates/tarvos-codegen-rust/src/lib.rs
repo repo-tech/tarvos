@@ -4012,6 +4012,19 @@ impl RustCodegen {
                     .map(|v| Self::emit_value(v, ctx))
                     .collect::<Result<Vec<_>>>()?
                     .join(", ");
+                // A Python list may hold values of different types, but `vec![..]` cannot.
+                // `[10, "Tarvos Wins", True, 4.5]` emitted
+                // `vec![10_i64, "Tarvos Wins".to_string(), true, 4.5_f64]` and
+                // rustc rejected it with E0308, expected `i64`, found `String`.
+                //
+                // Refusing here rather than emitting the `Vec` anyway matters:
+                // the program is not going to compile either way, but a diagnostic
+                // naming the feature is actionable and a type error inside a
+                // `vec![]` literal is not. Representing it properly needs each
+                // element boxed into the tagged value, which is a larger change
+                // than this guard, and until that exists an honest refusal keeps
+                // the boundary honest instead of hiding it behind invalid Rust.
+                Self::validate_list_elements(elements, &elements_str)?;
                 format!("vec![{}]", elements_str)
             }
             Value::ListComp {
@@ -4057,9 +4070,7 @@ impl RustCodegen {
                         (format!("({sequence}).iter().cloned()"), true)
                     }
                     Value::Name(name) => match Self::name_type(name) {
-                        Some(Type::Array(_)) => {
-                            (format!("({sequence}).iter().cloned()"), true)
-                        }
+                        Some(Type::Array(_)) => (format!("({sequence}).iter().cloned()"), true),
                         _ => (sequence, false),
                     },
                     _ => (sequence, false),
@@ -4640,6 +4651,31 @@ impl RustCodegen {
                 Self::validate_native_type(return_type, &format!("return type of `{name}`"))?;
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Reject a list literal whose elements do not share one Rust type.
+    ///
+    /// The element types are read back off the IR nodes rather than trusted from the
+    /// list's own `element_type`, because that field records the type the analysis
+    /// settled on and it is the disagreement between it and the actual elements
+    /// that produces the invalid `vec![..]`.
+    fn validate_list_elements(elements: &[Value], rendered: &str) -> Result<()> {
+        let mut distinct: Vec<String> = Vec::new();
+        for element in elements {
+            let ty = Self::value_type(element, &HashMap::new()).to_string();
+            if !distinct.contains(&ty) {
+                distinct.push(ty);
+            }
+        }
+        if distinct.len() > 1 {
+            return Err(anyhow::anyhow!(
+                "a native list must hold one type, but this list mixes {}. \
+             Heterogeneous lists are not supported natively yet; use --python-fallback.\n\
+             It was emitted as: vec![{rendered}]",
+                distinct.join(" and ")
+            ));
         }
         Ok(())
     }
