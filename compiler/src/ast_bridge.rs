@@ -220,6 +220,12 @@ pub enum CompareOperator {
     LtEq,
     Gt,
     GtEq,
+    /// `x in container`, carried as its own operator because the operands are
+    /// in the opposite order from an equality test and the right side is a
+    /// container rather than a comparable value.
+    In,
+    /// `x not in container`.
+    NotIn,
 }
 
 /// Ruff's current module parser exposes a suite through `parse_module(...).suite()`.
@@ -336,6 +342,12 @@ impl AstBridge {
             pyast::CmpOp::LtE => CompareOperator::LtEq,
             pyast::CmpOp::Gt => CompareOperator::Gt,
             pyast::CmpOp::GtE => CompareOperator::GtEq,
+            // Membership, and its negation, are ordinary comparisons to CPython
+            // and to any caller of this bridge. They were rejected here only
+            // because the shared IR had no operator to lower them to; with
+            // `BinaryOp::In` in place they are just comparisons.
+            pyast::CmpOp::In => CompareOperator::In,
+            pyast::CmpOp::NotIn => CompareOperator::NotIn,
             _ => return None,
         })
     }

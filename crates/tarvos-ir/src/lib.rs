@@ -233,6 +233,15 @@ pub enum BinaryOp {
     LShift,
     RShift,
     FloorDiv,
+    /// Python's `x in container`, lowered to a membership test.
+    ///
+    /// Membership is not an arithmetic operator and has no numeric result, so it
+    /// is a distinct variant rather than a reuse of `Eq`: the operand order is
+    /// reversed (`7 in values`, not `values == 7`) and the right side is a
+    /// container, not a value of the same type.
+    In,
+    /// Python's `x not in container`, the negation of [`BinaryOp::In`].
+    NotIn,
 }
 
 impl BinaryOp {
@@ -258,6 +267,10 @@ impl BinaryOp {
             BinaryOp::LShift => "<<",
             BinaryOp::RShift => ">>",
             BinaryOp::FloorDiv => "//",
+            // Membership prints as the word Python spells it with, which keeps
+            // generated Rust readable when it is inspected.
+            BinaryOp::In => "in",
+            BinaryOp::NotIn => "not in",
         }
     }
 }

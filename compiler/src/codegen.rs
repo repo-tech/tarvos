@@ -361,6 +361,8 @@ impl Emitter {
                     CompareOperator::LtEq => "le",
                     CompareOperator::Gt => "gt",
                     CompareOperator::GtEq => "ge",
+                    CompareOperator::In => "in",
+                    CompareOperator::NotIn => "not in",
                 };
                 Ok(format!(
                     "({}).{}({})",

@@ -1756,6 +1756,11 @@ impl Lowerer {
             "le" | "<=" => BinaryOp::LtEq,
             "gt" | ">" => BinaryOp::Gt,
             "ge" | ">=" => BinaryOp::GtEq,
+            // `in` keeps Python's operand order: the value is on the left and the
+            // container on the right, so it is not reversed here the way an
+            // equality test would be.
+            "in" => BinaryOp::In,
+            "not in" => BinaryOp::NotIn,
             _ => bail!("unsupported comparison operator: {}", op),
         })
     }
@@ -1814,6 +1819,14 @@ impl Lowerer {
                 | BinaryOp::RShift,
             ) => Ok(Type::Int),
             (Type::Int, Type::Int, BinaryOp::FloorDiv) => Ok(Type::Int),
+            // Membership always produces a bool and never fails on the operand types,
+            // so it is answered before the per-type table. `7 in values` has an `int`
+            // on the left and a list on the right, and no row in the table pairs
+            // those, so without this the expression would be rejected even though
+            // both types are perfectly ordinary. The third tuple slot is the
+            // operator, so the pattern has to be written per operand position.
+            (_, _, BinaryOp::In) => Ok(Type::Bool),
+            (_, _, BinaryOp::NotIn) => Ok(Type::Bool),
             (Type::Int, Type::Int, BinaryOp::Eq) => Ok(Type::Bool),
             (Type::Int, Type::Int, BinaryOp::NotEq) => Ok(Type::Bool),
             (Type::Int, Type::Int, BinaryOp::Lt) => Ok(Type::Bool),

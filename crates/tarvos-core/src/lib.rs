@@ -1036,6 +1036,12 @@ fn convert_ruff_expr(expression: ruff::Expr) -> tarvos_ast::Expr {
                 ruff::CompareOperator::LtEq => "le",
                 ruff::CompareOperator::Gt => "gt",
                 ruff::CompareOperator::GtEq => "ge",
+                // `in` and `not in` reach the shared AST as operator strings, so
+                // the lowering stage can lower them to `BinaryOp::In` and
+                // `BinaryOp::NotIn`. They were dropped here before, which is why
+                // `7 in values` fell back to the compatibility runtime.
+                ruff::CompareOperator::In => "in",
+                ruff::CompareOperator::NotIn => "not in",
             }
             .to_string()],
             comparators: vec![convert_ruff_expr(*right)],

@@ -2144,7 +2144,24 @@ impl RustCodegen {
                 value,
             } => {
                 let value_str = Self::emit_value(value, ctx)?;
-                if indices.len() == 1 && matches!(indices[0], Value::String(_)) {
+                // A dict stores by key, a sequence stores by position, and the
+                // two need different Rust. `counts["a"] = 1` and
+                // `counts[v] = counts[v] + 1` both land here, and treating the
+                // second as a positional write emitted `counts[__tarvos_index_0]`
+                // on a `HashMap`, which rustc rejected with E0308: a map is
+                // indexed by `&_` and never by `usize`.
+                //
+                // The target's type decides. A map always uses `insert` whatever
+                // the key's shape; a sequence keeps the bound-checked positional
+                // write below, which is also what computes the `IndexError`.
+                let target_is_dict = matches!(Self::name_type(target), Some(Type::Dict { .. }));
+                if target_is_dict && indices.len() == 1 {
+                    let index_str = Self::emit_value(&indices[0], ctx)?;
+                    out.push_str(&format!(
+                        "{}{}.insert({}, {});\n",
+                        ind, target, index_str, value_str
+                    ));
+                } else if indices.len() == 1 && matches!(indices[0], Value::String(_)) {
                     let index_str = Self::emit_value(&indices[0], ctx)?;
                     out.push_str(&format!(
                         "{}{}.insert({}, {});\n",
@@ -3382,6 +3399,37 @@ impl RustCodegen {
         VALUE_TYPES.with(|types| types.borrow().get(name).cloned())
     }
 
+    /// The type of a value, when it can be recovered without the analysis
+    /// context that `emit_value` does not carry.
+    ///
+    /// Membership is the only emitter that needs this: it has to know whether
+    /// the container is a map, because Rust spells membership `contains_key` for
+    /// a map and `contains` for everything else.
+    fn name_type_from_value(value: &Value) -> Option<Type> {
+        match value {
+            Value::Name(name) => Self::name_type(name),
+            Value::List { element_type, .. } | Value::ListComp { element_type, .. } => {
+                Some(Type::Array(Box::new(element_type.clone())))
+            }
+            Value::Tuple { element_types, .. } => Some(Type::Tuple(element_types.clone())),
+            Value::Dict {
+                key_type,
+                value_type,
+                ..
+            } => Some(Type::Dict {
+                key: Box::new(key_type.clone()),
+                value: Box::new(value_type.clone()),
+            }),
+            Value::String(_) | Value::FormatString { .. } => Some(Type::String),
+            Value::Int(_) | Value::Int128(_) => Some(Type::Int),
+            Value::Float(_) => Some(Type::Float),
+            Value::Bool(_) => Some(Type::Bool),
+            // A field, a call, or an indexed read: the type is real but lives in
+            // the analysis context this emitter does not have.
+            _ => None,
+        }
+    }
+
     fn emit_value(value: &Value, ctx: &EmitCtx) -> Result<String> {
         Ok(match value {
             Value::Int(v) => format!("{}_i64", v),
@@ -3577,6 +3625,37 @@ impl RustCodegen {
                     return Ok(format!(
                         "{{ let __tarvos_shift_amount = {right_str}; if __tarvos_shift_amount < 0_i64 {{ panic!(\"ValueError: negative shift count\") }} let __tarvos_shift_value = {left_str}; __tarvos_shift_value.{checked}(__tarvos_shift_amount as u32).{fallback} }}"
                     ));
+                }
+                // Membership is a method call, not an operator, so it has to be emitted
+                // before the generic `op.symbol()` path below. `7 in values`
+                // is `values.contains(&7)`, with the operands in Python's order:
+                // the value is borrowed and the container is the receiver.
+                //
+                // Which method depends on the container, because Rust spells
+                // membership differently per collection: a sequence and a set
+                // use `contains`, a map uses `contains_key`, and a string uses
+                // `contains` for a substring, which is what Python's `in` means
+                // on a string.
+                if matches!(op, BinaryOp::In | BinaryOp::NotIn) {
+                    let container_ty = match Self::name_type_from_value(right) {
+                        Some(ty) => ty,
+                        None => {
+                            return Err(anyhow::anyhow!(
+                                "`in` needs the container's type, which is not known here; \
+                                 use --python-fallback"
+                            ))
+                        }
+                    };
+                    let method = match container_ty {
+                        Type::Dict { .. } => "contains_key",
+                        _ => "contains",
+                    };
+                    let test = format!("({right_str}).{method}(&{left_str})");
+                    return Ok(if matches!(op, BinaryOp::NotIn) {
+                        format!("(!{test})")
+                    } else {
+                        test
+                    });
                 }
                 let op_str = op.symbol();
                 // Python compares numbers across int and float (`1 == 1.0` is
