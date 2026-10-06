@@ -288,8 +288,6 @@ native subset rejects the program.
 Native syntax and unsupported-AST diagnostics include the source line and
 column. Use `--python-fallback` when CPython compatibility is required.
 
-Tarvos is open-source software licensed under the [AGPL-3.0](LICENSE).
-
 ## License
 
 Tarvos is open-source software licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
