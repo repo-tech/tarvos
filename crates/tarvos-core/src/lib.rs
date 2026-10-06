@@ -886,6 +886,9 @@ fn convert_ruff_stmt(statement: ruff::Stmt) -> tarvos_ast::Stmt {
         },
         ruff::Stmt::Break => Stmt::Break,
         ruff::Stmt::Continue => Stmt::Continue,
+        // `pass` survives the conversion so an empty body stays a body. Every
+        // later stage emits it as nothing.
+        ruff::Stmt::Pass => Stmt::Pass,
         ruff::Stmt::Raise(value) => Stmt::Raise {
             exc: value.map(convert_ruff_expr),
         },

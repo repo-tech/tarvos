@@ -131,6 +131,9 @@ impl Emitter {
             Stmt::Import { .. } => Ok(()),
             // Imports carry no runtime effect here; the module resolver has
             // already inlined the imported definitions by this point.
+            Stmt::Pass => Ok(()),
+            // Imports carry no runtime effect here; the module resolver has
+            // already inlined the imported definitions by this point.
             Stmt::ImportFrom { .. } => Ok(()),
             // Exception control flow is lowered by `tarvos-codegen-rust`, which
             // models it with `Result` values and a real error type. This legacy

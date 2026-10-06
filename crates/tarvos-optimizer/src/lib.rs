@@ -209,6 +209,10 @@ impl Optimizer {
         for stmt in stmts {
             match stmt {
                 Stmt::StructDef { .. } => result.push(stmt.clone()),
+                // `pass` does nothing, so there is nothing to substitute into
+                // it. Preserved: a loop body that was only `pass` still needs a
+                // statement to remain a valid loop.
+                Stmt::Pass => result.push(stmt.clone()),
                 Stmt::Let { name, ty, value } => {
                     let new_val = Self::substitute_value(value, &env);
                     // A name whose type is not fixed must not be tracked as a
@@ -741,6 +745,8 @@ impl Optimizer {
     fn fold_stmt(stmt: &Stmt) -> Result<Stmt> {
         match stmt {
             Stmt::StructDef { .. } => Ok(stmt.clone()),
+            // `pass` is already fully folded: it contains nothing.
+            Stmt::Pass => Ok(stmt.clone()),
             Stmt::Let { name, ty, value } => {
                 let folded_value = Self::fold_value(value)?;
                 Ok(Stmt::Let {
@@ -1330,6 +1336,8 @@ impl Optimizer {
     fn eliminate_stmt(stmt: &Stmt) -> Stmt {
         match stmt {
             Stmt::StructDef { .. } => stmt.clone(),
+            // `pass` contains no values, so elimination has nothing to do.
+            Stmt::Pass => stmt.clone(),
             Stmt::Let { name, ty, value } => Stmt::Let {
                 name: name.clone(),
                 ty: ty.clone(),
@@ -1552,6 +1560,8 @@ impl Optimizer {
     fn stmt_reads(stmt: &Stmt) -> HashSet<String> {
         match stmt {
             Stmt::StructDef { .. } => HashSet::new(),
+            // `pass` reads and writes nothing.
+            Stmt::Pass => HashSet::new(),
             Stmt::Let { value, .. } => Self::value_names(value),
             Stmt::Assign { name, value } => {
                 let mut names = Self::value_names(value);

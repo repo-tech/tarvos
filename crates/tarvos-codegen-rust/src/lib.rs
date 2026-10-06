@@ -1697,6 +1697,8 @@ impl RustCodegen {
             Stmt::StructDef { fields, .. } => {
                 fields.iter().any(|(_, ty)| matches!(ty, Type::Dict { .. }))
             }
+            // `pass` mentions no values, so it cannot use a map.
+            Stmt::Pass => false,
             Stmt::Let { value, .. } | Stmt::Assign { value, .. } => {
                 Self::value_uses_hash_map(value)
             }
@@ -1760,7 +1762,7 @@ impl RustCodegen {
     fn collect_stmt_calls(stmt: &Stmt, names: &mut HashSet<String>) {
         let mut values = |value: &Value| Self::collect_value_calls(value, names);
         match stmt {
-            Stmt::StructDef { .. } | Stmt::Break | Stmt::Continue => {}
+            Stmt::StructDef { .. } | Stmt::Break | Stmt::Continue | Stmt::Pass => {}
             Stmt::Let { value, .. }
             | Stmt::Assign { value, .. }
             | Stmt::Destructure { value, .. }
@@ -2038,6 +2040,10 @@ impl RustCodegen {
 
         match stmt {
             Stmt::StructDef { .. } => {}
+            // `pass` emits nothing, but the arm is written out so the
+            // construct stays recognized through every stage. A body that is
+            // only `pass` still forms a valid `{ }` block around it.
+            Stmt::Pass => {}
             Stmt::Let { name, ty, value } => {
                 let value_str = Self::emit_value(value, ctx)?;
                 // A name that later changes type is declared as a tagged value
@@ -2155,13 +2161,14 @@ impl RustCodegen {
                 // the key's shape; a sequence keeps the bound-checked positional
                 // write below, which is also what computes the `IndexError`.
                 let target_is_dict = matches!(Self::name_type(target), Some(Type::Dict { .. }));
-                if target_is_dict && indices.len() == 1 {
-                    let index_str = Self::emit_value(&indices[0], ctx)?;
-                    out.push_str(&format!(
-                        "{}{}.insert({}, {});\n",
-                        ind, target, index_str, value_str
-                    ));
-                } else if indices.len() == 1 && matches!(indices[0], Value::String(_)) {
+                // A string-literal key implies a map even when the target's
+                // type was never recorded, so it is kept as its own clause:
+                // without it, `user["language"] = "Python"` in a function body
+                // where the dict's declaration is out of view would take the
+                // positional path below and not compile.
+                if (target_is_dict || matches!(indices.first(), Some(Value::String(_))))
+                    && indices.len() == 1
+                {
                     let index_str = Self::emit_value(&indices[0], ctx)?;
                     out.push_str(&format!(
                         "{}{}.insert({}, {});\n",
@@ -3062,6 +3069,8 @@ impl RustCodegen {
         names: &HashMap<String, Type>,
     ) {
         match stmt {
+            // `pass` mentions no values, so it requests no display impls.
+            Stmt::Pass => {}
             Stmt::Print(values) => {
                 for value in values {
                     Self::require_display(value, needs, names);

@@ -72,6 +72,9 @@ pub enum Stmt {
     },
     /// Return statement
     Return(Option<Value>),
+    /// Python's `pass`: a statement that does nothing. Emitted as an empty
+    /// statement so a body that is only `pass` still forms a valid Rust block.
+    Pass,
     Break,
     Continue,
     Raise(Option<Value>),

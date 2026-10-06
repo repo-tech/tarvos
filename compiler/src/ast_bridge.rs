@@ -59,6 +59,10 @@ pub enum Stmt {
     Return(Option<Expr>),
     Break,
     Continue,
+    /// Python's `pass`. Carried rather than dropped so line numbers in later
+    /// diagnostics stay aligned with the source; every later stage emits it as
+    /// nothing.
+    Pass,
     /// `try: ... except ...: ... else: ... finally: ...`
     Try {
         body: Vec<Stmt>,
@@ -516,6 +520,11 @@ impl AstBridge {
             }
             pyast::Stmt::Break(_) => Stmt::Break,
             pyast::Stmt::Continue(_) => Stmt::Continue,
+            // `pass` is explicitly supported rather than dropped, because a
+            // dropped statement shifts every diagnostic's line number after it.
+            // Emitted as nothing by every later stage; the statement exists so
+            // the construct is recognized, not so it can do work.
+            pyast::Stmt::Pass(_) => Stmt::Pass,
             pyast::Stmt::Raise(node) => {
                 Stmt::Raise(node.exc.as_deref().map(|value| self.expr(value)))
             }

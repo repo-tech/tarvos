@@ -97,6 +97,13 @@ pub enum Stmt {
     #[serde(rename = "continue")]
     Continue,
 
+    /// Python's `pass`: a statement that does nothing. It is a real statement
+    /// rather than an empty body, because an empty Rust block is only valid
+    /// where a statement is expected, and `pass` also appears where one is
+    /// not, such as directly in a `finally` clause.
+    #[serde(rename = "pass")]
+    Pass,
+
     #[serde(rename = "raise")]
     Raise { exc: Option<Expr> },
 

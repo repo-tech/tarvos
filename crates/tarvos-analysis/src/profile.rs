@@ -63,6 +63,9 @@ pub fn analyze_module(module: &Module) -> ProfileStats {
 fn analyze_stmt(stmt: &Stmt, stats: &mut ProfileStats) {
     match stmt {
         Stmt::Import { .. } | Stmt::ImportFrom { .. } => stats.statements += 1,
+        // `pass` is a statement, so it counts as one, but it carries nothing
+        // to analyze.
+        Stmt::Pass => stats.statements += 1,
         Stmt::Assign { value, .. } => {
             stats.statements += 1;
             stats.assignments += 1;

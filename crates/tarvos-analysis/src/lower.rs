@@ -606,6 +606,11 @@ impl Lowerer {
                 }
                 Ok(Stmt::Break)
             }
+            // `pass` lowers to nothing. It is a case in the match rather than
+            // an absence because the AST bridge recognizes it, and a recognized
+            // construct that vanishes here would turn an honest statement into
+            // a silent one.
+            tarvos_ast::Stmt::Pass => Ok(Stmt::Pass),
             tarvos_ast::Stmt::Continue => {
                 if self.loop_depth == 0 {
                     bail!("continue is only supported inside a loop");
