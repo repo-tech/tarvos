@@ -1,9 +1,17 @@
-# Tarvos ⚡
+<p align="center">
+<img width="1798" height="576" alt="logo" src="https://github.com/user-attachments/assets/50fba72e-121a-4008-b919-3cbc92d2cd56" />
+</p>
+
+<div align="center">
 
 [![CI](https://github.com/repo-tech/Tarvos/actions/workflows/ci.yml/badge.svg)](https://github.com/repo-tech/Tarvos/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/badge/version-1.3.1-blue.svg)](https://github.com/repo-tech/Tarvos/releases)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL3.0-yellow.svg)](https://opensource.org/licenses/GPL-3.0)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
+
+</div>
+
+# Tarvos ⚡
 
 **Tarvos** compiles a statically analyzable subset of Python straight to native
 Rust and produces a standalone executable. No Python runtime, no Rust toolchain,
