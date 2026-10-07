@@ -296,6 +296,13 @@ native subset rejects the program.
 Native syntax and unsupported-AST diagnostics include the source line and
 column. Use `--python-fallback` when CPython compatibility is required.
 
+## Project Origin
+
+Tarvos was created and is primarily developed by Himanshu Gupta.
+
+See [PROJECT_ORIGIN.md](PROJECT_ORIGIN.md) for the project's origin,
+engineering direction, and attribution.
+
 ## License
 
 Tarvos is open-source software licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
