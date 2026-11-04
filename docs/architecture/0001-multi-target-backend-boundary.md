@@ -145,3 +145,26 @@ The backend-boundary extraction is acceptable only when:
 - `.github/workflows/ci.yml`
 - `Cargo.toml`
 - `README.md`
+
+
+## Addendum: existing embedded path discovered during follow-up audit
+
+The CLI already exposes `tarvos compile --target embedded`, and
+`CompilePipeline::transpile_file_embedded` calls
+`RustCodegen::generate_embedded`. This is a real existing implementation path,
+so the project should not describe embedded support as wholly absent.
+
+The inspected code generator describes this path as a deliberately small,
+freestanding `no_std` entry point for integer programs. The implementation
+accepts a narrow set of integer bindings/expressions and emits
+`tarvos_entry() -> i64`. It rejects printing, reassignment, and unsupported
+statements. Its own comment explains that the normal backend remains
+`std`-based because Python printing, collections, timing, and exception
+handling need it.
+
+This is a useful prototype, but it is not yet evidence of a general MCU/IoT
+toolchain. It does not by itself establish target-triple support, linker and
+memory-layout integration, startup/runtime support, peripheral access, device
+flashing, or hardware-in-the-loop tests. The next embedded audit should inspect
+the full code-generation tests and actual target build/link path before making
+any product claim.
