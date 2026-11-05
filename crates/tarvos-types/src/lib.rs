@@ -11,14 +11,32 @@ pub enum Type {
     String,
     None,
 
-    // Composite types (future)
+    /// Composite types (future)
     Array(Box<Type>),
+    /// A `set`: homogeneous elements, unordered, deduplicated.
+    ///
+    /// It is its own type rather than a disguised `Array` so `print(s)` can
+    /// render `{1, 2, 3}` instead of `[1, 2, 3]`, and so `list - list` stays a
+    /// rejected operation while `set - set` is not.
+    ///
+    /// The runtime keeps elements **sorted**, which is what CPython's own
+    /// iteration order produces for ints and floats (their hash is the value,
+    /// so bucket order is ascending). A `str` set's order in CPython is
+    /// randomised per process by `PYTHONHASHSEED` and cannot be reproduced by
+    /// anything; sorting is the closest deterministic choice.
+    Set(Box<Type>),
     Tuple(Vec<Type>),
     Dict {
         key: Box<Type>,
         value: Box<Type>,
     },
     Object(String),
+
+    /// A union type: `x: int | str | None`.
+
+    /// Used when a variable is assigned values of different types, e.g.
+    /// `x = None; x = "hello"` infers `Union([None, String])`.
+    Union(Vec<Type>),
 
     // Special
     Unknown,
@@ -48,6 +66,7 @@ impl fmt::Display for Type {
             Type::String => write!(f, "str"),
             Type::None => write!(f, "None"),
             Type::Array(inner) => write!(f, "Array[{}]", inner),
+            Type::Set(inner) => write!(f, "set[{}]", inner),
             Type::Tuple(types) => {
                 write!(f, "(")?;
                 for (i, t) in types.iter().enumerate() {
@@ -60,6 +79,16 @@ impl fmt::Display for Type {
             }
             Type::Dict { key, value } => write!(f, "Dict[{}, {}]", key, value),
             Type::Object(name) => write!(f, "{}", name),
+            Type::Union(types) => {
+                write!(f, "(")?;
+                for (i, t) in types.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " | ")?;
+                    }
+                    write!(f, "{}", t)?;
+                }
+                write!(f, ")")
+            }
             Type::Unknown => write!(f, "Unknown"),
             Type::Dynamic => write!(f, "dynamic"),
         }
