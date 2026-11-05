@@ -1,6 +1,6 @@
 use crate::stdlib::{dict_method_mutates, list_method_mutates, MethodReceiver};
 use crate::{module_supported, native_builtin_method, native_constant, native_function};
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};
 use tarvos_ir::{BinaryOp, Module, Stmt, TypeContext, Value};
 use tarvos_types::Type;
@@ -51,13 +51,13 @@ impl Lowerer {
         // unannotated parameter types, so they cannot disagree about a name.
         let variable_types = collect_variable_types(&module.body);
 
-        // A name bound to two different types in one module is tagged, so that
-        // both bindings can agree on one Rust type. This has to be known here
-        // rather than at codegen: inference below asks the type of `x + 1`,
-        // and if `x` is still believed to be an `Int` that expression is
-        // rejected as `int + str` before anything downstream can widen it.
-        for name in collect_type_changing_names(&module.body) {
-            self.type_context.declare(name, Type::Dynamic);
+        // A name bound to two different types in one module is tagged with a
+        // union type so both bindings agree on one Rust type. This has to be
+        // known here rather than at codegen: inference below asks the type of
+        // `x + 1`, and if `x` is still believed to be an `Int` that expression
+        // is rejected as `int + str` before anything downstream can widen it.
+        for (name, types) in collect_variable_union_types(&module.body) {
+            self.type_context.declare(name, Type::Union(types));
         }
         self.empty_list_hints = variable_types
             .iter()
@@ -485,7 +485,16 @@ impl Lowerer {
                         if let tarvos_ast::Expr::Name { id } = object.as_ref() {
                             return self.lower_method_call_stmt(id, method, args);
                         }
-                        bail!("method call on complex expression not yet supported as statement");
+                        // Fall back to the expression path: it resolves builtin
+                        // receivers (string/list/dict literals) and the
+                        // compile-time `.format()` expansion, neither of which
+                        // the statement-specific paths above cover.
+                        let val = self.lower_expr(&tarvos_ast::Expr::MethodCall {
+                            object: object.clone(),
+                            method: method.clone(),
+                            args: args.clone(),
+                        })?;
+                        Ok(Stmt::Expr(val))
                     }
 
                     _ => {
@@ -912,8 +921,12 @@ impl Lowerer {
             }
             // A chained call such as `text.strip().lower()` names its receiver
             // through the previous call's result, so the type has to come from
-            // lowering it rather than from the scope.
-            tarvos_ast::Expr::Call { .. } | tarvos_ast::Expr::MethodCall { .. } => {
+            // lowering it rather than from the scope. A subscript receiver
+            // (`item["name"].upper()`) is typed the same way: the index's
+            // element type is only known once it is lowered.
+            tarvos_ast::Expr::Call { .. }
+            | tarvos_ast::Expr::MethodCall { .. }
+            | tarvos_ast::Expr::Subscript { .. } => {
                 let lowered = self.lower_expr(object)?;
                 Some(self.value_type(&lowered)?)
             }
@@ -995,12 +1008,24 @@ impl Lowerer {
         };
 
         // `pop()`, `get()` and `setdefault()` return the container's element or
-        // value type, which the static registry cannot know.
+        // value type, which the static registry cannot know. The views do too:
+        // `values()` is a list of the dict's value type and `items()` a list of
+        // `(key, value)` pairs, so `list(d.values())` would otherwise be handed
+        // an `Unknown` element and rejected instead of materializing.
         return_type = match (receiver, method, &receiver_ty) {
             (MethodReceiver::List, "pop", Type::Array(element)) => (**element).clone(),
             (MethodReceiver::Dict, "get" | "pop" | "setdefault", Type::Dict { value, .. }) => {
                 (**value).clone()
             }
+            (MethodReceiver::Dict, "keys", Type::Dict { key, .. }) => {
+                Type::Array(key.clone())
+            }
+            (MethodReceiver::Dict, "values", Type::Dict { value, .. }) => {
+                Type::Array(value.clone())
+            }
+            (MethodReceiver::Dict, "items", Type::Dict { key, value }) => Type::Array(
+                Box::new(Type::Tuple(vec![(**key).clone(), (**value).clone()])),
+            ),
             _ => return_type,
         };
 
@@ -1016,6 +1041,135 @@ impl Lowerer {
             args: args_ir,
             return_type,
         }))
+    }
+
+    /// Expand a literal `"template".format(*args)` into f-string format parts.
+    ///
+    /// The template is a compile-time constant and the arguments arrive in
+    /// positional order, so the whole call resolves here: `str.format` has no
+    /// native runtime form, but its positional subset is exactly what the
+    /// `FormatString` IR already represents and renders. Named fields
+    /// (`{name}`) are rejected with a nameable diagnostic rather than being
+    /// silently mis-indexed, and mixing automatic `{}` with numbered `{0}`
+    /// fields mirrors CPython's own `ValueError`.
+    fn lower_format_template(
+        &mut self,
+        template: &str,
+        args: &[tarvos_ast::Expr],
+    ) -> Result<Vec<tarvos_ast::FormatPart>> {
+        let chars: Vec<char> = template.chars().collect();
+        let mut parts: Vec<tarvos_ast::FormatPart> = Vec::new();
+        let mut literal = String::new();
+        let mut next_auto = 0usize;
+        let mut used_auto = false;
+        let mut used_numbered = false;
+        let mut i = 0usize;
+
+        while i < chars.len() {
+            match chars[i] {
+                '{' if chars.get(i + 1) == Some(&'{') => {
+                    literal.push('{');
+                    i += 2;
+                }
+                '}' if chars.get(i + 1) == Some(&'}') => {
+                    literal.push('}');
+                    i += 2;
+                }
+                '}' => bail!("`.format()` template contains an unmatched `}}`"),
+                '{' => {
+                    let mut close = None;
+                    let mut j = i + 1;
+                    while j < chars.len() {
+                        match chars[j] {
+                            '{' => bail!(
+                                "`.format()` template nests a replacement field inside another; \
+                                 literal braces must be doubled as `{{`/`}}`"
+                            ),
+                            '}' => {
+                                close = Some(j);
+                                break;
+                            }
+                            _ => j += 1,
+                        }
+                    }
+                    let close = close.ok_or_else(|| {
+                        anyhow!("`.format()` template has an unclosed `{{` field")
+                    })?;
+                    let field: String = chars[i + 1..close].iter().collect();
+
+                    // Split the field into `name[!conversion][:format_spec]`.
+                    let (name, conversion, format_spec) = match field.split_once('!') {
+                        Some((name, rest)) => match rest.split_once(':') {
+                            Some((conv, spec)) => (name, Some(conv), Some(spec.to_string())),
+                            None => (name, Some(rest), None),
+                        },
+                        None => match field.split_once(':') {
+                            Some((name, spec)) => (name, None, Some(spec.to_string())),
+                            None => (field.as_str(), None, None),
+                        },
+                    };
+                    if let Some(conv) = conversion {
+                        if !matches!(conv, "r" | "s" | "a") {
+                            bail!(
+                                "`.format()` conversion `!{conv}` is not supported; expected \
+                                 `!r`, `!s`, or `!a`"
+                            );
+                        }
+                    }
+
+                    let index = if name.is_empty() {
+                        if used_numbered {
+                            bail!("`.format()` template mixes automatic and numbered fields");
+                        }
+                        used_auto = true;
+                        next_auto += 1;
+                        next_auto - 1
+                    } else if name.chars().all(|c| c.is_ascii_digit()) {
+                        if used_auto {
+                            bail!("`.format()` template mixes automatic and numbered fields");
+                        }
+                        used_numbered = true;
+                        name.parse::<usize>().map_err(|_| {
+                            anyhow!("`.format()` field number `{name}` does not fit in a usize")
+                        })?
+                    } else {
+                        bail!(
+                            "`.format()` named field `{{{name}}}` is not supported natively yet; \
+                             use positional `{{}}` fields or an f-string instead"
+                        );
+                    };
+
+                    let arg = args.get(index).ok_or_else(|| {
+                        anyhow!(
+                            "`.format()` field position {index} has no matching argument \
+                             (only {} given)",
+                            args.len()
+                        )
+                    })?;
+
+                    if !literal.is_empty() {
+                        parts.push(tarvos_ast::FormatPart::Literal {
+                            value: std::mem::take(&mut literal),
+                        });
+                    }
+                    parts.push(tarvos_ast::FormatPart::Value {
+                        value: arg.clone(),
+                        format_spec,
+                        conversion: conversion.map(str::to_string),
+                    });
+                    i = close + 1;
+                }
+                ch => {
+                    literal.push(ch);
+                    i += 1;
+                }
+            }
+        }
+
+        if !literal.is_empty() {
+            parts.push(tarvos_ast::FormatPart::Literal { value: literal });
+        }
+        Ok(parts)
     }
 
     fn lower_class(&mut self, class_name: &str, body: &[tarvos_ast::Stmt]) -> Result<Vec<Stmt>> {
@@ -1163,6 +1317,26 @@ impl Lowerer {
                     );
                 }
 
+                // `is` and `is not` are identity tests. `None` is a singleton
+                // in Python, so against `None` identity is exactly equality;
+                // any other operand would need object addresses the tagged
+                // value does not carry, and is refused rather than silently
+                // approximated as `==`.
+                let mut left_is_none = matches!(left.as_ref(), tarvos_ast::Expr::None);
+                for (operator, comparator) in operators.iter().zip(comparators) {
+                    let right_is_none = matches!(comparator, tarvos_ast::Expr::None);
+                    if matches!(operator.as_str(), "is" | "is not")
+                        && !left_is_none
+                        && !right_is_none
+                    {
+                        bail!(
+                            "identity comparison with `is` against a non-None value is not \
+                             supported natively; compare with `==` or use --python-fallback"
+                        );
+                    }
+                    left_is_none = right_is_none;
+                }
+
                 let mut left_ir = self.lower_expr(left)?;
                 let mut result = None;
                 for (operator, comparator) in operators.iter().zip(comparators) {
@@ -1208,6 +1382,14 @@ impl Lowerer {
                         && matches!(&args[0], tarvos_ast::Expr::String { value } if value == "time")
                     {
                         return Ok(Value::String("time".into()));
+                    }
+                    // The desugared `sorted(values, key=lambda ...)` call.
+                    // Handled before the argument walk because the lambda is
+                    // not a value `lower_expr` can lower on its own: its body
+                    // is lowered here with the parameter bound to the element
+                    // type instead.
+                    if id == "__tarvos_sorted_by_key" {
+                        return self.lower_sorted_by_key_call(args);
                     }
                     if matches!(id.as_str(), "list" | "sorted")
                         && !self.class_names.contains(id)
@@ -1304,6 +1486,18 @@ impl Lowerer {
                     return Ok(value);
                 }
 
+                // `"template".format(*args)` has no runtime counterpart in the
+                // native backend, but when the receiver is a literal the whole
+                // call can be expanded here into the same IR an f-string
+                // produces, which already renders positionally. A non-literal
+                // receiver falls through to the class-instance path below.
+                if method == "format" {
+                    if let tarvos_ast::Expr::String { value: template } = object.as_ref() {
+                        let parts = self.lower_format_template(template, args)?;
+                        return self.lower_expr(&tarvos_ast::Expr::FormatString { parts });
+                    }
+                }
+
                 let object_name = match object.as_ref() {
                     tarvos_ast::Expr::Name { id } => id,
                     _ => bail!("method calls on complex expressions are not supported"),
@@ -1338,11 +1532,24 @@ impl Lowerer {
                     elements.iter().map(|e| self.lower_expr(e)).collect();
                 let elements_ir = elements_ir?;
 
-                let element_type = if let Some(first) = elements_ir.first() {
-                    self.value_type(first)?
-                } else {
-                    Type::Unknown
-                };
+                // A mixed list is honest Dynamic: `__TarvosValue` carries
+                // each element's own tag, which is how `[1, "hello", 3.14]`
+                // keeps every value instead of forcing them into one Rust
+                // type. A single `Unknown` does not widen — it is absence of
+                // evidence, not evidence of a second type.
+                let mut element_type = Type::Unknown;
+                for element in &elements_ir {
+                    let ty = self.value_type(element)?;
+                    if ty == Type::Unknown {
+                        continue;
+                    }
+                    if element_type == Type::Unknown {
+                        element_type = ty;
+                    } else if ty != element_type {
+                        element_type = Type::Dynamic;
+                        break;
+                    }
+                }
 
                 Ok(Value::List {
                     elements: elements_ir,
@@ -1395,32 +1602,42 @@ impl Lowerer {
                     .iter()
                     .map(|e| self.lower_expr(e))
                     .collect::<Result<_>>()?;
-                let key_type = keys_ir
-                    .first()
-                    .map(|v| self.value_type(v))
-                    .transpose()?
-                    .unwrap_or(Type::Unknown);
-                let value_type = values_ir
-                    .first()
-                    .map(|v| self.value_type(v))
-                    .transpose()?
-                    .unwrap_or(Type::Unknown);
+                let mut key_type = Type::Unknown;
+                for key in &keys_ir {
+                    let ty = self.value_type(key)?;
+                    if ty == Type::Unknown {
+                        continue;
+                    }
+                    if key_type == Type::Unknown {
+                        key_type = ty;
+                    } else if ty != key_type {
+                        key_type = Type::Dynamic;
+                    }
+                }
                 if !matches!(
                     key_type,
                     Type::Int | Type::Float | Type::Bool | Type::String | Type::Unknown
                 ) {
                     bail!("dictionary keys must have a statically supported scalar type");
                 }
-                for key in &keys_ir {
-                    let ty = self.value_type(key)?;
-                    if ty != key_type && ty != Type::Unknown && key_type != Type::Unknown {
-                        bail!("dictionary keys must have one consistent type");
-                    }
-                }
+                // Python dictionaries are heterogeneous: `{"name": "a", "age": 1}`
+                // is ordinary code, so a second value type widens the slot to
+                // `Dynamic` exactly the way a mixed list literal does. Forcing
+                // one type here would reject the most common dict shape there is.
+                //
+                // A single `Unknown` still does not widen — it is absence of
+                // evidence, not evidence of a second type.
+                let mut value_type = Type::Unknown;
                 for value in &values_ir {
                     let ty = self.value_type(value)?;
-                    if ty != value_type && ty != Type::Unknown && value_type != Type::Unknown {
-                        bail!("dictionary values must have one consistent type");
+                    if ty == Type::Unknown {
+                        continue;
+                    }
+                    if value_type == Type::Unknown {
+                        value_type = ty;
+                    } else if ty != value_type {
+                        value_type = Type::Dynamic;
+                        break;
                     }
                 }
                 Ok(Value::Dict {
@@ -1523,13 +1740,7 @@ impl Lowerer {
                     container_type,
                 })
             }
-            tarvos_ast::Expr::None => {
-                bail!(
-                    "None is not in the compilable subset. \
-                     Tarvos targets statically-typed code; \
-                     use typed functions and avoid None values."
-                )
-            }
+            tarvos_ast::Expr::None => Ok(Value::None),
             tarvos_ast::Expr::Attribute { value, attr } => {
                 if let tarvos_ast::Expr::Name { id } = value.as_ref() {
                     if let Some(module) = self.module_aliases.get(id) {
@@ -1646,18 +1857,37 @@ impl Lowerer {
                 })
             }
             tarvos_ast::Expr::Set { elements } => {
-                let mut elements_ir = Vec::new();
-                for e in elements {
-                    elements_ir.push(self.lower_expr(e)?);
+                let elements_ir = elements
+                    .iter()
+                    .map(|e| self.lower_expr(e))
+                    .collect::<Result<Vec<_>>>()?;
+                // A single `Unknown` does not widen: `set()` of an unknown
+                // source is still an unknown element, not a mixed one.
+                let mut element_type = Type::Unknown;
+                for element in &elements_ir {
+                    let ty = self.value_type(element)?;
+                    if ty == Type::Unknown {
+                        continue;
+                    }
+                    if element_type == Type::Unknown {
+                        element_type = ty;
+                    } else if ty != element_type {
+                        element_type = Type::Dynamic;
+                        break;
+                    }
                 }
-                let element_type = if let Some(first) = elements_ir.first() {
-                    self.value_type(first)?
-                } else {
-                    Type::Unknown
-                };
-                Ok(Value::List {
-                    elements: elements_ir,
-                    element_type,
+                // Lowered as a call rather than a new `Value` variant: the IR
+                // has no set node, and a constructor call carries the set type
+                // in `return_type`, which is exactly what `value_type` reads.
+                // The list literal inside it is the source ordering; the
+                // constructor deduplicates and sorts it.
+                Ok(Value::Call {
+                    function: "__tarvos_set_of".to_string(),
+                    args: vec![Value::List {
+                        elements: elements_ir,
+                        element_type: element_type.clone(),
+                    }],
+                    return_type: Type::Set(Box::new(element_type)),
                 })
             }
             tarvos_ast::Expr::Starred { value } => self.lower_expr(value),
@@ -1766,6 +1996,10 @@ impl Lowerer {
             // equality test would be.
             "in" => BinaryOp::In,
             "not in" => BinaryOp::NotIn,
+            // Identity, already validated by the caller: only `None` gets this
+            // far, and against the `None` singleton identity is equality.
+            "is" => BinaryOp::Eq,
+            "is not" => BinaryOp::NotEq,
             _ => bail!("unsupported comparison operator: {}", op),
         })
     }
@@ -1776,6 +2010,7 @@ impl Lowerer {
             Value::Float(_) => Ok(Type::Float),
             Value::String(_) => Ok(Type::String),
             Value::Bool(_) => Ok(Type::Bool),
+            Value::None => Ok(Type::None),
             Value::Name(id) => Ok(self
                 .type_context
                 .lookup(id)
@@ -1824,6 +2059,23 @@ impl Lowerer {
                 | BinaryOp::RShift,
             ) => Ok(Type::Int),
             (Type::Int, Type::Int, BinaryOp::FloorDiv) => Ok(Type::Int),
+            // Set algebra. Python spells these same symbols as bitwise
+            // operators on integers, so the *operand types* decide which
+            // meaning applies: two sets are set operations, two integers are
+            // bitwise. A `list` deliberately has no row here — `[1] | [2]` is a
+            // TypeError in CPython and must stay one.
+            (Type::Set(left), Type::Set(right), BinaryOp::BitOr)
+            | (Type::Set(left), Type::Set(right), BinaryOp::BitAnd)
+            | (Type::Set(left), Type::Set(right), BinaryOp::BitXor)
+            | (Type::Set(left), Type::Set(right), BinaryOp::Sub) => {
+                // Mixing element types is legal Python and widens the result
+                // exactly the way a mixed list literal widens to `Dynamic`.
+                if *left == *right {
+                    Ok(Type::Set(left.clone()))
+                } else {
+                    Ok(Type::Set(Box::new(Type::Dynamic)))
+                }
+            }
             // Membership always produces a bool and never fails on the operand types,
             // so it is answered before the per-type table. `7 in values` has an `int`
             // on the left and a list on the right, and no row in the table pairs
@@ -1875,6 +2127,55 @@ impl Lowerer {
         }
     }
 
+    /// Lower the desugared `sorted(values, key=lambda p: body)` call.
+    ///
+    /// The lambda is not a value the IR can carry, so its body is lowered here
+    /// with the parameter bound to the element type, and travels as the key
+    /// expression the emitter wraps back into `sort_by_key(|p| ...)`. The
+    /// parameter name rides along inside the function name — the only field a
+    /// `Value::Call` has that can carry a binder. Rust's `sort_by_key` is
+    /// stable, which is what keeps Python's ordering of equal keys.
+    fn lower_sorted_by_key_call(&mut self, args: &[tarvos_ast::Expr]) -> Result<Value> {
+        let [values, key] = args else {
+            bail!("internal: sorted_by_key expects a values expression and a key lambda");
+        };
+        let tarvos_ast::Expr::Lambda {
+            args: params,
+            body: key_body,
+        } = key
+        else {
+            bail!(
+                "sorted(..., key=...) is only supported with a single-parameter lambda \
+                 natively; use --python-fallback otherwise"
+            );
+        };
+        let [param] = params.as_slice() else {
+            bail!(
+                "sorted(..., key=...) supports exactly one lambda parameter natively; \
+                 use --python-fallback otherwise"
+            );
+        };
+        let values = self.lower_expr(values)?;
+        let element = self.call_arg_element_type(&values)?;
+        if element == Type::Unknown {
+            bail!(
+                "sorted(..., key=...) argument has an unknown element type; \
+                 bind it to a typed list first or use --python-fallback"
+            );
+        }
+        let return_type = Type::Array(Box::new(element.clone()));
+        let outer_context = self.type_context.clone();
+        self.type_context.declare(param.clone(), element);
+        let key = self.lower_expr(key_body);
+        self.type_context = outer_context;
+        let key = key?;
+        Ok(Value::Call {
+            function: format!("__tarvos_sorted_by_key__{param}"),
+            args: vec![values, key],
+            return_type,
+        })
+    }
+
     fn infer_call_return_type(&self, function: &str, args: &[Value]) -> Result<Type> {
         if let Some((_, _, return_type)) = self.function_signatures.get(function) {
             return Ok(return_type.clone());
@@ -1889,8 +2190,104 @@ impl Lowerer {
             "bool" => Type::Bool,
             "range" => Type::Array(Box::new(Type::Int)),
             "abs" => Type::Int,
-            "min" | "max" | "sum" | "round" => Type::Int,
+            "min" | "max" | "round" => Type::Int,
+            // `sum` takes the element type of what it sums: floats in, floats
+            // out — `sum(x * 0.5 for x in xs)` is a float. An argument whose
+            // element type is not known stays `Int`, the type every integer
+            // sum has.
+            "sum" => {
+                let element = args
+                    .first()
+                    .map(|arg| self.call_arg_element_type(arg))
+                    .transpose()?
+                    .unwrap_or(Type::Unknown);
+                if element == Type::Float {
+                    Type::Float
+                } else {
+                    Type::Int
+                }
+            }
             "any" | "all" => Type::Bool,
+            // `enumerate(xs)` yields `(index, element)` pairs and `zip(a, b)`
+            // yields `(a_element, b_element)` pairs. Both are materialized as
+            // a list of tuples, which is what the tuple-target `for` loop the
+            // desugars produce unpacks from. A `str` iterable would iterate
+            // Rust `char`s instead of one-character strings, so it is refused
+            // rather than lowered wrongly.
+            "enumerate" => {
+                if args
+                    .first()
+                    .map(|arg| self.value_type(arg))
+                    .transpose()?
+                    .is_some_and(|ty| ty == Type::String)
+                {
+                    bail!(
+                        "enumerate() over a string is not supported natively; \
+                         iterate list(text) instead or use --python-fallback"
+                    );
+                }
+                let element = args
+                    .first()
+                    .map(|arg| self.call_arg_element_type(arg))
+                    .transpose()?
+                    .unwrap_or(Type::Unknown);
+                Type::Array(Box::new(Type::Tuple(vec![Type::Int, element])))
+            }
+            "zip" => {
+                if args.len() != 2 {
+                    bail!(
+                        "zip() is supported natively with exactly two iterables, got {}; \
+                         use --python-fallback otherwise",
+                        args.len()
+                    );
+                }
+                let first_type = self.value_type(&args[0])?;
+                let second_type = self.value_type(&args[1])?;
+                if first_type == Type::String || second_type == Type::String {
+                    bail!(
+                        "zip() over a string is not supported natively; \
+                         iterate list(text) instead or use --python-fallback"
+                    );
+                }
+                let first = self.call_arg_element_type(&args[0])?;
+                let second = self.call_arg_element_type(&args[1])?;
+                Type::Array(Box::new(Type::Tuple(vec![first, second])))
+            }
+            // The comprehension desugars: a nested comprehension feeds one
+            // level of rows through `__tarvos_flatten`, and a dict
+            // comprehension feeds `(key, value)` pairs through
+            // `__tarvos_dict_of`. Both names are synthesized by the bridge,
+            // never by user code.
+            "__tarvos_flatten" => {
+                let element = args
+                    .first()
+                    .map(|arg| self.call_arg_element_type(arg))
+                    .transpose()?
+                    .unwrap_or(Type::Unknown);
+                match element {
+                    Type::Array(inner) => Type::Array(inner),
+                    other => {
+                        bail!("internal: __tarvos_flatten() over {other} is not a list of lists")
+                    }
+                }
+            }
+            "__tarvos_dict_of" => {
+                let element = args
+                    .first()
+                    .map(|arg| self.call_arg_element_type(arg))
+                    .transpose()?
+                    .unwrap_or(Type::Unknown);
+                match element {
+                    Type::Tuple(types) if types.len() == 2 => Type::Dict {
+                        key: Box::new(types[0].clone()),
+                        value: Box::new(types[1].clone()),
+                    },
+                    other => bail!(
+                        "dict comprehension elements resolved to {other}, \
+                         expected a (key, value) pair"
+                    ),
+                }
+            }
             "ord" => Type::Int,
             "chr" => Type::String,
             // `list()` / `sorted()` preserve their input's element type. The
@@ -1945,6 +2342,10 @@ impl Lowerer {
         let ty = self.value_type(arg)?;
         match ty {
             Type::Array(element) => Ok(*element),
+            // `sorted(a | b)` hands a set to the same materializing path a list
+            // takes; the elements are already deduplicated and sorted, so the
+            // conversion is only about re-sorting the result.
+            Type::Set(element) => Ok(*element),
             Type::Dict { key, .. } => Ok(*key),
             Type::Tuple(elements) => {
                 let mut uniform: Option<Type> = None;
@@ -2120,6 +2521,7 @@ impl Lowerer {
                 Some(Type::String) => return "str",
                 Some(Type::Dict { .. }) => return "dict",
                 Some(Type::Array(_)) => return "vec",
+                Some(Type::Set(_)) => return "set",
                 Some(Type::Tuple(_)) => return "tuple",
                 _ => {}
             }
@@ -2447,6 +2849,7 @@ fn expression_type(expr: &tarvos_ast::Expr) -> Type {
         tarvos_ast::Expr::Int { .. } => Type::Int,
         tarvos_ast::Expr::Float { .. } => Type::Float,
         tarvos_ast::Expr::Bool { .. } => Type::Bool,
+        tarvos_ast::Expr::None => Type::None,
         tarvos_ast::Expr::String { .. } | tarvos_ast::Expr::FormatString { .. } => Type::String,
         tarvos_ast::Expr::List { elements } => Type::Array(Box::new(
             elements
@@ -2609,17 +3012,19 @@ fn collect_variable_types(statements: &[tarvos_ast::Stmt]) -> HashMap<String, Ty
 ///
 /// Two different types is the trigger; a name bound twice with the *same* type
 /// is ordinary code and must not be tagged.
-fn collect_type_changing_names(statements: &[tarvos_ast::Stmt]) -> HashSet<String> {
+fn collect_variable_union_types(statements: &[tarvos_ast::Stmt]) -> HashMap<String, Vec<Type>> {
+    let mut all_types: HashMap<String, Vec<Type>> = HashMap::new();
     let mut seen: HashMap<String, Type> = HashMap::new();
-    let mut changing: HashSet<String> = HashSet::new();
-    collect_type_changing_into(statements, &mut seen, &mut changing, 0);
-    changing
+    collect_variable_union_types_into(statements, &mut all_types, &mut seen, 0);
+    // Only keep variables that actually have multiple distinct types.
+    all_types.retain(|_, types| types.len() > 1);
+    all_types
 }
 
-fn collect_type_changing_into(
+fn collect_variable_union_types_into(
     statements: &[tarvos_ast::Stmt],
+    all_types: &mut HashMap<String, Vec<Type>>,
     seen: &mut HashMap<String, Type>,
-    changing: &mut HashSet<String>,
     depth: usize,
 ) {
     // The same guard as `collect_variable_types_into`: deeply nested source is
@@ -2640,7 +3045,10 @@ fn collect_type_changing_into(
                 }
                 match seen.get(id) {
                     Some(previous) if *previous != ty => {
-                        changing.insert(id.clone());
+                        all_types
+                            .entry(id.clone())
+                            .or_insert_with(|| vec![previous.clone()])
+                            .push(ty.clone());
                     }
                     Some(_) => {}
                     None => {
@@ -2657,21 +3065,21 @@ fn collect_type_changing_into(
                         seen.entry(id.clone()).or_insert(ty);
                     }
                 }
-                collect_type_changing_into(body, seen, changing, depth + 1);
+                collect_variable_union_types_into(body, all_types, seen, depth + 1);
             }
             tarvos_ast::Stmt::If { body, orelse, .. } => {
-                collect_type_changing_into(body, seen, changing, depth + 1);
-                collect_type_changing_into(orelse, seen, changing, depth + 1);
+                collect_variable_union_types_into(body, all_types, seen, depth + 1);
+                collect_variable_union_types_into(orelse, all_types, seen, depth + 1);
             }
             tarvos_ast::Stmt::While { body, .. } | tarvos_ast::Stmt::With { body, .. } => {
-                collect_type_changing_into(body, seen, changing, depth + 1);
+                collect_variable_union_types_into(body, all_types, seen, depth + 1);
             }
             tarvos_ast::Stmt::FunctionDef { body, .. } => {
                 // A function has its own scope, so its names are walked against a
                 // fresh map rather than the module's. A local `x` is unrelated to
                 // a module-level one and must not make it look dynamic.
                 let mut inner_seen = HashMap::new();
-                collect_type_changing_into(body, &mut inner_seen, changing, depth + 1);
+                collect_variable_union_types_into(body, all_types, &mut inner_seen, depth + 1);
             }
             _ => {}
         }

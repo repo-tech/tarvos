@@ -59,6 +59,16 @@ const VEC_DISPLAY_IMPL: &str =
 
 const MAP_DISPLAY_IMPL: &str = "impl<K: __TarvosRepr, V: __TarvosRepr> __TarvosDisplay for std::collections::HashMap<K, V> { fn __tarvos_display(&self) -> String { self.__tarvos_repr() } }\n";
 
+const SET_REPR_IMPL: &str = r##"impl<T: __TarvosRepr> __TarvosRepr for __TarvosSet<T> {
+    fn __tarvos_repr(&self) -> String {
+        let items = self.items.iter().map(|item| item.__tarvos_repr()).collect::<Vec<String>>();
+        format!("{{{}}}", items.join(", "))
+    }
+}
+"##;
+
+const SET_DISPLAY_IMPL: &str = "impl<T: __TarvosRepr> __TarvosDisplay for __TarvosSet<T> { fn __tarvos_display(&self) -> String { self.__tarvos_repr() } }\n";
+
 /// `Debug` cannot express that split, so repr is spelled out here.
 /// Which native types a program can actually hand to `print` / `str`.
 ///
@@ -81,6 +91,11 @@ struct DisplayNeeds {
     display_bool: bool,
     display_string: bool,
     display_collection: bool,
+    /// A `set` is its own runtime newtype (`__TarvosSet<T>`), separate from the
+    /// generic `Vec` impl, so it needs its own pair of impls on top of the
+    /// collection ones its element type requires.
+    repr_set: bool,
+    display_set: bool,
     /// `range()` is lowered to a Rust `Range`, not a `Vec`, so it needs its own
     /// impl. Emitting the old runtime without one made `print(range(5))`
     /// generate code that does not compile: E0599, no `__tarvos_display` for
@@ -142,6 +157,8 @@ impl DisplayNeeds {
             display_bool: true,
             display_string: true,
             display_collection: true,
+            repr_set: true,
+            display_set: true,
             repr_range: true,
             display_range: true,
         };
@@ -159,6 +176,7 @@ impl DisplayNeeds {
             || self.repr_bool
             || self.repr_string
             || self.repr_collection
+            || self.repr_set
             || self.repr_range;
         if repr_trait {
             out.push_str("#[allow(dead_code)]\ntrait __TarvosRepr { fn __tarvos_repr(&self) -> String; }\n\n");
@@ -181,6 +199,9 @@ impl DisplayNeeds {
         if self.repr_collection {
             out.push_str(VEC_REPR_IMPL);
             out.push_str(MAP_REPR_IMPL);
+        }
+        if self.repr_set {
+            out.push_str(SET_REPR_IMPL);
         }
         let display_trait = self.display_i64
             || self.display_f64
@@ -205,6 +226,9 @@ impl DisplayNeeds {
         if self.display_collection {
             out.push_str(VEC_DISPLAY_IMPL);
             out.push_str(MAP_DISPLAY_IMPL);
+        }
+        if self.display_set {
+            out.push_str(SET_DISPLAY_IMPL);
         }
         if self.repr_range || self.display_range {
             out.push_str(RANGE_REPR_FN);
@@ -452,6 +476,23 @@ const STR_CASE_HELPERS: [&str; 3] = [
     "tarvos_str_capitalize",
     "tarvos_str_swapcase",
 ];
+
+/// Runtime behind the comprehension desugars: `__tarvos_flatten` joins the
+/// row lists a multi-clause comprehension builds, and `__tarvos_dict_of`
+/// collects the `(key, value)` pairs a dict comprehension produces. Both are
+/// only emitted when a program actually uses them.
+const COMPREHENSION_RUNTIME: &str = r##"
+#[allow(dead_code)]
+#[inline]
+fn __tarvos_flatten<T>(rows: Vec<Vec<T>>) -> Vec<T> {
+    rows.into_iter().flatten().collect()
+}
+#[allow(dead_code)]
+#[inline]
+fn __tarvos_dict_of<K: Eq + std::hash::Hash, V>(pairs: Vec<(K, V)>) -> std::collections::HashMap<K, V> {
+    pairs.into_iter().collect()
+}
+"##;
 
 /// Runtime that backs Python subscript reads on lists and strings.
 ///
@@ -1336,6 +1377,214 @@ fn tarvos_list_sort_string(target: &mut Vec<String>) { target.sort(); }
 fn tarvos_list_sort_bool(target: &mut Vec<bool>) { target.sort(); }
 "##;
 
+/// Runtime behind Python's `dict` view methods: `keys()`, `values()`, `items()`.
+///
+/// These materialize into Rust `Vec`s, so the program can iterate over them or
+/// pass them to `list()` / `sorted()`. A dict view is not a live view of the
+/// map: it copies keys/values at call time, which matches Python for the native
+/// subset because the dict is not mutated between the view call and its use.
+const DICT_RUNTIME: &str = r##"
+#[allow(dead_code)]
+#[inline]
+fn tarvos_dict_keys<K: Clone, V>(map: &std::collections::HashMap<K, V>) -> Vec<K> {
+    map.keys().cloned().collect()
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_dict_values<K, V: Clone>(map: &std::collections::HashMap<K, V>) -> Vec<V> {
+    map.values().cloned().collect()
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_dict_items<K: Clone, V: Clone>(map: &std::collections::HashMap<K, V>) -> Vec<(K, V)> {
+    map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_dict_get<K: Eq + std::hash::Hash, V>(map: &std::collections::HashMap<K, V>, key: &K, default: Option<V>) -> V {
+    match map.get(key) {
+        Some(value) => value.clone(),
+        None => default.unwrap_or_else(|| panic!("KeyError: key not found")),
+    }
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_dict_pop<K: Eq + std::hash::Hash, V>(map: &mut std::collections::HashMap<K, V>, key: &K, default: Option<V>) -> V {
+    match map.remove(key) {
+        Some(value) => value,
+        None => match default {
+            Some(v) => v,
+            None => panic!("KeyError: key not found"),
+        },
+    }
+}
+#[allow(dead_code)]
+#[inline]
+fn tarvos_dict_setdefault<K: Eq + std::hash::Hash + Clone, V: Clone>(map: &mut std::collections::HashMap<K, V>, key: K, default: V) -> V {
+    map.entry(key.clone()).or_insert_with(|| default.clone()).clone()
+}
+"##;
+
+/// Runtime behind Python's `set`.
+///
+/// A set is a sorted, deduplicated `Vec` behind a newtype. The newtype is what
+/// lets `print(s)` render `{1, 2, 3}` where a plain `Vec` renders `[1, 2, 3]`,
+/// and it is why `list - list` can stay a rejected operation while `set - set`
+/// is not: the two are different Rust types.
+///
+/// Elements are kept **sorted** rather than in insertion order. CPython's own
+/// iteration order for a set is hash-bucket order, which for `int` (hash is the
+/// value) and `float` comes out ascending, so sorting reproduces it there. For
+/// `str` CPython randomises the order per process via `PYTHONHASHSEED` and
+/// nothing can reproduce it; sorting is the closest deterministic answer.
+///
+/// The elements need `Ord`, which every native scalar Tarvos emits has. A
+/// program whose set element type cannot provide one is rejected by the type
+/// checker before this code is reached.
+const SET_RUNTIME: &str = r##"#[derive(Clone, Debug)]
+pub struct __TarvosSet<T> {
+    items: Vec<T>,
+}
+
+impl<T: Ord + Clone + std::fmt::Debug> __TarvosSet<T> {
+    #[allow(dead_code)]
+    #[inline]
+    pub fn from_items(items: Vec<T>) -> Self {
+        let mut items = items;
+        items.sort();
+        items.dedup();
+        Self { items }
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn contains(&self, value: &T) -> bool {
+        self.items.binary_search(value).is_ok()
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn len(&self) -> i64 {
+        self.items.len() as i64
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.items.iter()
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn items(&self) -> Vec<T> {
+        self.items.clone()
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn add(&mut self, value: T) {
+        match self.items.binary_search(&value) {
+            Ok(_) => {}
+            Err(position) => self.items.insert(position, value),
+        }
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn remove(&mut self, value: &T) {
+        match self.items.binary_search(value) {
+            Ok(position) => {
+                self.items.remove(position);
+            }
+            // Python raises KeyError rather than silently ignoring it.
+            Err(_) => panic!("KeyError: {:?}", value),
+        }
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn discard(&mut self, value: &T) {
+        if let Ok(position) = self.items.binary_search(value) {
+            self.items.remove(position);
+        }
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn union(&self, other: &Self) -> Self {
+        let mut merged = self.items.clone();
+        merged.extend(other.items.iter().cloned());
+        Self::from_items(merged)
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn intersection(&self, other: &Self) -> Self {
+        let merged = self
+            .items
+            .iter()
+            .filter(|item| other.contains(item))
+            .cloned()
+            .collect();
+        Self::from_items(merged)
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn difference(&self, other: &Self) -> Self {
+        let merged = self
+            .items
+            .iter()
+            .filter(|item| !other.contains(item))
+            .cloned()
+            .collect();
+        Self::from_items(merged)
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub fn symmetric_difference(&self, other: &Self) -> Self {
+        let mut merged = self
+            .items
+            .iter()
+            .filter(|item| !other.contains(item))
+            .cloned()
+            .collect::<Vec<T>>();
+        merged.extend(other.items.iter().filter(|item| !self.contains(item)).cloned());
+        Self::from_items(merged)
+    }
+}
+
+impl<T: Ord + Clone + std::fmt::Debug> std::ops::BitOr for &__TarvosSet<T> {
+    type Output = __TarvosSet<T>;
+    fn bitor(self, other: Self) -> __TarvosSet<T> { self.union(other) }
+}
+impl<T: Ord + Clone + std::fmt::Debug> std::ops::BitAnd for &__TarvosSet<T> {
+    type Output = __TarvosSet<T>;
+    fn bitand(self, other: Self) -> __TarvosSet<T> { self.intersection(other) }
+}
+impl<T: Ord + Clone + std::fmt::Debug> std::ops::Sub for &__TarvosSet<T> {
+    type Output = __TarvosSet<T>;
+    fn sub(self, other: Self) -> __TarvosSet<T> { self.difference(other) }
+}
+impl<T: Ord + Clone + std::fmt::Debug> std::ops::BitXor for &__TarvosSet<T> {
+    type Output = __TarvosSet<T>;
+    fn bitxor(self, other: Self) -> __TarvosSet<T> { self.symmetric_difference(other) }
+}
+"##;
+
 pub struct RustCodegen;
 
 thread_local! {
@@ -1377,6 +1626,14 @@ impl RustCodegen {
         // preludes below only cost anything when they are actually reachable.
         let runtime_calls = Self::collect_runtime_calls(module);
         let needs = |name: &str| runtime_calls.contains(name);
+        // Display needs are collected immediately so that the set newtype
+        // emission (below) can check the display/repr flags before they are
+        // consumed by the later render() call.
+        let display_needs = Self::collect_display_needs(module);
+        let display_src = display_needs.render();
+        if !display_src.is_empty() {
+            out.push_str(&display_src);
+        }
         // The tagged-value runtime is large and only a name that genuinely
         // changes type needs it. Everything else keeps its native `i64`/`String`
         // representation and never sees this code emitted.
@@ -1417,13 +1674,29 @@ impl RustCodegen {
         {
             out.push_str(LIST_RUNTIME);
         }
+        if runtime_calls
+            .iter()
+            .any(|name| name.starts_with("tarvos_dict_"))
+        {
+            out.push_str(DICT_RUNTIME);
+        }
+        let needs = |name: &str| runtime_calls.contains(name);
+        // The set newtype must be emitted exactly when SET_REPR_IMPL and
+        // SET_DISPLAY_IMPL are: both are driven by display_needs.repr_set /
+        // display_set, and the impls reference __TarvosSet<T>. The original
+        // condition was checking runtime call names and statement usage instead,
+        // which missed cases where type inference produced a set-typed value
+        // that render() then tried to emit impls for.
+        let uses_sets = display_needs.repr_set || display_needs.display_set;
+        if uses_sets {
+            out.push_str(SET_RUNTIME);
+        }
         if needs("__tarvos_index") {
             out.push_str(INDEX_RUNTIME);
         }
-        if needs("tarvos_json_dumps_runtime") {
-            out.push_str(JSON_RUNTIME);
+        if needs("__tarvos_flatten") || needs("__tarvos_dict_of") {
+            out.push_str(COMPREHENSION_RUNTIME);
         }
-        // Emitted only when a program actually calls a statistics function.
         let uses_statistics = runtime_calls
             .iter()
             .any(|name| name.starts_with("tarvos_statistics_"));
@@ -1454,10 +1727,8 @@ impl RustCodegen {
         if needs("tarvos_range") {
             out.push_str(RANGE_RUNTIME);
         }
-        let display_needs = Self::collect_display_needs(module);
-        let display_src = display_needs.render();
-        if !display_src.is_empty() {
-            out.push_str(&display_src);
+        if needs("tarvos_json_dumps_runtime") {
+            out.push_str(JSON_RUNTIME);
         }
         // Installed before any statement is emitted, because every `is_dynamic`
         // question below depends on it. Replaced rather than merged, so two
@@ -1747,6 +2018,146 @@ impl RustCodegen {
         }
     }
 
+    /// Whether a statement can produce a value of `Type::Set`.
+    ///
+    /// The set newtype (`__TarvosSet`) has to be declared before any binding
+    /// can name it, so this answers the same question `statement_uses_hash_map`
+    /// answers for `HashMap`: does the emitted program refer to the type at all?
+    /// A set literal lowers to a `__tarvos_set_of` call, and a set arriving
+    /// from elsewhere still carries `Type::Set` in its call's return type.
+    fn statement_uses_set(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::StructDef { fields, .. } => {
+                fields.iter().any(|(_, ty)| Self::type_needs_set(ty))
+            }
+            Stmt::Pass | Stmt::Break | Stmt::Continue | Stmt::Raise(_) => false,
+            Stmt::Let { value, .. } | Stmt::Assign { value, .. } => Self::value_uses_set(value),
+            Stmt::Destructure { value, .. } => Self::value_uses_set(value),
+            Stmt::Print(values) => values.iter().any(Self::value_uses_set),
+            Stmt::IndexAssign { indices, value, .. } => {
+                indices.iter().any(Self::value_uses_set) || Self::value_uses_set(value)
+            }
+            Stmt::If { test, body, orelse } => {
+                Self::value_uses_set(test)
+                    || body.iter().any(Self::statement_uses_set)
+                    || orelse.iter().any(Self::statement_uses_set)
+            }
+            Stmt::While { test, body } => {
+                Self::value_uses_set(test) || body.iter().any(Self::statement_uses_set)
+            }
+            Stmt::For { iter, body, .. } => {
+                Self::value_uses_set(iter) || body.iter().any(Self::statement_uses_set)
+            }
+            Stmt::Function { body, .. } => body.iter().any(Self::statement_uses_set),
+            Stmt::Return(value) => value.as_ref().is_some_and(Self::value_uses_set),
+            Stmt::ListAppend { value, .. } | Stmt::Expr(value) => Self::value_uses_set(value),
+            Stmt::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                body.iter().any(Self::statement_uses_set)
+                    || handlers
+                        .iter()
+                        .any(|handler| handler.body.iter().any(Self::statement_uses_set))
+                    || orelse.iter().any(Self::statement_uses_set)
+                    || finalbody.iter().any(Self::statement_uses_set)
+            }
+            Stmt::With { body, items } => {
+                items
+                    .iter()
+                    .any(|item| Self::value_uses_set(&item.context_expr))
+                    || body.iter().any(Self::statement_uses_set)
+            }
+            Stmt::FieldAssign { object, value, .. } => {
+                Self::value_uses_set(object) || Self::value_uses_set(value)
+            }
+        }
+    }
+
+    /// Whether a value can evaluate to a set.
+    fn value_uses_set(value: &Value) -> bool {
+        match value {
+            Value::Call {
+                function,
+                args,
+                return_type,
+            } => {
+                function == "__tarvos_set_of"
+                    || Self::type_needs_set(return_type)
+                    || args.iter().any(Self::value_uses_set)
+            }
+            Value::Binary { left, right, ty, .. } => {
+                Self::type_needs_set(ty)
+                    || Self::value_uses_set(left)
+                    || Self::value_uses_set(right)
+            }
+            Value::List { elements, .. } | Value::Tuple { elements, .. } => {
+                elements.iter().any(Self::value_uses_set)
+            }
+            Value::ListComp {
+                iter,
+                element,
+                condition,
+                ..
+            } => {
+                Self::value_uses_set(iter)
+                    || Self::value_uses_set(element)
+                    || condition
+                        .as_ref()
+                        .is_some_and(|value| Self::value_uses_set(value))
+            }
+            Value::Unary { operand, .. } => Self::value_uses_set(operand),
+            Value::Field { object, .. } => Self::value_uses_set(object),
+            Value::Index {
+                container, index, ..
+            } => Self::value_uses_set(container) || Self::value_uses_set(index),
+            Value::Slice {
+                container,
+                lower,
+                upper,
+                step,
+                ..
+            } => {
+                Self::value_uses_set(container)
+                    || lower.as_ref().is_some_and(|v| Self::value_uses_set(v))
+                    || upper.as_ref().is_some_and(|v| Self::value_uses_set(v))
+                    || step.as_ref().is_some_and(|v| Self::value_uses_set(v))
+            }
+            Value::Dict { keys, values, .. } => keys
+                .iter()
+                .chain(values.iter())
+                .any(Self::value_uses_set),
+            Value::FormatString { parts } => parts.iter().any(|part| match part {
+                tarvos_ir::FormatPart::Value { value, .. } => Self::value_uses_set(value),
+                tarvos_ir::FormatPart::Literal(_) => false,
+            }),
+            // Constants and bare names carry no set construction of their own;
+            // a name bound to a set is covered by the binding's own statement.
+            Value::Int(_)
+            | Value::Int128(_)
+            | Value::Float(_)
+            | Value::String(_)
+            | Value::Bool(_)
+            | Value::None
+            | Value::Name(_) => false,
+        }
+    }
+
+    /// Whether a type contains a set anywhere inside it.
+    fn type_needs_set(ty: &Type) -> bool {
+        match ty {
+            Type::Set(_) => true,
+            Type::Array(inner) => Self::type_needs_set(inner),
+            Type::Tuple(types) => types.iter().any(Self::type_needs_set),
+            Type::Dict { key, value } => {
+                Self::type_needs_set(key) || Self::type_needs_set(value)
+            }
+            _ => false,
+        }
+    }
+
     /// Collect every runtime helper name the module calls.
     ///
     /// A single traversal feeds all prelude decisions, so registering a new
@@ -1979,9 +2390,10 @@ impl RustCodegen {
             Value::Binary { left, right, .. } => {
                 Self::value_uses_hash_map(left) || Self::value_uses_hash_map(right)
             }
-            Value::Call { args, .. }
-            | Value::List { elements: args, .. }
-            | Value::Tuple { elements: args, .. } => args.iter().any(Self::value_uses_hash_map),
+            Value::Call { args, .. } => args.iter().any(Self::value_uses_hash_map),
+            Value::List { elements, .. } | Value::Tuple { elements, .. } => {
+                elements.iter().any(Self::value_uses_hash_map)
+            }
             Value::ListComp {
                 iter,
                 element,
@@ -2020,6 +2432,7 @@ impl RustCodegen {
             | Value::Float(_)
             | Value::String(_)
             | Value::Bool(_)
+            | Value::None
             | Value::Name(_) => false,
         }
     }
@@ -3288,6 +3701,7 @@ impl RustCodegen {
             },
             // A field or slice type is not resolvable here, so fall back to
             // every impl rather than risk dropping one the program needs.
+            Value::None => {},
             Value::Field { .. } | Value::Slice { .. } => needs.require_all(),
         }
     }
@@ -3313,6 +3727,16 @@ impl RustCodegen {
             // also needs `Repr for i64`. Recursing here is what keeps the
             // emitted set compilable.
             Type::Array(inner) => {
+                needs.display_collection = true;
+                needs.repr_collection = true;
+                Self::require_type_repr(inner, needs);
+            }
+            // A set renders through the same generic collection machinery as a
+            // `Vec`, just with `{...}` instead of `[...]`, so it needs the same
+            // element impls plus its own `Display`/`Repr` impl.
+            Type::Set(inner) => {
+                needs.display_set = true;
+                needs.repr_set = true;
                 needs.display_collection = true;
                 needs.repr_collection = true;
                 Self::require_type_repr(inner, needs);
@@ -3343,6 +3767,11 @@ impl RustCodegen {
             Type::Bool => needs.repr_bool = true,
             Type::String => needs.repr_string = true,
             Type::Array(inner) => {
+                needs.repr_collection = true;
+                Self::require_type_repr(inner, needs);
+            }
+            Type::Set(inner) => {
+                needs.repr_set = true;
                 needs.repr_collection = true;
                 Self::require_type_repr(inner, needs);
             }
@@ -3439,6 +3868,42 @@ impl RustCodegen {
         }
     }
 
+    /// Which argument slots of a call must arrive boxed as `__TarvosValue`.
+    ///
+    /// A statically-dynamic list is emitted as `Vec<__TarvosValue>`, so the
+    /// generic helpers instantiate their type parameter with `__TarvosValue`.
+    /// A plain-typed argument (`5_i64`, `"x".to_string()`) does not fit that
+    /// slot and fails to compile, so the matching slot is boxed here.
+    ///
+    /// The result is parallel to `args` (so it can be zipped with it), and it
+    /// stays all-`false` unless the receiver really is a dynamic list: boxing
+    /// an argument for a uniform `Vec<i64>` would break a call that was already
+    /// correct. Only the *value* slot is marked — the receiver stays a plain
+    /// `Vec` expression and an index is always an `i64`. `extend` is left alone
+    /// deliberately: it takes `&[T]`, and `box_dynamic` would wrap its whole
+    /// argument in a single `__TarvosValue::List` instead of producing a slice
+    /// of the elements.
+    fn dynamic_list_value_slots(function: &str, args: &[Value]) -> Vec<bool> {
+        let mut slots = vec![false; args.len()];
+        let value_slot = match function {
+            "tarvos_list_insert" => 2,
+            "tarvos_list_remove" | "tarvos_list_index" | "tarvos_list_count" => 1,
+            // Converters (`str()`, `int()`), `sorted()` and user functions take
+            // ordinary types; their arguments must never be tagged.
+            _ => return slots,
+        };
+        let dynamic_list = matches!(
+            args.first().and_then(Self::name_type_from_value),
+            Some(Type::Array(inner)) if Self::type_needs_dynamic(&inner)
+        );
+        if dynamic_list {
+            if let Some(slot) = slots.get_mut(value_slot) {
+                *slot = true;
+            }
+        }
+        slots
+    }
+
     fn emit_value(value: &Value, ctx: &EmitCtx) -> Result<String> {
         Ok(match value {
             Value::Int(v) => format!("{}_i64", v),
@@ -3454,6 +3919,7 @@ impl RustCodegen {
             // Strings are stored as Rust `String` (heap), not `&str`
             Value::String(v) => format!("{:?}.to_string()", v),
             Value::Bool(v) => v.to_string(),
+            Value::None => "__TarvosValue::None".to_string(),
             Value::Name(name) if name == "__name__" => "\"__main__\".to_string()".to_string(),
             Value::Name(name) => name.clone(),
             Value::Field { object, field, .. } => {
@@ -3734,11 +4200,23 @@ impl RustCodegen {
                 } else {
                     vec![false; args.len()]
                 };
+                // A statically-dynamic list instantiates every generic helper
+                // with `T = __TarvosValue`, so plain-typed value arguments
+                // (`i64`, `String`, ..) are boxed at the call site. The
+                // receiver itself stays a plain `Vec` expression — only the
+                // *value* slots are boxed, and only for the helpers that take
+                // one.
+                let boxed = Self::dynamic_list_value_slots(function, args);
                 let args_rendered = args
                     .iter()
                     .zip(owned)
-                    .map(|(arg, needs_clone)| {
-                        let rendered = Self::emit_value(arg, ctx)?;
+                    .zip(boxed)
+                    .map(|((arg, needs_clone), needs_box)| {
+                        let rendered = if needs_box {
+                            Self::box_dynamic(arg)?
+                        } else {
+                            Self::emit_value(arg, ctx)?
+                        };
                         Ok(if needs_clone {
                             format!("{rendered}.clone()")
                         } else {
@@ -3881,6 +4359,11 @@ impl RustCodegen {
                     name if name.starts_with("tarvos_list_") => {
                         Self::emit_list_builtin(name, &args_rendered)?
                     }
+
+                    name if name.starts_with("tarvos_dict_") => {
+                        Self::emit_dict_builtin(name, &args_rendered)?
+                    }
+
                     "tarvos_os_getcwd" => {
                         if !args_rendered.is_empty() {
                             return Err(anyhow::anyhow!("os.getcwd() takes no arguments"));
@@ -4051,20 +4534,97 @@ impl RustCodegen {
                     // `Range` has no `iter()` method - calling it was E0599. Only the
                     // dynamic-step form returns a `Vec`, and that one keeps it.
                     // `sum(xs)` must not consume `xs`, so the Vec case borrows.
-                    "sum" => match args.first() {
-                        Some(Value::Call { function, args: range_args, .. })
-                            if function == "range" && range_args.len() < 3 =>
-                        {
-                            format!("{}.sum::<i64>()", args_str)
+                    // The accumulator type follows the call's return type: a float
+                    // sum collects as `f64`, everything else as `i64`.
+                    "sum" => {
+                        let accumulator = if *return_type == Type::Float {
+                            "f64"
+                        } else {
+                            "i64"
+                        };
+                        match args.first() {
+                            Some(Value::Call { function, args: range_args, .. })
+                                if function == "range" && range_args.len() < 3 =>
+                            {
+                                format!("{}.sum::<{}>()", args_str, accumulator)
+                            }
+                            Some(Value::Call { function, args: range_args, .. })
+                                if function == "range"
+                                    && Self::range_step_is_positive_literal(range_args.get(2)) =>
+                            {
+                                format!("{}.sum::<{}>()", args_str, accumulator)
+                            }
+                            _ => format!("{}.iter().sum::<{}>()", args_str, accumulator),
                         }
-                        Some(Value::Call { function, args: range_args, .. })
-                            if function == "range"
-                                && Self::range_step_is_positive_literal(range_args.get(2)) =>
-                        {
-                            format!("{}.sum::<i64>()", args_str)
+                    }
+                    // `any`/`all` walk a list of booleans — the shape every
+                    // comprehension the backend compiles produces. An element
+                    // type that is not `bool` is refused rather than emitted as
+                    // a closure Rust would reject: Python would apply truthiness
+                    // to the values, and guessing that here would either not
+                    // compile or, worse, compile to the wrong test.
+                    "any" | "all" => {
+                        let element = args
+                            .first()
+                            .and_then(Self::name_type_from_value)
+                            .map(|ty| match ty {
+                                Type::Array(element) => *element,
+                                other => other,
+                            });
+                        match element {
+                            Some(Type::Bool) => {
+                                let method = if function == "any" { "any" } else { "all" };
+                                format!("({}).{}(|value| *value)", args_str, method)
+                            }
+                            other => {
+                                return Err(anyhow::anyhow!(
+                                    "any()/all() over {} elements is not supported natively; \
+                                     only a list of booleans (such as a comparison comprehension) \
+                                     is, use --python-fallback otherwise",
+                                    other
+                                        .map(|ty| ty.to_string())
+                                        .unwrap_or_else(|| "unknown".to_string())
+                                ));
+                            }
                         }
-                        _ => format!("{}.iter().sum::<i64>()", args_str),
-                    },
+                    }
+                    // `enumerate` and `zip` are materialized as a list of
+                    // tuples, cloned first because iterating must not consume
+                    // the source — Python never does. The tuple-target `for`
+                    // loop unpacks each row.
+                    "enumerate" => format!(
+                        "({args_str}).clone().into_iter().enumerate()\
+                         .map(|(index, value)| (index as i64, value))\
+                         .collect::<Vec<(i64, _)>>()"
+                    ),
+                    "zip" => {
+                        let [first, second] = args_rendered.as_slice() else {
+                            return Err(anyhow::anyhow!(
+                                "zip() is supported natively with exactly two iterables"
+                            ));
+                        };
+                        format!(
+                            "({first}).clone().into_iter().zip(({second}).clone().into_iter())\
+                             .collect::<Vec<(_, _)>>()"
+                        )
+                    }
+                    // The desugared `sorted(values, key=lambda p: body)`: the
+                    // parameter name rides in the function name, and the key
+                    // expression is inlined into a stable `sort_by_key`, which
+                    // keeps Python's ordering of equal keys. The list is
+                    // cloned first because sorting must not consume it.
+                    name if name.starts_with("__tarvos_sorted_by_key__") => {
+                        let param = &name["__tarvos_sorted_by_key__".len()..];
+                        let [values, key] = args_rendered.as_slice() else {
+                            return Err(anyhow::anyhow!(
+                                "sorted_by_key requires a list and a key expression"
+                            ));
+                        };
+                        format!(
+                            "({{ let mut __tarvos_sorted = ({values}).clone(); \
+                             __tarvos_sorted.sort_by_key(|{param}| {key}); __tarvos_sorted }})"
+                        )
+                    }
                     name
                         if name.starts_with("__tarvos_list_from_")
                             | name.starts_with("__tarvos_sorted_from_") =>
@@ -4094,6 +4654,16 @@ impl RustCodegen {
                     // still reject it as dynamic; emission annotates the vec so
                     // the display helper resolves without guessing the element.
                     return Ok("Vec::<i64>::new()".to_string());
+                }
+                // A mixed list is `Vec<__TarvosValue>`: each element is boxed
+                // with its own tag the same way a dynamic binding boxes its
+                // value. The uniform case keeps the plain `vec![..]`.
+                if *element_type == Type::Dynamic {
+                    let parts = elements
+                        .iter()
+                        .map(Self::box_dynamic)
+                        .collect::<Result<Vec<_>>>()?;
+                    return Ok(format!("vec![{}]", parts.join(", ")));
                 }
                 let elements_str = elements
                     .iter()
@@ -4212,6 +4782,21 @@ impl RustCodegen {
                 container_type,
                 element_type,
             } => {
+                // A statically-dynamic list is a plain `Vec<__TarvosValue>` at
+                // runtime, not a tagged `__TarvosValue::List`. The index value
+                // is boxed for uniformity, then unboxed through the runtime
+                // helper; negative indices resolve exactly like the
+                // uniform-typed path below it.
+                if matches!(container_type, Type::Array(inner) if **inner == Type::Dynamic) {
+                    let container_str = Self::emit_value(container, ctx)?;
+                    let index_str = Self::box_dynamic(index)?;
+                    return Ok(Self::clone_if_owned(
+                        format!(
+                            "{container_str}[__tarvos_index({container_str}.len() as i64, __tarvos_dyn_index(&{index_str}))]"
+                        ),
+                        element_type,
+                    ));
+                }
                 let container_str = Self::emit_value(container, ctx)?;
                 let index_str = Self::emit_value(index, ctx)?;
                 if matches!(container_type, Type::Dict { .. }) {
@@ -4310,7 +4895,15 @@ impl RustCodegen {
                                 );
                             }
                             args.push(match conversion.as_deref() {
-                                Some("r") | Some("a") => format!("{:?}", rendered),
+                                // `!r` renders the value's repr, so the emitted
+                                // expression must be the repr *of the value*.
+                                // Wrapping the Rust source text of the
+                                // expression in `{:?}` would print code rather
+                                // than the value.
+                                Some("r") | Some("a") => {
+                                    format!("({}).__tarvos_repr()", rendered)
+                                }
+                                Some("s") => Self::emit_str_conversion(value, &rendered),
                                 _ => rendered,
                             });
                         }
@@ -4447,11 +5040,13 @@ impl RustCodegen {
             Type::Int | Type::Float | Type::Bool | Type::None | Type::Unknown => expression,
             Type::String
             | Type::Array(_)
+            | Type::Set(_)
             | Type::Dict { .. }
             | Type::Tuple(_)
             // A tagged value owns whatever it holds, so it is never `Copy` even
             // when it currently happens to carry an `i64`.
             | Type::Dynamic
+            | Type::Union(_)
             | Type::Object(_) => {
                 format!("{expression}.clone()")
             }
@@ -4546,6 +5141,13 @@ impl RustCodegen {
     ///
     /// Mutating methods take `&mut`, so the receiver is reborrowed in place and
     /// the call keeps its `Vec`'s existing binding.
+    ///
+    /// Values appended into, inserted into, or removed from a
+    /// statically-dynamic list (`Vec<__TarvosValue>`) arrive boxed at the call
+    /// site: a plain `i64` argument would not fit the `__TarvosValue` slot the
+    /// generic helper instantiates with. The boxed forms are computed in
+    /// `emit_value`'s call arm, which is why this only needs the rendered
+    /// strings.
     fn emit_list_builtin(name: &str, args_rendered: &[String]) -> Result<String> {
         let [receiver, rest @ ..] = args_rendered else {
             return Err(anyhow::anyhow!("{name}() is missing its receiver"));
@@ -4576,6 +5178,49 @@ impl RustCodegen {
                 format!("tarvos_list_pop_at({borrowed}, ({index}) as i64)")
             }
             (_, []) => format!("{name}({borrowed})"),
+            (_, arguments) => {
+                return Err(anyhow::anyhow!(
+                    "{name}() does not accept {} argument(s) natively",
+                    arguments.len()
+                ))
+            }
+        })
+    }
+
+    /// Emit `dict` view method calls: `keys()`, `values()`, `items()`, `get()`,
+    /// `pop()`, `setdefault()`.
+    ///
+    /// Dict view methods take `&HashMap` (borrowed) while `pop`/`setdefault`
+    /// take `&mut HashMap` (mutably borrowed) because they remove or insert.
+    fn emit_dict_builtin(name: &str, args_rendered: &[String]) -> Result<String> {
+        let [receiver, rest @ ..] = args_rendered else {
+            return Err(anyhow::anyhow!("{name}() is missing its receiver"));
+        };
+        let borrowed = format!("(&{receiver})");
+        let mut_borrowed = format!("(&mut {receiver})");
+        Ok(match (name, rest) {
+            ("tarvos_dict_keys", []) => format!("tarvos_dict_keys({borrowed})"),
+            ("tarvos_dict_values", []) => format!("tarvos_dict_values({borrowed})"),
+            ("tarvos_dict_items", []) => format!("tarvos_dict_items({borrowed})"),
+            ("tarvos_dict_get", [key, default]) => {
+                let default_str = if default == "None" {
+                    "None".to_string()
+                } else {
+                    format!("Some({default})")
+                };
+                format!("tarvos_dict_get({borrowed}, &{key}, {default_str})")
+            }
+            ("tarvos_dict_pop", [key, default]) => {
+                let default_str = if default == "None" {
+                    "None".to_string()
+                } else {
+                    format!("Some({default})")
+                };
+                format!("tarvos_dict_pop({mut_borrowed}, &{key}, {default_str})")
+            }
+            ("tarvos_dict_setdefault", [key, default]) => {
+                format!("tarvos_dict_setdefault({mut_borrowed}, {key}, {default})")
+            }
             (_, arguments) => {
                 return Err(anyhow::anyhow!(
                     "{name}() does not accept {} argument(s) natively",
@@ -4688,6 +5333,13 @@ impl RustCodegen {
         {
             return format!(":.{precision}");
         }
+        // Python's format type characters have no Rust equivalent. Strip the
+        // ones whose Rust translation is Rust's default formatting: `d` and
+        // `s` are plain `Display`, `f`/`F` are `Display` with the precision
+        // Rust already reads. Anything else (`g`, `%`, unknown) is passed
+        // through unchanged so Rust rejects it at compile time rather than
+        // the value being silently reformatted.
+        let spec = spec.strip_suffix(['d', 's', 'f', 'F']).unwrap_or(spec);
         if spec.starts_with(':') {
             spec.to_owned()
         } else {
@@ -4703,7 +5355,12 @@ impl RustCodegen {
             Type::String => "String".to_string(),
             Type::None => "()".to_string(),
             Type::Dynamic => "__TarvosValue".to_string(),
+            // A union type is a tagged runtime value, like Dynamic.
+            Type::Union(_) => "__TarvosValue".to_string(),
             Type::Array(inner) => format!("Vec<{}>", Self::type_to_rust(inner)),
+            // A set is a sorted, deduplicated vector behind a newtype so its
+            // `Display` can use `{...}` where a `Vec` uses `[...]`.
+            Type::Set(inner) => format!("__TarvosSet<{}>", Self::type_to_rust(inner)),
             Type::Tuple(types) => {
                 let type_strs = types.iter().map(Self::type_to_rust).collect::<Vec<_>>();
                 format!("({})", type_strs.join(", "))
@@ -4791,6 +5448,9 @@ impl RustCodegen {
                  supported natively yet; use --python-fallback"
             )),
             Type::Array(inner) => Self::validate_native_type(inner, context),
+            // A set is homogeneous by construction, so only its element type
+            // has to be a native type.
+            Type::Set(inner) => Self::validate_native_type(inner, context),
             Type::Tuple(types) => {
                 for element in types {
                     Self::validate_native_type(element, context)?;
@@ -4811,6 +5471,23 @@ impl RustCodegen {
     /// This is deliberately a *type* question and not a "does the source assign
     /// twice" question: `x = 0` followed by `x = 5` is ordinary static code, and
     /// boxing it would slow down the overwhelmingly common case for nothing.
+    ///
+    /// A mixed list literal (`[1, "a"]`) needs the runtime too even though no
+    /// *name* is `Dynamic`: its binding is `Array(Dynamic)`, and the emitted
+    /// `Vec<__TarvosValue>` cannot name the type without the definition.
+    fn type_needs_dynamic(ty: &Type) -> bool {
+        match ty {
+            Type::Dynamic => true,
+            Type::Array(inner) => Self::type_needs_dynamic(inner),
+            Type::Set(inner) => Self::type_needs_dynamic(inner),
+            Type::Tuple(types) => types.iter().any(Self::type_needs_dynamic),
+            Type::Dict { key, value } => {
+                Self::type_needs_dynamic(key) || Self::type_needs_dynamic(value)
+            }
+            _ => false,
+        }
+    }
+
     fn module_uses_dynamic_values(module: &Module) -> bool {
         let mut module_variables = HashMap::new();
         let mut in_function = false;
@@ -4819,7 +5496,7 @@ impl RustCodegen {
                 Stmt::Function { params, body, .. } => {
                     let mut variables = params.iter().cloned().collect::<HashMap<_, _>>();
                     Self::statements_use_dynamic(body, &mut variables);
-                    if variables.values().any(|ty| matches!(ty, Type::Dynamic)) {
+                    if variables.values().any(Self::type_needs_dynamic) {
                         in_function = true;
                     }
                 }
@@ -4833,10 +5510,7 @@ impl RustCodegen {
                 }
             }
         }
-        in_function
-            || module_variables
-                .values()
-                .any(|ty| matches!(ty, Type::Dynamic))
+        in_function || module_variables.values().any(Self::type_needs_dynamic)
     }
 
     /// Widen any name whose second binding has an incompatible type.
@@ -4926,6 +5600,7 @@ impl RustCodegen {
         Value::Int128(v) => format!("__TarvosValue::Int({}i128 as i64)", v),
         Value::Float(v) => format!("__TarvosValue::Float({:?})", v),
         Value::Bool(v) => format!("__TarvosValue::Bool({})", v),
+        Value::None => "__TarvosValue::None".to_string(),
         Value::String(v) => format!("__TarvosValue::Str({:?}.to_string())", v),
         // Reading a name yields its value. The clone matters because the
         // binding may well be read again on a later line.
@@ -5340,6 +6015,7 @@ Value::Binary { left, op, right, .. } => {
             Value::Float(_) => Type::Float,
             Value::String(_) | Value::FormatString { .. } => Type::String,
             Value::Bool(_) => Type::Bool,
+            Value::None => Type::None,
             Value::Name(name) => variables.get(name).cloned().unwrap_or(Type::Unknown),
             Value::Field { ty, .. } | Value::Unary { ty, .. } | Value::Binary { ty, .. } => {
                 ty.clone()
