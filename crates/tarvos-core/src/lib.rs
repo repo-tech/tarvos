@@ -21,7 +21,7 @@ mod normalize;
 ///
 /// This runs on both front ends, so a construct only has to be handled once
 /// instead of in the Ruff bridge and the CPython exporter separately.
-fn normalize_module(mut module: ast::Module) -> ast::Module {
+pub fn normalize_module(mut module: ast::Module) -> ast::Module {
     module.body = normalize::normalize_body(module.body, &mut 0);
     module
 }
@@ -1045,6 +1045,10 @@ fn convert_ruff_expr(expression: ruff::Expr) -> tarvos_ast::Expr {
                 // `7 in values` fell back to the compatibility runtime.
                 ruff::CompareOperator::In => "in",
                 ruff::CompareOperator::NotIn => "not in",
+                // Identity against `None`, where Python's singleton makes it
+                // equality. Lowering rejects any other `is` operand.
+                ruff::CompareOperator::Is => "is",
+                ruff::CompareOperator::IsNot => "is not",
             }
             .to_string()],
             comparators: vec![convert_ruff_expr(*right)],
@@ -1069,6 +1073,14 @@ fn convert_ruff_expr(expression: ruff::Expr) -> tarvos_ast::Expr {
             attr: attribute,
         },
         ruff::Expr::Await(value) => convert_ruff_expr(*value),
+        // The bridge only carries a lambda where a call desugar produced one
+        // (a `sorted(key=)` argument), already validated to a single
+        // parameter. Any other shape never gets this far: the bridge reports
+        // it as unsupported first.
+        ruff::Expr::Lambda { args, body } => Expr::Lambda {
+            args,
+            body: Box::new(convert_ruff_expr(*body)),
+        },
         ruff::Expr::Unsupported { kind } => Expr::String {
             value: format!("unsupported Ruff expression: {kind}"),
         },

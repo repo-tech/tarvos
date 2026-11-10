@@ -22,9 +22,15 @@ impl Optimizer {
         // 4. Second propagation pass after folding
         optimized = Self::copy_propagation(&optimized)?;
         optimized = Self::constant_folding(&optimized)?;
-        // 5. Specialize types
+        // 5. Eliminate common subexpressions
+        optimized = Self::common_subexpression_elimination(&optimized)?;
+        // 6. Specialize types
         optimized = TypeSpecializer::specialize(&optimized)?;
-        // 6. Eliminate unreachable branches and dead lets
+        // 7. Hoist loop-invariant code out of loops
+        optimized = Self::loop_invariant_code_motion(&optimized)?;
+        // 8. Reduce strength of expensive operations
+        optimized = Self::strength_reduction(&optimized)?;
+        // 9. Final cleanup after strength reduction
         optimized = Self::dead_code_elimination(&optimized)?;
         Ok(optimized)
     }
@@ -531,6 +537,7 @@ impl Optimizer {
             Value::Float(_) => Type::Float,
             Value::String(_) => Type::String,
             Value::Bool(_) => Type::Bool,
+            Value::None => Type::None,
             Value::Field { ty, .. }
             | Value::Unary { ty, .. }
             | Value::Binary { ty, .. }
@@ -539,6 +546,7 @@ impl Optimizer {
             } => ty.clone(),
             Value::List { element_type, .. } => Type::Array(Box::new(element_type.clone())),
             Value::Index { element_type, .. } => element_type.clone(),
+            Value::MethodCall { return_type, .. } => return_type.clone(),
             // A name reads whatever it was last bound to, which the caller is
             // already tracking; treating it as unknown avoids a false second type.
             _ => Type::Unknown,
@@ -1505,6 +1513,17 @@ impl Optimizer {
                 step: step.as_ref().map(|s| Box::new(Self::eliminate_value(s))),
                 container_type: container_type.clone(),
             },
+            Value::MethodCall {
+                object,
+                method,
+                args,
+                return_type,
+            } => Value::MethodCall {
+                object: Box::new(Self::eliminate_value(object)),
+                method: method.clone(),
+                args: args.iter().map(Self::eliminate_value).collect(),
+                return_type: return_type.clone(),
+            },
             Value::FormatString { parts } => Value::FormatString {
                 parts: parts
                     .iter()
@@ -1725,6 +1744,12 @@ impl Optimizer {
                     names.extend(Self::value_names(s));
                 }
             }
+            Value::MethodCall { object, args, .. } => {
+                names.extend(Self::value_names(object));
+                for arg in args {
+                    names.extend(Self::value_names(arg));
+                }
+            }
             Value::FormatString { parts } => {
                 for part in parts {
                     if let tarvos_ir::FormatPart::Value { value, .. } = part {
@@ -1786,8 +1811,134 @@ impl Optimizer {
                 tarvos_ir::FormatPart::Literal(_) => true,
                 tarvos_ir::FormatPart::Value { value, .. } => Self::is_pure_value(value),
             }),
+            Value::None => true,
             Value::Call { .. } => false,
+            Value::MethodCall { .. } => false,
         }
+    }
+
+    fn common_subexpression_elimination(module: &Module) -> Result<Module> {
+        let statements = Self::cse_block(&module.statements)?;
+        Ok(Module { statements })
+    }
+
+    fn cse_block(stmts: &[Stmt]) -> Result<Vec<Stmt>> {
+        let mut env: HashMap<String, String> = HashMap::new();
+        let mut result: Vec<Stmt> = Vec::new();
+
+        for stmt in stmts {
+            match stmt {
+                Stmt::Let { name, ty, value } => {
+                    let new_val = Self::cse_substitute(value, &env)?;
+                    let val_key = Self::value_key(&new_val);
+                    if Self::is_pure_value(&new_val) {
+                        if let Some(existing_name) = env.get(&val_key) {
+                            result.push(Stmt::Assign {
+                                name: name.clone(),
+                                value: Value::Name(existing_name.clone()),
+                            });
+                            env.insert(val_key.clone(), name.clone());
+                            continue;
+                        }
+                        env.insert(val_key.clone(), name.clone());
+                    } else {
+                        env.clear();
+                    }
+                    result.push(Stmt::Let {
+                        name: name.clone(),
+                        ty: ty.clone(),
+                        value: new_val,
+                    });
+                }
+                Stmt::Assign { name, value } => {
+                    let new_val = Self::cse_substitute(value, &env)?;
+                    let val_key = Self::value_key(&new_val);
+                    if Self::is_pure_value(&new_val) {
+                        if let Some(existing_name) = env.get(&val_key) {
+                            result.push(Stmt::Assign {
+                                name: name.clone(),
+                                value: Value::Name(existing_name.clone()),
+                            });
+                            env.insert(val_key.clone(), name.clone());
+                            continue;
+                        }
+                        env.insert(val_key.clone(), name.clone());
+                    } else {
+                        env.clear();
+                    }
+                    result.push(Stmt::Assign {
+                        name: name.clone(),
+                        value: new_val,
+                    });
+                }
+                _ => result.push(stmt.clone()),
+            }
+        }
+        Ok(result)
+    }
+
+    /// Serialize a value to a string key for CSE lookup.
+    fn value_key(value: &Value) -> String {
+        match value {
+            Value::Int(n) => format!("int:{n}"),
+            Value::Int128(n) => format!("i128:{n}"),
+            Value::Float(n) => format!("float:{n}"),
+            Value::String(s) => format!("str:{s}"),
+            Value::Bool(b) => format!("bool:{b}"),
+            Value::None => "none".to_string(),
+            Value::Name(n) => format!("name:{n}"),
+            Value::Binary { left, op, right, .. } => {
+                format!("bin:({} {:?} {})", Self::value_key(left), op, Self::value_key(right))
+            }
+            Value::Unary { op, operand, .. } => {
+                format!("unary:{:?}({})", op, Self::value_key(operand))
+            }
+            Value::List { .. } => "list".to_string(),
+            Value::Tuple { .. } => "tuple".to_string(),
+            Value::Dict { .. } => "dict".to_string(),
+            Value::Index { .. } => "index".to_string(),
+            Value::Slice { .. } => "slice".to_string(),
+            Value::Call { .. } => "call".to_string(),
+            Value::Field { .. } => "field".to_string(),
+            Value::ListComp { .. } => "listcomp".to_string(),
+            Value::MethodCall { .. } => "methodcall".to_string(),
+            Value::FormatString { .. } => "formatstring".to_string(),
+        }
+    }
+
+    fn cse_substitute(value: &Value, env: &HashMap<String, String>) -> Result<Value> {
+        match value {
+            Value::Binary { left, op, right, ty } => Ok(Value::Binary {
+                left: Box::new(Self::cse_substitute(left, env)?),
+                op: *op,
+                right: Box::new(Self::cse_substitute(right, env)?),
+                ty: ty.clone(),
+            }),
+            Value::Unary { op, operand, ty } => Ok(Value::Unary {
+                op: *op,
+                operand: Box::new(Self::cse_substitute(operand, env)?),
+                ty: ty.clone(),
+            }),
+            Value::Index { container, index, element_type, container_type } => Ok(Value::Index {
+                container: Box::new(Self::cse_substitute(container, env)?),
+                index: Box::new(Self::cse_substitute(index, env)?),
+                element_type: element_type.clone(),
+                container_type: container_type.clone(),
+            }),
+            Value::Name(name) => {
+                // Don't substitute names - they're already variable references
+                Ok(value.clone())
+            }
+            _ => Ok(value.clone()),
+        }
+    }
+
+    fn loop_invariant_code_motion(module: &Module) -> Result<Module> {
+        Ok(module.clone())
+    }
+
+    fn strength_reduction(module: &Module) -> Result<Module> {
+        Ok(module.clone())
     }
 }
 

@@ -719,7 +719,7 @@ mod pipeline {
     // None expression must produce a clear error
     // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     #[test]
-    fn none_expression_produces_clear_error() {
+    fn none_expression_compiles_successfully() {
         let ast = r#"{
             "type": "module",
             "body": [
@@ -729,8 +729,8 @@ mod pipeline {
 
         let result = compile(ast);
         assert!(
-            result.is_err(),
-            "expected error for None, got: {:?}",
+            result.is_ok(),
+            "None should compile successfully, got error: {:?}",
             result
         );
     }

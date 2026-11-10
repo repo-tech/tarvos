@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 use std::fmt;
 
 /// Tarvos type system - initial subset
@@ -41,81 +42,29 @@ pub enum Type {
     // Special
     Unknown,
 
-    /// A value whose type is not fixed at compile time.
-    ///
-    /// This is what Python's dynamic typing looks like from the outside: the
-    /// name `x` is bound to an `Int` on one line and a `String` on the next.
-    /// Tarvos keeps the native typed path for the overwhelming majority of
-    /// variables, so `Dynamic` is reserved for names that genuinely change type.
-    /// Those are compiled to a tagged runtime value instead of a bare `i64`,
-    /// which costs a tag word and a match on each operation, and buys the
-    /// ability to do what the source said.
-    ///
-    /// It is deliberately *not* a fallback for "the analyser could not work this
-    /// out". `Unknown` already means that, and silently treating the two the
-    /// same would hide real type changes behind a convenient guess.
+    /// A tagged value for dynamic method dispatch.
+    MethodCall(String),
+    /// Dynamic typing: a name that changes type.
     Dynamic,
 }
 
 impl fmt::Display for Type {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Type::Int => write!(f, "int"),
             Type::Float => write!(f, "float"),
             Type::Bool => write!(f, "bool"),
             Type::String => write!(f, "str"),
             Type::None => write!(f, "None"),
-            Type::Array(inner) => write!(f, "Array[{}]", inner),
+            Type::Array(inner) => write!(f, "list[{}]", inner),
             Type::Set(inner) => write!(f, "set[{}]", inner),
-            Type::Tuple(types) => {
-                write!(f, "(")?;
-                for (i, t) in types.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", t)?;
-                }
-                write!(f, ")")
-            }
-            Type::Dict { key, value } => write!(f, "Dict[{}, {}]", key, value),
-            Type::Object(name) => write!(f, "{}", name),
-            Type::Union(types) => {
-                write!(f, "(")?;
-                for (i, t) in types.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " | ")?;
-                    }
-                    write!(f, "{}", t)?;
-                }
-                write!(f, ")")
-            }
+            Type::Tuple(types) => write!(f, "({})", types.iter().map(|t| t.to_string()).collect::<Vec<String>>().join(", ")),
+            Type::Dict { key, value } => write!(f, "dict[{}, {}]", key, value),
+            Type::Object(name) => write!(f, "class {}", name),
+            Type::Union(types) => write!(f, "{}", types.iter().map(|t| t.to_string()).collect::<Vec<String>>().join(" | ")),
+            Type::MethodCall(name) => write!(f, "method({})", name),
             Type::Unknown => write!(f, "Unknown"),
-            Type::Dynamic => write!(f, "dynamic"),
+            Type::Dynamic => write!(f, "Dynamic"),
         }
     }
 }
-
-#[derive(Debug)]
-pub enum TypeError {
-    Mismatch { expected: Type, actual: Type },
-    Undefined(String),
-    UnsupportedOperation { op: String, left: Type, right: Type },
-}
-
-impl fmt::Display for TypeError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            TypeError::Mismatch { expected, actual } => {
-                write!(f, "type mismatch: expected {}, got {}", expected, actual)
-            }
-            TypeError::Undefined(name) => {
-                write!(f, "undefined variable: {}", name)
-            }
-            TypeError::UnsupportedOperation { op, left, right } => {
-                write!(f, "cannot apply '{}' to {} and {}", op, left, right)
-            }
-        }
-    }
-}
-
-impl std::error::Error for TypeError {}

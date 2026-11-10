@@ -114,7 +114,7 @@ impl TypeInference {
                     .map(|e| self.infer_expr(e))
                     .transpose()?
                     .unwrap_or(Type::Unknown);
-                Ok(Type::Array(Box::new(elem_type)))
+                Ok(Type::Set(Box::new(elem_type)))
             }
             tarvos_ast::Expr::Starred { value } => self.infer_expr(value),
         }

@@ -12,6 +12,8 @@ members = [
     "crates/tarvos-analysis",
     "crates/tarvos-optimizer",
     "crates/tarvos-codegen-rust",
+    "crates/tarvos-codegen-wasm",
+    "crates/tarvos-codegen-cloud",
     "crates/tarvos-tests",
 ]
 
@@ -33,12 +35,12 @@ debug = 0
 opt-level = 0
 
 [profile.release]
-opt-level = "z"
-codegen-units = 1
-lto = true
-debug = 0
-panic = "abort"
-strip = true
+opt-level = 3           
+codegen-units = 1    
+lto = "fat"          
+panic = "abort"    
+strip = true       
+
 
 [profile.release-fast]
 inherits = "release"

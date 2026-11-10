@@ -366,6 +366,11 @@ impl Emitter {
                     CompareOperator::GtEq => "ge",
                     CompareOperator::In => "in",
                     CompareOperator::NotIn => "not in",
+                    // Identity against `None` is what the native validator
+                    // admits; the compatibility object model spells it the
+                    // same way it spells every other comparison.
+                    CompareOperator::Is => "is",
+                    CompareOperator::IsNot => "is not",
                 };
                 Ok(format!(
                     "({}).{}({})",
@@ -402,6 +407,9 @@ impl Emitter {
             )),
             Expr::ListComp { .. } => Err(CodegenError::new(
                 "list comprehensions are supported by the native core pipeline",
+            )),
+            Expr::Lambda { .. } => Err(CodegenError::new(
+                "lambdas are supported by the native core pipeline",
             )),
             Expr::Set(values) => {
                 let mut rust_names = Vec::with_capacity(values.len());

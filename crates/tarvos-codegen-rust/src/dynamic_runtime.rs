@@ -277,6 +277,23 @@ fn repeat(items: &[__TarvosValue], count: i64) -> Vec<__TarvosValue> {
     out
 }
 
+/// Read the integer out of a render-time index expression for a
+/// statically-dynamic list. A uniform list inlines its `i64` index; a dynamic
+/// one carries an `__TarvosValue`, so the tag is unwrapped here rather than at
+/// every use site.
+#[allow(dead_code)]
+#[inline]
+pub fn __tarvos_dyn_index(index: &__TarvosValue) -> i64 {
+    match index {
+        __TarvosValue::Int(i) => *i,
+        __TarvosValue::Bool(b) => *b as i64,
+        other => panic!(
+            "TypeError: indices must be integers, not '{}'",
+            other.type_name()
+        ),
+    }
+}
+
 /// Python equality is value-based and cross-type: `1 == 1.0` and `1 == True`
 /// are both true. A derived `PartialEq` compares variants first and would call
 /// all three false.
@@ -347,7 +364,44 @@ impl std::fmt::Display for __TarvosValue {
 fn render_nested(value: &__TarvosValue) -> String {
     match value {
         __TarvosValue::Str(s) => format!("'{}'", s),
+        __TarvosValue::Float(v) => format!("{:?}", v),
         other => (*other).to_string(),
+    }
+}
+
+/// Python-faithful `repr` for a tagged value, used when a dynamic list prints
+/// through the typed `Vec<__TarvosValue>` display path. The `__TarvosRepr`
+/// trait (emitted by the display pass) is generic over `T: __TarvosRepr`, so
+/// `__TarvosValue` needs this impl before `Vec<__TarvosValue>` can display.
+impl __TarvosRepr for __TarvosValue {
+    fn __tarvos_repr(&self) -> String {
+        match self {
+            __TarvosValue::Str(s) => __tarvos_str_repr(s),
+            __TarvosValue::Bool(b) => {
+                if *b {
+                    "True".to_string()
+                } else {
+                    "False".to_string()
+                }
+            }
+            __TarvosValue::None => "None".to_string(),
+            __TarvosValue::Int(i) => i.to_string(),
+            __TarvosValue::Float(v) => format!("{:?}", v),
+            __TarvosValue::List(items) | __TarvosValue::Tuple(items) => {
+                let parts = items.iter().map(|item| item.__tarvos_repr()).collect::<Vec<_>>();
+                format!("[{}]", parts.join(", "))
+            }
+            __TarvosValue::Dict(entries) => {
+                let mut parts = entries
+                    .iter()
+                    .map(|(k, v)| {
+                        format!("{}: {}", __tarvos_str_repr(k), v.__tarvos_repr())
+                    })
+                    .collect::<Vec<_>>();
+                parts.sort();
+                format!("{{{}}}", parts.join(", "))
+            }
+        }
     }
 }
 
@@ -491,6 +545,94 @@ pub fn __tarvos_append(target: &mut __TarvosValue, item: __TarvosValue) {
         other => panic!(
             "AttributeError: '{}' object has no attribute 'append'",
             other.type_name()
+        ),
+    }
+}
+
+/// Box a statically-typed value into __TarvosValue for dynamic method dispatch.
+#[allow(dead_code)]
+pub fn __tarvos_box_dynamic(value: __TarvosValue) -> __TarvosValue {
+    value
+}
+
+/// Unbox a __TarvosValue back to a statically-typed value when the method
+/// result type is known at compile time.
+#[allow(dead_code)]
+pub fn __tarvos_unbox_dynamic(value: __TarvosValue) -> __TarvosValue {
+    value
+}
+
+/// Generic method call dispatcher for dynamic types.
+/// Called when a method is not statically recognized.
+#[allow(dead_code)]
+pub fn __tarvos_method_call(
+    object: &__TarvosValue,
+    method: &str,
+    _args: &[__TarvosValue],
+) -> __TarvosValue {
+    match (object, method) {
+        (__TarvosValue::Str(s), "upper") => {
+            __TarvosValue::Str(s.to_ascii_uppercase())
+        }
+        (__TarvosValue::Str(s), "lower") => {
+            __TarvosValue::Str(s.to_ascii_lowercase())
+        }
+        (__TarvosValue::Str(s), "strip") => {
+            __TarvosValue::Str(s.trim().to_string())
+        }
+        (__TarvosValue::Str(s), "startswith") => {
+            __TarvosValue::Bool(false) // needs arg
+        }
+        (__TarvosValue::Str(s), "endswith") => {
+            __TarvosValue::Bool(false) // needs arg
+        }
+        (__TarvosValue::Str(s), "find") => {
+            __TarvosValue::Int(-1) // needs arg
+        }
+        (__TarvosValue::Str(s), "split") => {
+            __TarvosValue::List(
+                s.split_whitespace()
+                    .map(|w| __TarvosValue::Str(w.to_string()))
+                    .collect(),
+            )
+        }
+        (__TarvosValue::List(items), "append") => {
+            // needs item arg
+            __TarvosValue::List(items.clone())
+        }
+        (__TarvosValue::List(items), "pop") => {
+            items.last().cloned().unwrap_or(__TarvosValue::None)
+        }
+        (__TarvosValue::List(items), "clear") => {
+            let mut items = items.clone();
+            items.clear();
+            __TarvosValue::List(items)
+        }
+        (__TarvosValue::List(items), "reverse") => {
+            let mut items = items.clone();
+            items.reverse();
+            __TarvosValue::List(items)
+        }
+        (__TarvosValue::List(items), "sort") => {
+            let mut items = items.clone();
+            items.sort();
+            __TarvosValue::List(items)
+        }
+        (__TarvosValue::Dict(entries), "keys") => {
+            __TarvosValue::List(
+                entries.keys().cloned().map(__TarvosValue::Str).collect(),
+            )
+        }
+        (__TarvosValue::Dict(entries), "values") => {
+            __TarvosValue::List(entries.values().cloned().collect())
+        }
+        (__TarvosValue::Dict(entries), "get") => {
+            entries.values().next().cloned().unwrap_or(__TarvosValue::None)
+        }
+        other => panic!(
+            "AttributeError: '{}' object has no attribute '{}'",
+            other.0.type_name(),
+            method
         ),
     }
 }

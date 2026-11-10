@@ -2141,7 +2141,8 @@ impl RustCodegen {
             | Value::String(_)
             | Value::Bool(_)
             | Value::None
-            | Value::Name(_) => false,
+            | Value::Name(_)
+            | Value::MethodCall { .. } => false,
         }
     }
 
@@ -2408,6 +2409,7 @@ impl RustCodegen {
             }
             Value::Unary { operand, .. } => Self::value_uses_hash_map(operand),
             Value::Field { object, .. } => Self::value_uses_hash_map(object),
+            Value::MethodCall { .. } => false,
             Value::Index {
                 container, index, ..
             } => Self::value_uses_hash_map(container) || Self::value_uses_hash_map(index),
@@ -2433,7 +2435,8 @@ impl RustCodegen {
             | Value::String(_)
             | Value::Bool(_)
             | Value::None
-            | Value::Name(_) => false,
+            | Value::Name(_)
+            | Value::MethodCall { .. } => false,
         }
     }
 
@@ -3702,7 +3705,7 @@ impl RustCodegen {
             // A field or slice type is not resolvable here, so fall back to
             // every impl rather than risk dropping one the program needs.
             Value::None => {},
-            Value::Field { .. } | Value::Slice { .. } => needs.require_all(),
+            Value::Field { .. } | Value::Slice { .. } | Value::MethodCall { .. } => needs.require_all(),
         }
     }
 
@@ -4915,6 +4918,68 @@ impl RustCodegen {
                     format!("format!({:?}, {})", format_string, args.join(", "))
                 }
             }
+            Value::MethodCall {
+                object,
+                method,
+                args,
+                return_type,
+            } => {
+                let object_str = Self::emit_value(object, ctx)?;
+                let boxed = if matches!(object.as_ref(), Value::Name(_) | Value::Call { .. }) {
+                    format!("__tarvos_box_dynamic({object_str})")
+                } else {
+                    object_str
+                };
+                let args_rendered: Result<Vec<_>, _> = args
+                    .iter()
+                    .map(|arg| Self::emit_value(arg, ctx))
+                    .collect();
+                let args_rendered = args_rendered?;
+                let args_str = args_rendered.join(", ");
+                match method.as_str() {
+                    "upper" => format!("({boxed}).to_ascii_uppercase()"),
+                    "lower" => format!("({boxed}).to_ascii_lowercase()"),
+                    "strip" => format!("({boxed}).trim().to_string()"),
+                    "lstrip" => format!("({boxed}).trim_start().to_string()"),
+                    "rstrip" => format!("({boxed}).trim_end().to_string()"),
+                    "startswith" => {
+                        if args_str.is_empty() {
+                            "false".to_string()
+                        } else {
+                            format!("({boxed}).starts_with({args_str})")
+                        }
+                    }
+                    "endswith" => {
+                        if args_str.is_empty() {
+                            "false".to_string()
+                        } else {
+                            format!("({boxed}).ends_with({args_str})")
+                        }
+                    }
+                    "find" => {
+                        if args_str.is_empty() {
+                            "-1_i64".to_string()
+                        } else {
+                            format!("({boxed}).find({args_str}).map_or(-1_i64, |i| i as i64)")
+                        }
+                    }
+                    "split" => {
+                        if args_str.is_empty() {
+                            format!("({boxed}).split_whitespace().map(|s| s.to_string()).collect::<Vec<_>>()")
+                        } else {
+                            format!("({boxed}).split('{args_str}').map(|s| s.to_string()).collect::<Vec<_>>()")
+                        }
+                    }
+                    "join" => {
+                        if args_str.is_empty() {
+                            format!("Vec::<String>::new()")
+                        } else {
+                            format!("({args_str}).iter().map(|s| s.as_str()).collect::<Vec<_>>().join(&{boxed})")
+                        }
+                    }
+                    _ => format!("__tarvos_method_call({boxed}, \"{method}\", {args_str})"),
+                }
+            }
         })
     }
 
@@ -5037,7 +5102,7 @@ impl RustCodegen {
 
     fn clone_if_owned(expression: String, element_type: &Type) -> String {
         match element_type {
-            Type::Int | Type::Float | Type::Bool | Type::None | Type::Unknown => expression,
+            Type::Int | Type::Float | Type::Bool | Type::None | Type::Unknown | Type::MethodCall(_) => expression,
             Type::String
             | Type::Array(_)
             | Type::Set(_)
@@ -5357,6 +5422,7 @@ impl RustCodegen {
             Type::Dynamic => "__TarvosValue".to_string(),
             // A union type is a tagged runtime value, like Dynamic.
             Type::Union(_) => "__TarvosValue".to_string(),
+            Type::MethodCall(_) => "__TarvosValue".to_string(),
             Type::Array(inner) => format!("Vec<{}>", Self::type_to_rust(inner)),
             // A set is a sorted, deduplicated vector behind a newtype so its
             // `Display` can use `{...}` where a `Vec` uses `[...]`.
@@ -5770,6 +5836,7 @@ Value::Binary { left, op, right, .. } => {
             Value::Index { .. } => "a subscript",
             Value::Slice { .. } => "a slice",
             Value::Field { .. } => "an attribute",
+            Value::MethodCall { .. } => "a method call",
             Value::FormatString { .. } => "a format string",
             _ => "this expression",
         }
@@ -6035,11 +6102,15 @@ Value::Binary { left, op, right, .. } => {
             },
             Value::Index { element_type, .. } => element_type.clone(),
             Value::Slice { container_type, .. } => container_type.clone(),
+            Value::MethodCall { return_type, .. } => return_type.clone(),
         }
     }
 
     fn types_compatible(expected: &Type, actual: &Type) -> bool {
-        expected == actual || matches!(expected, Type::Unknown) || matches!(actual, Type::Unknown)
+        expected == actual || matches!(expected, Type::Unknown)
+        || matches!(actual, Type::Unknown)
+        // MethodCall types are dynamic and compatible with anything
+        || matches!(expected, Type::MethodCall { .. })
     }
 }
 

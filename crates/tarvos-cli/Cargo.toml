@@ -21,3 +21,5 @@ tarvos-ir = { path = "../tarvos-ir" }
 tarvos-analysis = { path = "../tarvos-analysis" }
 tarvos-optimizer = { path = "../tarvos-optimizer" }
 tarvos-codegen-rust = { path = "../tarvos-codegen-rust" }
+tarvos-codegen-wasm = { path = "../tarvos-codegen-wasm" }
+tarvos-codegen-cloud = { path = "../tarvos-codegen-cloud" }

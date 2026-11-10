@@ -103,11 +103,35 @@ fn normalize_stmt(stmt: Stmt, counter: &mut usize, taken: &mut HashSet<String>) 
             body: normalize_body(body, counter),
         }],
 
-        Stmt::For { target, iter, body } => vec![Stmt::For {
-            target: normalize_expr(target, counter, taken),
-            iter: normalize_expr(iter, counter, taken),
-            body: normalize_body(body, counter),
-        }],
+        Stmt::For { target, iter, body } => {
+            let target = normalize_expr(target, counter, taken);
+            let iter = normalize_expr(iter, counter, taken);
+            let body = normalize_body(body, counter);
+            // A tuple or list target — `for index, name in enumerate(xs):` —
+            // binds two names per iteration, which the IR's `for` cannot do on
+            // its own. Loop over a temporary that holds the whole element and
+            // unpack it at the top of the body: the plain-name unpack is the
+            // parallel-assignment form the IR already destructures, and the
+            // temporary is reserved through `taken` so no user binding can
+            // collide with it.
+            if matches!(target, Expr::Tuple { .. } | Expr::List { .. }) {
+                let temporary = fresh_temporary(counter, taken);
+                let mut loop_body = Vec::with_capacity(body.len() + 1);
+                loop_body.push(Stmt::Assign {
+                    target,
+                    value: Expr::Name {
+                        id: temporary.clone(),
+                    },
+                });
+                loop_body.extend(body);
+                return vec![Stmt::For {
+                    target: Expr::Name { id: temporary },
+                    iter,
+                    body: loop_body,
+                }];
+            }
+            vec![Stmt::For { target, iter, body }]
+        }
 
         Stmt::FunctionDef {
             name,

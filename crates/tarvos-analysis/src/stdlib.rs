@@ -212,7 +212,13 @@ pub fn native_builtin_method(receiver: MethodReceiver, method: &str) -> Option<B
         (MethodReceiver::List, "reverse") => exact("tarvos_list_reverse", 0, Type::None),
         (MethodReceiver::Dict, "update") => exact("tarvos_dict_update", 1, Type::None),
         (MethodReceiver::Dict, "setdefault") => exact("tarvos_dict_setdefault", 2, Type::Unknown),
-        (MethodReceiver::Dict, "get") => exact("tarvos_dict_get", 1, Type::Unknown),
+        // `get(key)` and `get(key, default)` are both valid; without a default
+        // Python returns `None` for a missing key.
+        (MethodReceiver::Dict, "get") => BuiltinMethod {
+            rust_name: "tarvos_dict_get",
+            arity: 1..=2,
+            return_type: Type::Unknown,
+        },
         (MethodReceiver::Dict, "pop") => exact("tarvos_dict_pop", 1, Type::Unknown),
         (MethodReceiver::Dict, "keys") => strings("tarvos_dict_keys", 0),
         (MethodReceiver::Dict, "values") => exact(

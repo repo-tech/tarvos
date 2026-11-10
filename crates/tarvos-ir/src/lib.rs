@@ -121,6 +121,11 @@ pub enum Value {
     String(String),
     Bool(bool),
 
+    /// Python's `None` singleton, used when a value's type is not fixed at
+    /// compile time (a dynamic binding) or when a container element may be
+    /// absent. Lowers to `__TarvosValue::None` in generated Rust.
+    None,
+
     // Variable reference
     Name(String),
     Field {
@@ -190,6 +195,13 @@ pub enum Value {
         upper: Option<Box<Value>>,
         step: Option<Box<Value>>,
         container_type: Type,
+    },
+    /// Method call: object.method(args)
+    MethodCall {
+        object: Box<Value>,
+        method: String,
+        args: Vec<Value>,
+        return_type: Type,
     },
     FormatString {
         parts: Vec<FormatPart>,

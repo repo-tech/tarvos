@@ -10,6 +10,7 @@ use std::{
 
 mod ai_probe;
 mod artifact;
+mod cache;
 mod commands;
 mod manifest;
 mod toolchain;
@@ -17,13 +18,17 @@ use commands::{
     analyze_command, benchmark_command, clean_command, doctor_command, export_command,
     init_command, install_command, validate_command,
 };
-use tarvos_analysis::analyze_module;
+use tarvos_analysis::{analyze_module, lower_module};
 use tarvos_analysis::native_detector::{ModuleReport, NativePlan, NativeSubsetDetector};
 use tarvos_analysis::native_specialization::{specialize_module, SpecializedLoop};
 use tarvos_core::{
-    export_python_ast as core_export_python_ast, find_python_command as core_find_python_command,
+    export_python_ast as core_export_python_ast,
+    find_python_command as core_find_python_command,
     CompilePipeline,
+    normalize_module,
 };
+use tarvos_codegen_cloud::{compile_to_cloud_rust, generate_dockerfile, generate_serverless_yml};
+use tarvos_codegen_wasm::{compile_to_wasm, compile_to_wat};
 use tarvos_parser::parse_python_ast;
 
 /// Long description shown by `tarvos --help`.
@@ -80,7 +85,7 @@ lowering, optimization, then Rust code generation.
 
 With `--format rust` (the default) Tarvos writes Rust source and stops there,
 so no Rust toolchain is required. With `--format exe` it invokes rustc
-afterwards to produce a native executable.
+afterwards to produce a native executable. With `--format wasm` it emits a WebAssembly binary for the browser or WASI.
 
 When a module uses dynamic constructs outside the native subset, Tarvos reports
 why and emits a compatibility launcher that delegates to Python at run time
@@ -90,7 +95,7 @@ Examples:
   tarvos compile app.py
   tarvos compile app.py -o src/main.rs
   tarvos compile app.py --format exe -o app.exe
-  tarvos compile app.py --target embedded";
+  tarvos compile app.py --format wasm -o app.wasm\n  tarvos compile app.py --target embedded\n  tarvos compile app.py --target wasm";
 
 const BUILD_HELP: &str = "\
 Build a native binary executable directly from Python.
@@ -657,6 +662,15 @@ fn main() -> Result<()> {
     }
 }
 
+fn transpile_python_to_ir(input_path: &Path) -> Result<tarvos_ir::Module> {
+    let source = fs::read_to_string(input_path)
+        .with_context(|| format!("failed to read {}", input_path.display()))?;
+    let ast_json = core_export_python_ast(&source)?;
+    let ast_module = parse_python_ast(&ast_json)?;
+    let normalized = normalize_module(ast_module);
+    lower_module(&normalized)
+}
+
 pub(crate) fn compile_mode(args: &[String]) -> Result<()> {
     let mut output_file = "output.rs".to_string();
     let mut format = "rust".to_string();
@@ -689,9 +703,74 @@ pub(crate) fn compile_mode(args: &[String]) -> Result<()> {
         }
     }
 
+    // Adjust default output extension for wasm format
+    if format == "wasm" && output_file == "output.rs" {
+        output_file = "output.wasm".to_string();
+    }
+
     let working_dir = env::current_dir()?;
     let input_path = secure_input_path(input_file, &working_dir)?;
     let output_path = secure_output_path(&output_file, &working_dir)?;
+
+    // For wasm target/format, compile IR to WebAssembly binary
+    if format == "wasm" || target == "wasm" {
+        println!("=== Tarvos Compiler (Wasm Target) ===\\n");
+        println!("Input: {}", input_path.display());
+        println!("  [1/4] Exporting Python AST...");
+        println!("  [2/4] Parsing AST...");
+        println!("  [3/4] Type checking and lowering to IR...");
+        println!("  [4/4] Generating WebAssembly...");
+
+        let ir_module = transpile_python_to_ir(&input_path)?;
+        let wasm_bytes = compile_to_wasm(&ir_module)?;
+
+        fs::write(&output_path, &wasm_bytes)?;
+
+        println!("\\n=== Compilation Successful ===\\n");
+        println!("Output: {}", output_path.display());
+        println!("Format: WebAssembly (.wasm)");
+        println!("Size: {} bytes", wasm_bytes.len());
+
+        if !source_only {
+            println!("\\n=== WebAssembly Text Format ===\\n{}", compile_to_wat(&ir_module)?);
+        }
+
+        return Ok(());
+    }
+
+    // For cloud target/format, generate AWS Lambda-compatible Rust code
+    if format == "cloud" || target == "cloud" {
+        println!("=== Tarvos Compiler (Cloud Target: AWS Lambda) ===\\n");
+        println!("Input: {}", input_path.display());
+        println!("  [1/4] Exporting Python AST...");
+        println!("  [2/4] Parsing AST...");
+        println!("  [3/4] Type checking and lowering to IR...");
+        println!("  [4/4] Generating AWS Lambda Rust code...");
+
+        let ir_module = transpile_python_to_ir(&input_path)?;
+        let rust_source = compile_to_cloud_rust(&ir_module)?;
+
+        // Write main handler
+        fs::write(&output_path, &rust_source)?;
+
+        // Write Dockerfile alongside
+        let dockerfile_path = output_path.with_file_name("Dockerfile");
+        fs::write(&dockerfile_path, generate_dockerfile())?;
+
+        // Write serverless.yml alongside
+        let serverless_path = output_path.with_file_name("serverless.yml");
+        fs::write(&serverless_path, generate_serverless_yml())?;
+
+        println!("\\n=== Compilation Successful ===\\n");
+        println!("Output: {}", output_path.display());
+        println!("Format: AWS Lambda Rust");
+        println!("Dockerfile: {}", dockerfile_path.display());
+        println!("Serverless: {}", serverless_path.display());
+        println!("Deploy: serverless deploy");
+
+        return Ok(());
+    }
+
     let (rust_source, compatibility_launcher) = match target.as_str() {
         "native" => match transpile_python_to_rust(&input_path) {
             Ok(source) => (source, false),
@@ -707,7 +786,7 @@ pub(crate) fn compile_mode(args: &[String]) -> Result<()> {
         ),
         other => {
             return Err(anyhow::anyhow!(
-                "unsupported target `{other}`; choose `native` or `embedded`"
+                "unsupported target `{other}`; choose `native`, `embedded`, or `wasm`"
             ))
         }
     };
@@ -1242,30 +1321,65 @@ fn prepare_native_run(args: &[String]) -> Result<(PathBuf, Vec<String>)> {
         .ok_or_else(|| anyhow::anyhow!("usage: tarvos run <file.py> [args...]"))?;
     let working_dir = env::current_dir()?;
     let input_path = secure_input_path(input_file, &working_dir)?;
-    let rust_source = transpile_python_to_rust(&input_path)?;
-    let temp_dir = tarvos_cache_dir()?.join("runs");
+
+    // --- Incremental cache pipeline: source → IR → Rust → Binary ---
+    let cache = cache::IncrementalCache::new()?;
+    let source = std::fs::read_to_string(&input_path)
+        .with_context(|| format!("failed to read {}", input_path.display()))?;
+    let source_hash = cache::IncrementalCache::hash_source(&source);
+
+    // Stage 1: IR (from source)
+    let ir_json = if let Some(cached) = cache.get_ir(source_hash)? {
+        println!("Cache hit: IR stage");
+        cached
+    } else {
+        println!("Cache miss: IR stage — parsing & lowering...");
+        let ir_module = transpile_python_to_ir(&input_path)?;
+        let ir_json = serde_json::to_string(&ir_module)?;
+        cache.put_ir(source_hash, &ir_json)?;
+        ir_json
+    };
+
+    // Stage 2: Rust (from IR)
+    let ir_hash = cache::IncrementalCache::hash_bytes(ir_json.as_bytes());
+    let rust_source = if let Some(cached) = cache.get_rust(ir_hash)? {
+        println!("Cache hit: Rust stage");
+        cached
+    } else {
+        println!("Cache miss: Rust stage — codegen...");
+        let ir_module: tarvos_ir::Module = serde_json::from_str(&ir_json)?;
+        let rust_source = tarvos_codegen_rust::RustCodegen::generate(&ir_module)?;
+        cache.put_rust(ir_hash, &rust_source)?;
+        rust_source
+    };
+
+    // Stage 3: Binary (from Rust)
+    let rust_hash = cache::IncrementalCache::hash_bytes(rust_source.as_bytes());
+    let temp_dir = cache.root.join("runs");
     fs::create_dir_all(&temp_dir).with_context(|| {
         format!(
             "failed to create user cache directory {}",
             temp_dir.display()
         )
     })?;
-    let mut source_hasher = std::collections::hash_map::DefaultHasher::new();
-    "tarvos-run-cache-v2-fast".hash(&mut source_hasher);
-    rust_source.hash(&mut source_hasher);
     let exe_path = temp_dir.join(format!(
         "{}-{:016x}{}",
         input_path.file_stem().unwrap_or_default().to_string_lossy(),
-        source_hasher.finish(),
+        rust_hash,
         if cfg!(windows) { ".exe" } else { "" }
     ));
-    if exe_path.is_file() {
-        println!("Using cached native executable: {}", exe_path.display());
+
+    if let Some(cached_bin) = cache.get_binary(rust_hash)? {
+        println!("Cache hit: Binary stage — using cached executable");
+        Ok((cached_bin, args[1..].to_vec()))
     } else {
-        println!("Compiling native executable for rapid execution...");
+        println!("Cache miss: Binary stage — compiling native executable...");
         compile_rust_binary_opt(&exe_path, &rust_source, true)?;
+        let metadata = std::fs::metadata(&exe_path)
+            .with_context(|| format!("failed to stat {}", exe_path.display()))?;
+        cache.put_binary(rust_hash, &exe_path, metadata.len())?;
+        Ok((exe_path, args[1..].to_vec()))
     }
-    Ok((exe_path, args[1..].to_vec()))
 }
 
 fn execute_native_run(exe_path: &Path, args: &[String]) -> Result<()> {
@@ -2748,8 +2862,16 @@ pub(crate) fn benchmark_mode(args: &[String]) -> Result<()> {
         .cloned()
         .unwrap_or_else(|| "examples/simple.rs".to_string());
 
-    let caller_dir = env::current_dir()?;
-    let repo_root = resolve_repo_root(&caller_dir)?;
+    // Use CARGO_MANIFEST_DIR to locate the repo root, so the command works
+    // from any directory (like `validate` does), not just the project root.
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let manifest_dir = PathBuf::from(manifest_dir);
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(&manifest_dir)
+        .to_path_buf();
+
     let python_script = repo_root.join("benchmarks").join("run_benchmarks.py");
     if !python_script.exists() {
         return Err(anyhow::anyhow!(
@@ -2758,10 +2880,10 @@ pub(crate) fn benchmark_mode(args: &[String]) -> Result<()> {
         ));
     }
 
-    let input_path = resolve_readable_path(input_file, &caller_dir)
+    let input_path = secure_input_path(input_file, &env::current_dir()?)
         .with_context(|| format!("benchmark input: {}", input_file))?;
     let reference_path = if args.get(1).is_some() {
-        resolve_readable_path(&reference_file, &caller_dir)
+        secure_input_path(&reference_file, &env::current_dir()?)
             .with_context(|| format!("benchmark reference: {}", reference_file))?
     } else {
         secure_input_path(&reference_file, &repo_root)?
@@ -2836,87 +2958,36 @@ pub(crate) fn benchmark_mode(args: &[String]) -> Result<()> {
 ///    checkout still finds the repository it was shipped with.
 /// 4. The build-time path, used only when it still exists, which keeps a
 ///    source build working from an unusual layout.
-fn resolve_repo_root(caller_dir: &Path) -> Result<PathBuf> {
-    if env::var_os("TARVOS_SANDBOX").is_some() {
-        return Ok(caller_dir.to_path_buf());
-    }
-    for start in [Some(caller_dir.to_path_buf()), exe_dir()] {
-        if let Some(root) = start.as_deref().and_then(find_repo_root_from) {
-            return Ok(root);
-        }
-    }
-    let compiled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..");
-    if compiled
-        .join("benchmarks")
-        .join("run_benchmarks.py")
-        .is_file()
-    {
-        return Ok(compiled);
-    }
-    Err(anyhow::anyhow!(
-        "could not locate a Tarvos checkout containing benchmarks/run_benchmarks.py.\n\
-         Looked upward from {} and from the running executable.\n\
-         `tarvos benchmark` compares a translated program against a reference Rust file and \
-         needs that harness; run it from inside a Tarvos checkout, or point TARVOS_SANDBOX at one.",
-        caller_dir.display()
-    ))
-}
-
-/// Walk up from `start` and return the first ancestor that owns the harness.
-///
-/// Split out from [`resolve_repo_root`] so the walk itself can be tested against
-/// a temporary tree. A candidate counts only when the harness is really there:
-/// a nearer directory that merely looks like a repository must not win, or the
-/// benchmark would run against the wrong tree.
-fn find_repo_root_from(start: &Path) -> Option<PathBuf> {
-    let mut current = start.to_path_buf();
-    loop {
-        if current
-            .join("benchmarks")
-            .join("run_benchmarks.py")
-            .is_file()
-        {
-            return Some(current);
-        }
-        match current.parent() {
-            Some(parent) if parent != current => current = parent.to_path_buf(),
-            _ => return None,
-        }
-    }
-}
-
-/// The directory holding the running executable, when it can be determined.
-fn exe_dir() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-}
-
-fn resolve_readable_path(input: &str, base_dir: &Path) -> Result<PathBuf> {
+fn secure_input_path(input: &str, root: &Path) -> Result<PathBuf> {
     let candidate = PathBuf::from(input);
     let absolute = if candidate.is_absolute() {
         candidate
     } else {
-        base_dir.join(candidate)
+        root.join(candidate)
     };
-    let canonical = absolute
-        .canonicalize()
-        .with_context(|| format!("file does not exist: {}", absolute.display()))?;
-    if !canonical.is_file() {
-        return Err(anyhow::anyhow!(
-            "benchmark path is not a file: {}",
-            canonical.display()
-        ));
-    }
-    Ok(canonical)
+    canonicalize_existing_path(&absolute, "resolve input path")
 }
 
-/// Print the full help, identical to `tarvos --help`.
+/// Resolve a user-supplied output path and create its parent directory.
 ///
-/// Rendered from the same clap definition as the flag, so the bare invocation
-/// can never drift from the documented one.
+/// As with `secure_input_path`, the destination is the user's own choice
+/// and is not confined to the current directory. The parent is created when
+/// missing so `tarvos build app.py -o dist/app.exe` works on a fresh checkout.
+fn secure_output_path(output: &str, root: &Path) -> Result<PathBuf> {
+    let candidate = PathBuf::from(output);
+    let absolute = if candidate.is_absolute() {
+        candidate
+    } else {
+        root.join(candidate)
+    };
+    let parent = absolute.parent().unwrap_or(root);
+    if !parent.exists() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create output directory {}", parent.display()))?;
+    }
+    Ok(absolute)
+}
+
 fn print_help() {
     eprint!("{}", Cli::command().render_long_help());
 }
@@ -2993,47 +3064,6 @@ fn which_simple(name: &str) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     Ok(Some(PathBuf::from(first)))
-}
-
-/// Resolve a user-supplied input path.
-///
-/// The path is canonicalized so relative paths, `.` segments, and symlinks
-/// resolve to one unambiguous location.
-///
-/// This deliberately does NOT confine the result to the current directory.
-/// The argument is typed by the user, so refusing a path they explicitly named
-/// ("tarvos compile /opt/app/main.py" from anywhere else) is a usability bug,
-/// not a security control: there is no untrusted input here. The boundary that
-/// does matter — a compiled module escaping its project with `..` — is enforced
-/// where the input is actually untrusted, in `tarvos_core::resolve_local_module`.
-fn secure_input_path(input: &str, root: &Path) -> Result<PathBuf> {
-    let candidate = PathBuf::from(input);
-    let absolute = if candidate.is_absolute() {
-        candidate
-    } else {
-        root.join(candidate)
-    };
-    canonicalize_existing_path(&absolute, "resolve input path")
-}
-
-/// Resolve a user-supplied output path and create its parent directory.
-///
-/// As with `secure_input_path`, the destination is the user's own choice and is
-/// not confined to the current directory. The parent is created when missing so
-/// `tarvos build app.py -o dist/app.exe` works on a fresh checkout.
-fn secure_output_path(output: &str, root: &Path) -> Result<PathBuf> {
-    let candidate = PathBuf::from(output);
-    let absolute = if candidate.is_absolute() {
-        candidate
-    } else {
-        root.join(candidate)
-    };
-    let parent = absolute.parent().unwrap_or(root);
-    if !parent.exists() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create output directory {}", parent.display()))?;
-    }
-    Ok(absolute)
 }
 
 fn normalize_windows_path(path: PathBuf) -> PathBuf {

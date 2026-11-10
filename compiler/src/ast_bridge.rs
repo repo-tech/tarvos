@@ -132,6 +132,16 @@ pub enum Expr {
         iter: Box<Expr>,
         condition: Option<Box<Expr>>,
     },
+    /// `lambda params: body`.
+    ///
+    /// The bridge only builds this for the positions that lower natively — a
+    /// `sorted(key=)` argument, which the call desugar carries into the
+    /// lowering stage. A lambda anywhere else is still reported as
+    /// unsupported, because the IR has no first-class function values for it.
+    Lambda {
+        args: Vec<String>,
+        body: Box<Expr>,
+    },
     /// Set literal `{1, 2}` and dictionary literal `{"a": 1}`.
     Set(Vec<Expr>),
     Dict {
@@ -230,6 +240,11 @@ pub enum CompareOperator {
     In,
     /// `x not in container`.
     NotIn,
+    /// `x is y`. Identity; the lowering stage accepts it only against `None`,
+    /// where Python's singleton makes identity and equality the same test.
+    Is,
+    /// `x is not y`.
+    IsNot,
 }
 
 /// Ruff's current module parser exposes a suite through `parse_module(...).suite()`.
@@ -333,13 +348,200 @@ impl AstBridge {
         Expr::Unsupported { kind }
     }
 
+    /// Combine a comprehension's `if` clauses into a single condition.
+    fn comprehension_condition(&mut self, ifs: &[pyast::Expr]) -> Option<Box<Expr>> {
+        match ifs.len() {
+            0 => None,
+            1 => Some(Box::new(self.expr(&ifs[0]))),
+            _ => Some(Box::new(Expr::BoolOp {
+                operator: "and".to_string(),
+                values: ifs.iter().map(|test| self.expr(test)).collect(),
+            })),
+        }
+    }
+
+    /// Lower a comprehension — list, dict view, or consuming generator — with
+    /// any number of `for` clauses.
+    ///
+    /// The IR models exactly one generator per comprehension, so extra clauses
+    /// are lowered as nested comprehensions: the innermost clause builds the
+    /// element, each clause above it wraps that in its own loop, and every
+    /// level above the innermost is passed through `__tarvos_flatten` so the
+    /// final value is the single flat list Python produces. In shape,
+    /// `[x * y for x in A for y in B]` becomes
+    /// `__tarvos_flatten([[x * y for y in B] for x in A])`.
+    ///
+    /// Returns `None` when a clause is outside the subset (async, or a tuple
+    /// target); the caller then reports the node as unsupported.
+    fn comprehension(&mut self, elt: Expr, generators: &[pyast::Comprehension]) -> Option<Expr> {
+        let last = generators.last()?;
+        if last.is_async {
+            return None;
+        }
+        let pyast::Expr::Name(target) = &last.target else {
+            return None;
+        };
+        let target = target.id.as_str().to_owned();
+        let iter = self.expr(&last.iter);
+        let condition = self.comprehension_condition(&last.ifs);
+        let mut current = Expr::ListComp {
+            elt: Box::new(elt),
+            target,
+            iter: Box::new(iter),
+            condition,
+        };
+        for generator in generators[..generators.len() - 1].iter().rev() {
+            if generator.is_async {
+                return None;
+            }
+            let pyast::Expr::Name(target) = &generator.target else {
+                return None;
+            };
+            let target = target.id.as_str().to_owned();
+            let iter = self.expr(&generator.iter);
+            let condition = self.comprehension_condition(&generator.ifs);
+            let inner = std::mem::replace(&mut current, Expr::None);
+            let rows = Expr::ListComp {
+                elt: Box::new(inner),
+                target,
+                iter: Box::new(iter),
+                condition,
+            };
+            current = Expr::Call {
+                function: Box::new(Expr::Name("__tarvos_flatten".to_string())),
+                args: vec![rows],
+            };
+        }
+        Some(current)
+    }
+
+    /// Lower an expression in a position the surrounding call consumes.
+    ///
+    /// A generator expression here — `sum(x * 0.5 for x in xs)` — is
+    /// materialized as a list, because every consuming builtin walks the whole
+    /// sequence and eager evaluation is observationally identical whenever the
+    /// element expression is pure, which is the only case the native backend
+    /// compiles anyway. A generator that escapes this position (bound to a
+    /// name, stored in a field) is still reported as unsupported: that would
+    /// need a lazy iterator object the IR does not model.
+    fn expr_consuming(&mut self, expr: &pyast::Expr) -> Expr {
+        match expr {
+            pyast::Expr::Generator(generator) => {
+                let elt = self.expr(&generator.elt);
+                match self.comprehension(elt, &generator.generators) {
+                    Some(comprehension) => comprehension,
+                    None => self.bad_expr(expr),
+                }
+            }
+            _ => self.expr(expr),
+        }
+    }
+
+    /// Extract the single parameter and lowered body of `lambda p: body`.
+    ///
+    /// Returns `None` for any other lambda shape — no parameters, several
+    /// parameters, defaults, `*args`/`**kwargs`, keyword-only parameters —
+    /// which the caller reports as unsupported rather than mis-binding.
+    fn lambda_pair(&mut self, lambda: &pyast::ExprLambda) -> Option<(String, Expr)> {
+        let parameters = lambda.parameters.as_deref()?;
+        if !parameters.posonlyargs.is_empty()
+            || parameters.args.len() != 1
+            || !parameters.kwonlyargs.is_empty()
+            || parameters.vararg.is_some()
+            || parameters.kwarg.is_some()
+        {
+            return None;
+        }
+        let parameter = &parameters.args[0];
+        if parameter.default.is_some() {
+            return None;
+        }
+        let name = parameter.parameter.name.as_str().to_owned();
+        let body = self.expr(&lambda.body);
+        Some((name, body))
+    }
+
+    /// Desugar `map(func, iterable)` / `filter(func, iterable)` into the
+    /// comprehension the native backend already compiles.
+    ///
+    /// `map` is `[body(p) for p in xs]` and `filter` is
+    /// `[p for p in xs if body(p)]` — the same eager list CPython's consumers
+    /// (`list`, `sum`, a `for` loop) build from the iterator anyway. The first
+    /// argument may be a lambda or a named function; anything else, any
+    /// keyword, and any second iterable (which would zip) return `None` so the
+    /// call falls through to the ordinary path and its diagnostic.
+    fn map_or_filter_call(&mut self, filter: bool, arguments: &pyast::Arguments) -> Option<Expr> {
+        if !arguments.keywords.is_empty() || arguments.args.len() != 2 {
+            return None;
+        }
+        let (param, body) = match &arguments.args[0] {
+            pyast::Expr::Lambda(lambda) => self.lambda_pair(lambda)?,
+            // A named function binds the same way: the comprehension parameter
+            // shadows the enclosing scope exactly like Python's own
+            // comprehension scope, so the generated name cannot collide with
+            // anything the element expression reads.
+            pyast::Expr::Name(_) => (
+                "__tarvos_item".to_string(),
+                Expr::Call {
+                    function: Box::new(self.expr(&arguments.args[0])),
+                    args: vec![Expr::Name("__tarvos_item".to_string())],
+                },
+            ),
+            _ => return None,
+        };
+        let iter = self.expr(&arguments.args[1]);
+        let (elt, condition) = if filter {
+            (Expr::Name(param.clone()), Some(Box::new(body)))
+        } else {
+            (body, None)
+        };
+        Some(Expr::ListComp {
+            elt: Box::new(elt),
+            target: param,
+            iter: Box::new(iter),
+            condition,
+        })
+    }
+
+    /// Desugar `sorted(values, key=lambda p: body)` into a native sort call.
+    ///
+    /// The keyword is consumed here rather than dropped: the lambda travels
+    /// as an `Expr::Lambda` the lowering stage binds to the element type, and
+    /// the emitter inlines its body into `sort_by_key`, which is stable and
+    /// therefore keeps Python's ordering of equal keys. Any other keyword
+    /// shape returns `None` and falls through to the keyword diagnostic.
+    fn sorted_by_key_call(&mut self, arguments: &pyast::Arguments) -> Option<Expr> {
+        if arguments.args.len() != 1 || arguments.keywords.len() != 1 {
+            return None;
+        }
+        let keyword = &arguments.keywords[0];
+        if keyword.arg.as_ref().map(|arg| arg.as_str()) != Some("key") {
+            return None;
+        }
+        let pyast::Expr::Lambda(lambda) = &keyword.value else {
+            return None;
+        };
+        let (param, body) = self.lambda_pair(lambda)?;
+        let values = self.expr(&arguments.args[0]);
+        Some(Expr::Call {
+            function: Box::new(Expr::Name("__tarvos_sorted_by_key".to_string())),
+            args: vec![
+                values,
+                Expr::Lambda {
+                    args: vec![param],
+                    body: Box::new(body),
+                },
+            ],
+        })
+    }
+
     /// Map a Python comparison operator onto the shared Tarvos operator set.
     ///
-    /// Returns `None` for the ordering operators outside the native subset
-    /// (`is`, `in`, ...), so the caller can retain the node and report an
-    /// explicit diagnostic instead of mis-compiling it.
-    fn compare_operator(op: pyast::CmpOp) -> Option<CompareOperator> {
-        Some(match op {
+    /// Every `CmpOp` Ruff can produce has a native counterpart, including the
+    /// membership and identity pairs that once fell back to the compatibility
+    /// runtime.
+    fn compare_operator(op: pyast::CmpOp) -> CompareOperator {
+        match op {
             pyast::CmpOp::Eq => CompareOperator::Eq,
             pyast::CmpOp::NotEq => CompareOperator::NotEq,
             pyast::CmpOp::Lt => CompareOperator::Lt,
@@ -352,8 +554,13 @@ impl AstBridge {
             // `BinaryOp::In` in place they are just comparisons.
             pyast::CmpOp::In => CompareOperator::In,
             pyast::CmpOp::NotIn => CompareOperator::NotIn,
-            _ => return None,
-        })
+            // `None` is a singleton in Python, so `x is None` is exactly an
+            // equality test. The lowering stage rejects any other `is`
+            // against a non-None operand rather than approximating identity
+            // as equality.
+            pyast::CmpOp::Is => CompareOperator::Is,
+            pyast::CmpOp::IsNot => CompareOperator::IsNot,
+        }
     }
 
     /// True when duplicating the expression cannot change program behaviour.
@@ -640,34 +847,30 @@ impl AstBridge {
                     .as_deref()
                     .map(|value| Box::new(self.expr(value))),
             },
-            pyast::Expr::ListComp(comprehension) => {
-                // The native subset covers the single-generator form, which is also
-                // the only one the shared IR can represent.
-                if comprehension.generators.len() != 1 {
-                    return self.bad_expr(expr);
+            pyast::Expr::ListComp(node) => {
+                // The shared IR models a single generator; extra `for` clauses
+                // are nested and flattened inside `comprehension`.
+                let elt = self.expr(&node.elt);
+                match self.comprehension(elt, &node.generators) {
+                    Some(comprehension) => comprehension,
+                    None => self.bad_expr(expr),
                 }
-                let generator = &comprehension.generators[0];
-                if generator.is_async {
-                    return self.bad_expr(expr);
-                }
-                let pyast::Expr::Name(target) = &generator.target else {
-                    // Tuple targets (`for a, b in ...`) are outside the subset.
+            }
+            pyast::Expr::DictComp(node) => {
+                // `{key: value for ...}` lowers through machinery that already
+                // exists: a comprehension of `(key, value)` pairs fed to a
+                // helper that collects them into a map, which is exactly what
+                // `dict(...)` would do with the same pairs.
+                let Some(key) = node.key.as_deref() else {
                     return self.bad_expr(expr);
                 };
-                // Multiple filters are combined with `and`.
-                let condition = match generator.ifs.len() {
-                    0 => None,
-                    1 => Some(Box::new(self.expr(&generator.ifs[0]))),
-                    _ => Some(Box::new(Expr::BoolOp {
-                        operator: "and".to_string(),
-                        values: generator.ifs.iter().map(|test| self.expr(test)).collect(),
-                    })),
-                };
-                Expr::ListComp {
-                    elt: Box::new(self.expr(&comprehension.elt)),
-                    target: target.id.as_str().to_owned(),
-                    iter: Box::new(self.expr(&generator.iter)),
-                    condition,
+                let pairs = Expr::Tuple(vec![self.expr(key), self.expr(&node.value)]);
+                match self.comprehension(pairs, &node.generators) {
+                    Some(comprehension) => Expr::Call {
+                        function: Box::new(Expr::Name("__tarvos_dict_of".to_string())),
+                        args: vec![comprehension],
+                    },
+                    None => self.bad_expr(expr),
                 }
             }
             pyast::Expr::Set(set) => {
@@ -733,10 +936,7 @@ impl AstBridge {
                 }
                 let mut operators = Vec::with_capacity(v.ops.len());
                 for op in &v.ops {
-                    let Some(operator) = Self::compare_operator(*op) else {
-                        return self.bad_expr(expr);
-                    };
-                    operators.push(operator);
+                    operators.push(Self::compare_operator(*op));
                 }
 
                 if operators.len() == 1 {
@@ -778,6 +978,30 @@ impl AstBridge {
                 }
             }
             pyast::Expr::Call(v) => {
+                // A few calls are recognized before the ordinary path: they
+                // consume their arguments (or their keyword) into a shape the
+                // backend already compiles, instead of dropping information
+                // the program depends on.
+                if let pyast::Expr::Name(name) = v.func.as_ref() {
+                    match name.id.as_str() {
+                        "sorted" => {
+                            if let Some(desugared) = self.sorted_by_key_call(&v.arguments) {
+                                return desugared;
+                            }
+                        }
+                        "map" => {
+                            if let Some(desugared) = self.map_or_filter_call(false, &v.arguments) {
+                                return desugared;
+                            }
+                        }
+                        "filter" => {
+                            if let Some(desugared) = self.map_or_filter_call(true, &v.arguments) {
+                                return desugared;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 // A keyword argument is currently dropped by the bridge, which is
                 // worse than an error: `quantiles(data, n=2)` would silently
                 // compile as `quantiles(data)`. Reporting it routes the program
@@ -798,7 +1022,7 @@ impl AstBridge {
                         .arguments
                         .args
                         .iter()
-                        .map(|value| self.expr(value))
+                        .map(|value| self.expr_consuming(value))
                         .collect(),
                 }
             }

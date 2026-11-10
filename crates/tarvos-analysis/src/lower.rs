@@ -2033,6 +2033,7 @@ impl Lowerer {
             }),
             Value::Index { element_type, .. } => Ok(element_type.clone()),
             Value::Slice { container_type, .. } => Ok(container_type.clone()),
+            Value::MethodCall { return_type, .. } => Ok(return_type.clone()),
             Value::FormatString { .. } => Ok(Type::String),
         }
     }
@@ -2123,6 +2124,10 @@ impl Lowerer {
             // The third tuple slot is the operator, not a type, so only the
             // operand positions are tested.
             (Type::Dynamic, _, _) | (_, Type::Dynamic, _) => Ok(Type::Dynamic),
+            // A Union operand makes the result Dynamic: we don't know which
+            // concrete type the value will have at run time, so the codegen
+            // emits a call to __tarvos_binop for runtime dispatch.
+            (Type::Union(_), _, _) | (_, Type::Union(_), _) => Ok(Type::Dynamic),
             _ => bail!("unsupported operation: {} {} {}", left, op.symbol(), right),
         }
     }
