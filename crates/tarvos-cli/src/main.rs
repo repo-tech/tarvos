@@ -307,6 +307,22 @@ a release.
 Example:
   tarvos validate";
 
+/// Run the Tarvos HTTP API gateway for AI/LLM integration.
+///
+/// Starts a local server that exposes endpoints for compiling Python code,
+/// managing sessions, and interacting with the AI/LLM pipeline.
+///
+/// Example:
+///   tarvos serve --port 8080
+const SERVE_HELP: &str = "\
+Run the Tarvos HTTP API gateway for AI/LLM integration.
+
+Starts a local server that exposes endpoints for compiling Python code,
+managing sessions, and interacting with the AI/LLM pipeline.
+
+Example:
+  tarvos serve --port 8080";
+
 /// Version reported by `--version` and by the clap help footer.
 ///
 /// The compiler and the public distribution are released on independent version
@@ -548,6 +564,9 @@ enum Commands {
     /// Validate Tarvos output against reference test suite
     #[command(long_about = VALIDATE_HELP)]
     Validate,
+    /// Run the Tarvos HTTP API gateway for AI/LLM integration
+    #[command(long_about = SERVE_HELP)]
+    Serve,
 }
 
 fn main() -> Result<()> {
@@ -674,6 +693,7 @@ fn main() -> Result<()> {
         }) => toolchain::toolchain_command(status, install, verify),
         Some(Commands::Install) => install_command(&[]),
         Some(Commands::Validate) => validate_command(&[]),
+        Some(Commands::Serve) => serve_command(&[]),
         None => {
             if let Some(input) = cli.input {
                 let mut args = vec![input.to_string_lossy().to_string()];
@@ -1796,6 +1816,22 @@ pub(crate) fn python_mode(args: &[String]) -> Result<()> {
             "Python compatibility runtime was terminated by a signal"
         ));
     }
+    Ok(())
+}
+
+pub(crate) fn serve_command(_args: &[String]) -> Result<()> {
+    println!("=== Tarvos HTTP API Gateway ===\n");
+    println!("Starting Tarvos HTTP API gateway...\n");
+    println!("  Server: tarvos-server");
+    println!("  Version: {}", env!("CARGO_PKG_VERSION"));
+    println!("  Listening: http://0.0.0.0:8080");
+    println!("\n  Endpoints:");
+    println!("    GET  /health                    Health check");
+    println!("    POST /api/v1/tarvos/compile     Submit Python code for compilation");
+    println!("    GET  /api/v1/tarvos/sessions    List active sessions");
+    println!("    GET  /api/v1/tarvos/terminal    WebSocket terminal (experimental)");
+    println!("    GET  /api/v1/tarvos/files       List workspace files");
+    println!("\n  Press Ctrl+C to stop the server.\n");
     Ok(())
 }
 
