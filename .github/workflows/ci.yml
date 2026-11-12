@@ -46,7 +46,7 @@ jobs:
       # outside the checkout, where rust-toolchain.toml is not visible. Without
       # this the CLI's rustup lookup resolves whatever the runner default is,
       # so the same source would build differently on different days.
-      RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-gnu
+      RUSTUP_TOOLCHAIN: ${{ matrix.os == 'windows-latest' && 'stable-x86_64-pc-windows-gnu' || 'stable-x86_64-unknown-linux-gnu' }}
     strategy:
       fail-fast: false
       matrix:
@@ -180,7 +180,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-gnu
+      RUSTUP_TOOLCHAIN: stable-x86_64-unknown-linux-gnu
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -234,7 +234,7 @@ jobs:
   # VIRTUAL_ENV, and no interpreter on the lookup path.
   standalone:
     env:
-      RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-gnu
+      RUSTUP_TOOLCHAIN: ${{ matrix.os == 'windows-latest' && 'stable-x86_64-pc-windows-gnu' || 'stable-x86_64-unknown-linux-gnu' }}
     name: Standalone artifact
     needs: quality
     runs-on: ${{ matrix.os }}
@@ -353,7 +353,7 @@ jobs:
 
   native:
     env:
-      RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-gnu
+      RUSTUP_TOOLCHAIN: ${{ matrix.os == 'windows-latest' && 'stable-x86_64-pc-windows-gnu' || 'stable-x86_64-unknown-linux-gnu' }}
     # A static job name. GitHub renders a matrix expression in `name` literally,
     # so the run list shows "native parity (${{ matrix.os }})" instead of a
     # usable job name, and a failure notification becomes an unreadable string.
