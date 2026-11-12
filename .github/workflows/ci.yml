@@ -56,7 +56,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable-x86_64-pc-windows-gnu
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
@@ -196,7 +196,7 @@ jobs:
         # version in a `with:` block, which `scripts/check_toolchain_pin.py`
         # reads as an unpinned install: the action could change what `@master`
         # does at any time while the gates below it assumed 1.98.0.
-        uses: dtolnay/rust-toolchain@stable-x86_64-pc-windows-gnu
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
@@ -248,7 +248,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable-x86_64-pc-windows-gnu
+        uses: dtolnay/rust-toolchain@stable
 
       # Deliberately NOT installed: Python, any third-party package, and the
       # Tarvos CLI itself. The build uses the managed toolchain under
@@ -371,7 +371,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable-x86_64-pc-windows-gnu
+        uses: dtolnay/rust-toolchain@stable
 
       # CPython is the *oracle* for the differential suite, so its version is a
       # correctness boundary, not a preference. It is pinned to 3.12 deliberately:
@@ -503,7 +503,7 @@ jobs:
           echo "cargo  : $(cargo --version)"
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable-x86_64-pc-windows-gnu
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 

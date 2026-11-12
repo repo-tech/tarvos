@@ -142,7 +142,7 @@ jobs:
           python-version: "3.12"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable-x86_64-pc-windows-gnu
+        uses: dtolnay/rust-toolchain@stable
 
       # Validation compiles Rust *through* the Tarvos CLI, which prefers its own
       # managed toolchain. Without this the validation step measures the
@@ -217,7 +217,7 @@ jobs:
           python-version: "3.12"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable-x86_64-pc-windows-gnu
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo and build output
         uses: actions/cache@v4
@@ -293,7 +293,7 @@ jobs:
           ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Set up the pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@stable-x86_64-pc-windows-gnu
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo and build output
         uses: actions/cache@v4

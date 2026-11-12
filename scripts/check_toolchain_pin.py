@@ -32,6 +32,21 @@ CHANNEL = re.compile(r'^\s*channel\s*=\s*"([^"]+)"', re.MULTILINE)
 TOOLCHAIN_ACTION = re.compile(r"dtolnay/rust-toolchain@([^\s]+)")
 
 
+def _channel_prefix(pinned: str) -> str:
+    """Strip target-triplet suffix from a pinned toolchain string.
+
+    rust-toolchain.toml may pin ``stable-x86_64-pc-windows-gnu`` but the
+    dtolnay/rust-toolchain GitHub Action accepts only the channel name
+    (``stable``) in its ``@`` ref.  This helper normalizes both sides so the
+    comparison is meaningful.
+    """
+    # Exact version pin (e.g. ``1.98.0``) — no target triplet possible.
+    if pinned[0].isdigit():
+        return pinned
+    # Channel with optional target-triplet suffix: ``stable``, ``stable-x86_64-pc-windows-gnu``
+    return pinned.split("-")[0]
+
+
 def main() -> int:
     if not TOOLCHAIN_FILE.is_file():
         print(f"fail  missing {TOOLCHAIN_FILE.relative_to(ROOT)}")
@@ -48,6 +63,10 @@ def main() -> int:
         )
         return 1
 
+    # Normalize: strip target-triplet so ``stable-x86_64-pc-windows-gnu``
+    # compares equal to the workflow's ``@stable`` ref.
+    pinned_prefix = _channel_prefix(pinned)
+
     failures = 0
     for workflow in WORKFLOWS:
         if not workflow.is_file():
@@ -57,8 +76,9 @@ def main() -> int:
             print(f"ok    {workflow.relative_to(ROOT)} (no toolchain step)")
             continue
         for used in sorted(found):
-            if used == pinned:
-                print(f"ok    {workflow.relative_to(ROOT)} uses {pinned}")
+            used_prefix = _channel_prefix(used)
+            if used_prefix == pinned_prefix:
+                print(f"ok    {workflow.relative_to(ROOT)} uses {used} (channel {pinned_prefix})")
             else:
                 failures += 1
                 print(
