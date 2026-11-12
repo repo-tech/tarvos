@@ -1,0 +1,24 @@
+[package]
+name = "tarvos-codegen-cranelift"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = "1"
+tarvos-ir = { path = "../tarvos-ir" }
+tarvos-types = { path = "../tarvos-types" }
+cranelift-codegen = "0.110"
+cranelift-frontend = "0.110"
+cranelift-entity = "0.110"
+target-lexicon = "0.13"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "z"
+codegen-units = 1
+lto = true
+debug = 0
+panic = "abort"
+strip = true

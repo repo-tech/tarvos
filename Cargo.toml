@@ -14,6 +14,7 @@ members = [
     "crates/tarvos-codegen-rust",
     "crates/tarvos-codegen-wasm",
     "crates/tarvos-codegen-cloud",
+    "crates/tarvos-codegen-cranelift",
     "crates/tarvos-tests",
 ]
 
