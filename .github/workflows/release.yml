@@ -142,7 +142,7 @@ jobs:
           python-version: "3.12"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@stable-x86_64-pc-windows-gnu
 
       # Validation compiles Rust *through* the Tarvos CLI, which prefers its own
       # managed toolchain. Without this the validation step measures the
@@ -161,9 +161,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-rust-1.98.0-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-rust-stable-x86_64-pc-windows-gnu-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-rust-1.98.0-
+            ${{ runner.os }}-rust-stable-x86_64-pc-windows-gnu-
       - name: Verify the pinned toolchain is consistent
         run: python scripts/check_toolchain_pin.py
 
@@ -217,7 +217,7 @@ jobs:
           python-version: "3.12"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@stable-x86_64-pc-windows-gnu
 
       - name: Cache Cargo and build output
         uses: actions/cache@v4
@@ -229,9 +229,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-rust-1.98.0-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-rust-stable-x86_64-pc-windows-gnu-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-rust-1.98.0-
+            ${{ runner.os }}-rust-stable-x86_64-pc-windows-gnu-
       # Measurement, not a gate. The numbers are attached to the run as
       # evidence for the release notes; publication does not wait on them, so a
       # slow or busy runner cannot block a release. Nothing is suppressed: a
@@ -293,7 +293,7 @@ jobs:
           ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Set up the pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@stable-x86_64-pc-windows-gnu
 
       - name: Cache Cargo and build output
         uses: actions/cache@v4
@@ -305,9 +305,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-rust-1.98.0-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-rust-stable-x86_64-pc-windows-gnu-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-rust-1.98.0-
+            ${{ runner.os }}-rust-stable-x86_64-pc-windows-gnu-
       - name: Report build context
         shell: bash
         run: |
