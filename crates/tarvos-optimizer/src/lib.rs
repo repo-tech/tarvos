@@ -1938,7 +1938,241 @@ impl Optimizer {
     }
 
     fn strength_reduction(module: &Module) -> Result<Module> {
-        Ok(module.clone())
+        let statements = Self::sr_block(&module.statements)?;
+        Ok(Module { statements })
+    }
+
+    fn sr_block(stmts: &[Stmt]) -> Result<Vec<Stmt>> {
+        let mut result: Vec<Stmt> = Vec::new();
+        for stmt in stmts {
+            match stmt {
+                Stmt::Let { name, ty, value } => {
+                    let new_val = Self::sr_value(value)?;
+                    result.push(Stmt::Let {
+                        name: name.clone(),
+                        ty: ty.clone(),
+                        value: new_val,
+                    });
+                }
+                Stmt::Assign { name, value } => {
+                    let new_val = Self::sr_value(value)?;
+                    result.push(Stmt::Assign {
+                        name: name.clone(),
+                        value: new_val,
+                    });
+                }
+                Stmt::If { test, body, orelse } => {
+                    let new_body = Self::sr_block(&body)?;
+                    let new_orelse = Self::sr_block(&orelse)?;
+                    result.push(Stmt::If {
+                        test: test.clone(),
+                        body: new_body,
+                        orelse: new_orelse,
+                    });
+                }
+                Stmt::For { target, iter, iter_type, body } => {
+                    let new_body = Self::sr_block(&body)?;
+                    result.push(Stmt::For {
+                        target: target.clone(),
+                        iter: iter.clone(),
+                        iter_type: iter_type.clone(),
+                        body: new_body,
+                    });
+                }
+                Stmt::While { test, body } => {
+                    let new_body = Self::sr_block(&body)?;
+                    result.push(Stmt::While {
+                        test: test.clone(),
+                        body: new_body,
+                    });
+                }
+                Stmt::Function { name, params, return_type, body } => {
+                    let new_body = Self::sr_block(&body)?;
+                    result.push(Stmt::Function {
+                        name: name.clone(),
+                        params: params.clone(),
+                        return_type: return_type.clone(),
+                        body: new_body,
+                    });
+                }
+                _ => result.push(stmt.clone()),
+            }
+        }
+        Ok(result)
+    }
+
+    /// Check if two Value references are structurally equal.
+    fn value_eq(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => x == y,
+            (Value::Int128(x), Value::Int128(y)) => x == y,
+            (Value::Float(x), Value::Float(y)) => x == y,
+            (Value::String(x), Value::String(y)) => x == y,
+            (Value::Bool(x), Value::Bool(y)) => x == y,
+            (Value::None, Value::None) => true,
+            (Value::Name(x), Value::Name(y)) => x == y,
+            (Value::Binary { left: l1, op: o1, right: r1, .. }, Value::Binary { left: l2, op: o2, right: r2, .. }) => {
+                o1 == o2 && Self::value_eq(l1, l2) && Self::value_eq(r1, r2)
+            }
+            (Value::Unary { op: o1, operand: op1, .. }, Value::Unary { op: o2, operand: op2, .. }) => {
+                o1 == o2 && Self::value_eq(op1, op2)
+            }
+            _ => false,
+        }
+    }
+
+    /// Apply strength reduction to a value expression.
+    ///
+    /// Transformations:
+    ///   x * 2^n → x << n        (power of 2 multiply)
+    ///   x / 2^n → x >> n        (power of 2 divide)
+    ///   x * 1 → x               (multiply by identity)
+    ///   x + 0 → x               (additive identity)
+    ///   x - 0 → x               (subtractive identity)
+    ///   x - x → 0               (self-subtraction)
+    fn sr_value(value: &Value) -> Result<Value> {
+        match value {
+            Value::Binary {
+                left,
+                op: BinaryOp::Mul,
+                right,
+                ty,
+            } => {
+                // x * 1 → x
+                if let Value::Int(1) = right.as_ref() {
+                    return Ok(*left.clone());
+                }
+                // 1 * x → x
+                if let Value::Int(1) = left.as_ref() {
+                    return Ok(*right.clone());
+                }
+                // x * 2^n → x << n
+                if let Value::Int(n) = right.as_ref() {
+                    if *n > 0 && (*n & (*n - 1)) == 0 {
+                        let shift = (*n as f64).log2() as u32;
+                        if shift < 63 {
+                            return Ok(Value::Binary {
+                                left: left.clone(),
+                                op: BinaryOp::LShift,
+                                right: Box::new(Value::Int(shift as i64)),
+                                ty: ty.clone(),
+                            });
+                        }
+                    }
+                }
+                // 2^n * x → x << n
+                if let Value::Int(n) = left.as_ref() {
+                    if *n > 0 && (*n & (*n - 1)) == 0 {
+                        let shift = (*n as f64).log2() as u32;
+                        if shift < 63 {
+                            return Ok(Value::Binary {
+                                left: right.clone(),
+                                op: BinaryOp::LShift,
+                                right: Box::new(Value::Int(shift as i64)),
+                                ty: ty.clone(),
+                            });
+                        }
+                    }
+                }
+                Ok(Value::Binary {
+                    left: Box::new(Self::sr_value(left.as_ref())?),
+                    op: BinaryOp::Mul,
+                    right: Box::new(Self::sr_value(right.as_ref())?),
+                    ty: ty.clone(),
+                })
+            }
+            Value::Binary {
+                left,
+                op: BinaryOp::Div,
+                right,
+                ty,
+            } => {
+                // x / 1 → x
+                if let Value::Int(1) = right.as_ref() {
+                    return Ok(*left.clone());
+                }
+                // x / 2^n → x >> n
+                if let Value::Int(n) = right.as_ref() {
+                    if *n > 0 && (*n & (*n - 1)) == 0 {
+                        let shift = (*n as f64).log2() as u32;
+                        if shift < 63 {
+                            return Ok(Value::Binary {
+                                left: left.clone(),
+                                op: BinaryOp::RShift,
+                                right: Box::new(Value::Int(shift as i64)),
+                                ty: ty.clone(),
+                            });
+                        }
+                    }
+                }
+                Ok(Value::Binary {
+                    left: Box::new(Self::sr_value(left.as_ref())?),
+                    op: BinaryOp::Div,
+                    right: Box::new(Self::sr_value(right.as_ref())?),
+                    ty: ty.clone(),
+                })
+            }
+            Value::Binary {
+                left,
+                op: BinaryOp::Add,
+                right,
+                ty,
+            } => {
+                // x + 0 → x
+                if let Value::Int(0) = right.as_ref() {
+                    return Ok(*left.clone());
+                }
+                // 0 + x → x
+                if let Value::Int(0) = left.as_ref() {
+                    return Ok(*right.clone());
+                }
+                Ok(Value::Binary {
+                    left: Box::new(Self::sr_value(left.as_ref())?),
+                    op: BinaryOp::Add,
+                    right: Box::new(Self::sr_value(right.as_ref())?),
+                    ty: ty.clone(),
+                })
+            }
+            Value::Binary {
+                left,
+                op: BinaryOp::Sub,
+                right,
+                ty,
+            } => {
+                // x - 0 → x
+                if let Value::Int(0) = right.as_ref() {
+                    return Ok(*left.clone());
+                }
+                // x - x → 0
+                if Self::value_eq(left.as_ref(), right.as_ref()) {
+                    return Ok(Value::Int(0));
+                }
+                Ok(Value::Binary {
+                    left: Box::new(Self::sr_value(left.as_ref())?),
+                    op: BinaryOp::Sub,
+                    right: Box::new(Self::sr_value(right.as_ref())?),
+                    ty: ty.clone(),
+                })
+            }
+            Value::Binary { left, op, right, ty } => Ok(Value::Binary {
+                left: Box::new(Self::sr_value(left.as_ref())?),
+                op: *op,
+                right: Box::new(Self::sr_value(right.as_ref())?),
+                ty: ty.clone(),
+            }),
+            Value::Unary { op, operand, ty } => Ok(Value::Unary {
+                op: *op,
+                operand: Box::new(Self::sr_value(operand)?),
+                ty: ty.clone(),
+            }),
+            Value::Index { container, index, element_type, container_type } => Ok(Value::Index {
+                container: Box::new(Self::sr_value(container)?),
+                index: Box::new(Self::sr_value(index)?),
+                element_type: element_type.clone(),
+                container_type: container_type.clone(),
+            }),
+            _ => Ok(value.clone()),
+        }
     }
 }
 
