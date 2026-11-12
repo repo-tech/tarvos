@@ -68,7 +68,17 @@ fair_no_fold_rust*
 *_release.pdb
 /temp-tarvos-dist/
 
-# The release job regenerates this from the distribution repository's own
-# notes. A committed copy would only ever be a stale duplicate of the notes it
-# was extracted from.
-/engine-body.md
+# CI and cache
+/.tarvos_cache/
+**/.cache/
+
+# Test artifacts
+hello_speed.exe
+demo.exe
+output_rust_out.exe
+temp_output.rs
+docs/*.pdf
+
+# Scripts
+version_tools/
+
