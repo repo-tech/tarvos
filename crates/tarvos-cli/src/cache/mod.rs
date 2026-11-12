@@ -49,7 +49,10 @@ impl IncrementalCache {
     }
 
     pub fn get_ir(&self, source_hash: u64) -> Result<Option<String>> {
-        let path = self.root.join("ir").join(format!("{:016x}.ir.json", source_hash));
+        let path = self
+            .root
+            .join("ir")
+            .join(format!("{:016x}.ir.json", source_hash));
         if path.is_file() {
             let content = std::fs::read_to_string(&path)
                 .with_context(|| format!("failed to read cached IR: {}", path.display()))?;
@@ -60,7 +63,10 @@ impl IncrementalCache {
     }
 
     pub fn put_ir(&self, source_hash: u64, ir_json: &str) -> Result<()> {
-        let path = self.root.join("ir").join(format!("{:016x}.ir.json", source_hash));
+        let path = self
+            .root
+            .join("ir")
+            .join(format!("{:016x}.ir.json", source_hash));
         std::fs::write(&path, ir_json)
             .with_context(|| format!("failed to write cached IR: {}", path.display()))?;
         self.write_meta(source_hash, CacheStage::Ir, ir_json.len() as u64)?;
@@ -88,7 +94,10 @@ impl IncrementalCache {
 
     pub fn get_binary(&self, rust_hash: u64) -> Result<Option<PathBuf>> {
         let exe_suffix = if cfg!(windows) { ".exe" } else { "" };
-        let path = self.root.join("bin").join(format!("{:016x}{}", rust_hash, exe_suffix));
+        let path = self
+            .root
+            .join("bin")
+            .join(format!("{:016x}{}", rust_hash, exe_suffix));
         if path.is_file() {
             self.touch_meta(rust_hash, CacheStage::Binary)?;
             return Ok(Some(path));
@@ -98,7 +107,10 @@ impl IncrementalCache {
 
     pub fn put_binary(&self, rust_hash: u64, binary_path: &Path, size_bytes: u64) -> Result<()> {
         let exe_suffix = if cfg!(windows) { ".exe" } else { "" };
-        let dest = self.root.join("bin").join(format!("{:016x}{}", rust_hash, exe_suffix));
+        let dest = self
+            .root
+            .join("bin")
+            .join(format!("{:016x}{}", rust_hash, exe_suffix));
         if !dest.exists() {
             std::fs::copy(binary_path, &dest)
                 .with_context(|| format!("failed to cache binary: {}", dest.display()))?;
@@ -131,13 +143,12 @@ impl IncrementalCache {
                 let path = entry.path();
                 if let Ok(metadata) = path.metadata() {
                     if let Ok(modified) = metadata.modified() {
-                        let age = now
-                            .saturating_sub(
-                                modified
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                            );
+                        let age = now.saturating_sub(
+                            modified
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                        );
                         if age > max_age_seconds {
                             let _ = std::fs::remove_file(&path);
                             removed += 1;

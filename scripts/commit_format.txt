@@ -1,0 +1,5 @@
+fix: format code to pass CI formatting checks
+
+- cargo fmt --all applied to fix formatting in lower.rs, cache/mod.rs,
+  optimizer/lib.rs, and types/lib.rs
+- CI formatting check should now pass for Windows and Linux runners

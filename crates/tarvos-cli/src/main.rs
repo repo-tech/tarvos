@@ -18,17 +18,15 @@ use commands::{
     analyze_command, benchmark_command, clean_command, doctor_command, export_command,
     init_command, install_command, validate_command,
 };
-use tarvos_analysis::{analyze_module, lower_module};
 use tarvos_analysis::native_detector::{ModuleReport, NativePlan, NativeSubsetDetector};
 use tarvos_analysis::native_specialization::{specialize_module, SpecializedLoop};
-use tarvos_core::{
-    export_python_ast as core_export_python_ast,
-    find_python_command as core_find_python_command,
-    CompilePipeline,
-    normalize_module,
-};
+use tarvos_analysis::{analyze_module, lower_module};
 use tarvos_codegen_cloud::{compile_to_cloud_rust, generate_dockerfile, generate_serverless_yml};
 use tarvos_codegen_wasm::{compile_to_wasm, compile_to_wat};
+use tarvos_core::{
+    export_python_ast as core_export_python_ast, find_python_command as core_find_python_command,
+    normalize_module, CompilePipeline,
+};
 use tarvos_parser::parse_python_ast;
 
 /// Build profile selection for `tarvos build`.
@@ -761,7 +759,10 @@ pub(crate) fn compile_mode(args: &[String]) -> Result<()> {
         println!("Size: {} bytes", wasm_bytes.len());
 
         if !source_only {
-            println!("\\n=== WebAssembly Text Format ===\\n{}", compile_to_wat(&ir_module)?);
+            println!(
+                "\\n=== WebAssembly Text Format ===\\n{}",
+                compile_to_wat(&ir_module)?
+            );
         }
 
         return Ok(());
@@ -2288,11 +2289,20 @@ fn find_python_command() -> Result<String> {
     core_find_python_command()
 }
 
-fn compile_rust_binary(output_path: &Path, rust_source: &str, build_profile: BuildProfile) -> Result<()> {
+fn compile_rust_binary(
+    output_path: &Path,
+    rust_source: &str,
+    build_profile: BuildProfile,
+) -> Result<()> {
     compile_rust_binary_opt(output_path, rust_source, false, build_profile)
 }
 
-fn compile_rust_binary_opt(output_path: &Path, rust_source: &str, fast_dev: bool, build_profile: BuildProfile) -> Result<()> {
+fn compile_rust_binary_opt(
+    output_path: &Path,
+    rust_source: &str,
+    fast_dev: bool,
+    build_profile: BuildProfile,
+) -> Result<()> {
     compile_rust_binary_toolchain(output_path, rust_source, fast_dev, false, build_profile)
 }
 

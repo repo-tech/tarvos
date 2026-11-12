@@ -2,7 +2,7 @@ use anyhow::Result;
 use tarvos_ir::Module;
 use tarvos_types::Type;
 use wasm_encoder::{
-    CodeSection, EntityType, ExportSection, ExportKind, FunctionSection, ImportSection,
+    CodeSection, EntityType, ExportKind, ExportSection, FunctionSection, ImportSection,
     Module as WasmModel, TypeSection, ValType,
 };
 
@@ -37,7 +37,7 @@ fn val_type_to_tag(ty: &Type) -> i32 {
         Type::Union(_) => TAG_INT,
         Type::Unknown => TAG_INT,
         Type::Dynamic => TAG_INT,
-    Type::MethodCall(_) => TAG_INT,
+        Type::MethodCall(_) => TAG_INT,
     }
 }
 
@@ -48,25 +48,53 @@ pub fn compile_to_wasm(module: &Module) -> Result<Vec<u8>> {
     types.function(vec![ValType::I32, ValType::I64], vec![]);
     types.function(vec![ValType::I32, ValType::I64], vec![]);
     for _ in 0..7 {
-        types.function(vec![ValType::I32, ValType::I64, ValType::I32, ValType::I64], vec![ValType::I32, ValType::I64]);
+        types.function(
+            vec![ValType::I32, ValType::I64, ValType::I32, ValType::I64],
+            vec![ValType::I32, ValType::I64],
+        );
     }
-    types.function(vec![ValType::I32, ValType::I64, ValType::I32, ValType::I64], vec![ValType::I32, ValType::I64]);
-    types.function(vec![ValType::I32, ValType::I64, ValType::I32, ValType::I64], vec![ValType::I32, ValType::I64]);
-    types.function(vec![ValType::I32, ValType::I64], vec![ValType::I32, ValType::I64]);
-    types.function(vec![ValType::I32, ValType::I64], vec![ValType::I32, ValType::I64]);
-    types.function(vec![ValType::I32, ValType::I64], vec![ValType::I32, ValType::I64]);
-    types.function(vec![ValType::I32, ValType::I64], vec![ValType::I32, ValType::I64]);
+    types.function(
+        vec![ValType::I32, ValType::I64, ValType::I32, ValType::I64],
+        vec![ValType::I32, ValType::I64],
+    );
+    types.function(
+        vec![ValType::I32, ValType::I64, ValType::I32, ValType::I64],
+        vec![ValType::I32, ValType::I64],
+    );
+    types.function(
+        vec![ValType::I32, ValType::I64],
+        vec![ValType::I32, ValType::I64],
+    );
+    types.function(
+        vec![ValType::I32, ValType::I64],
+        vec![ValType::I32, ValType::I64],
+    );
+    types.function(
+        vec![ValType::I32, ValType::I64],
+        vec![ValType::I32, ValType::I64],
+    );
+    types.function(
+        vec![ValType::I32, ValType::I64],
+        vec![ValType::I32, ValType::I64],
+    );
     wasm_module.section(&types);
     let mut imports = ImportSection::new();
     imports.import("tarvos_host", "print", EntityType::Function(13));
     imports.import("tarvos_host", "print_str", EntityType::Function(14));
     wasm_module.section(&imports);
     let mut functions = FunctionSection::new();
-    for i in 0..15 { functions.function(i as u32); }
+    for i in 0..15 {
+        functions.function(i as u32);
+    }
     wasm_module.section(&functions);
     let mut code = CodeSection::new();
     fn make_binop(tag: i32, op_instr: wasm_encoder::Instruction) -> wasm_encoder::Function {
-        let mut f = wasm_encoder::Function::new(vec![(0, ValType::I32), (1, ValType::I64), (2, ValType::I32), (3, ValType::I64)]);
+        let mut f = wasm_encoder::Function::new(vec![
+            (0, ValType::I32),
+            (1, ValType::I64),
+            (2, ValType::I32),
+            (3, ValType::I64),
+        ]);
         f.instruction(&wasm_encoder::Instruction::LocalGet(0));
         f.instruction(&wasm_encoder::Instruction::I32Const(TAG_INT));
         f.instruction(&wasm_encoder::Instruction::I32Eq);
@@ -74,7 +102,9 @@ pub fn compile_to_wasm(module: &Module) -> Result<Vec<u8>> {
         f.instruction(&wasm_encoder::Instruction::I32Const(TAG_INT));
         f.instruction(&wasm_encoder::Instruction::I32Eq);
         f.instruction(&wasm_encoder::Instruction::I32And);
-        f.instruction(&wasm_encoder::Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&wasm_encoder::Instruction::If(
+            wasm_encoder::BlockType::Result(ValType::I32),
+        ));
         f.instruction(&wasm_encoder::Instruction::LocalGet(1));
         f.instruction(&wasm_encoder::Instruction::LocalGet(3));
         f.instruction(&op_instr);
@@ -112,11 +142,18 @@ pub fn compile_to_wasm(module: &Module) -> Result<Vec<u8>> {
         code.function(&make_binop(TAG_INT, op));
     }
     {
-        let mut f = wasm_encoder::Function::new(vec![(0, ValType::I32), (1, ValType::I64), (2, ValType::I32), (3, ValType::I64)]);
+        let mut f = wasm_encoder::Function::new(vec![
+            (0, ValType::I32),
+            (1, ValType::I64),
+            (2, ValType::I32),
+            (3, ValType::I64),
+        ]);
         f.instruction(&wasm_encoder::Instruction::LocalGet(0));
         f.instruction(&wasm_encoder::Instruction::LocalGet(2));
         f.instruction(&wasm_encoder::Instruction::I32Eq);
-        f.instruction(&wasm_encoder::Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&wasm_encoder::Instruction::If(
+            wasm_encoder::BlockType::Result(ValType::I32),
+        ));
         f.instruction(&wasm_encoder::Instruction::LocalGet(1));
         f.instruction(&wasm_encoder::Instruction::LocalGet(3));
         f.instruction(&wasm_encoder::Instruction::I64Eq);
@@ -127,11 +164,18 @@ pub fn compile_to_wasm(module: &Module) -> Result<Vec<u8>> {
         code.function(&f);
     }
     {
-        let mut f = wasm_encoder::Function::new(vec![(0, ValType::I32), (1, ValType::I64), (2, ValType::I32), (3, ValType::I64)]);
+        let mut f = wasm_encoder::Function::new(vec![
+            (0, ValType::I32),
+            (1, ValType::I64),
+            (2, ValType::I32),
+            (3, ValType::I64),
+        ]);
         f.instruction(&wasm_encoder::Instruction::LocalGet(0));
         f.instruction(&wasm_encoder::Instruction::LocalGet(2));
         f.instruction(&wasm_encoder::Instruction::I32Eq);
-        f.instruction(&wasm_encoder::Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&wasm_encoder::Instruction::If(
+            wasm_encoder::BlockType::Result(ValType::I32),
+        ));
         f.instruction(&wasm_encoder::Instruction::LocalGet(1));
         f.instruction(&wasm_encoder::Instruction::LocalGet(3));
         f.instruction(&wasm_encoder::Instruction::I64Eq);
@@ -144,7 +188,12 @@ pub fn compile_to_wasm(module: &Module) -> Result<Vec<u8>> {
         code.function(&f);
     }
     {
-        let mut f = wasm_encoder::Function::new(vec![(0, ValType::I32), (1, ValType::I64), (2, ValType::I32), (3, ValType::I64)]);
+        let mut f = wasm_encoder::Function::new(vec![
+            (0, ValType::I32),
+            (1, ValType::I64),
+            (2, ValType::I32),
+            (3, ValType::I64),
+        ]);
         f.instruction(&wasm_encoder::Instruction::LocalGet(0));
         f.instruction(&wasm_encoder::Instruction::I32Const(TAG_INT));
         f.instruction(&wasm_encoder::Instruction::I32Eq);
@@ -152,7 +201,9 @@ pub fn compile_to_wasm(module: &Module) -> Result<Vec<u8>> {
         f.instruction(&wasm_encoder::Instruction::I32Const(TAG_INT));
         f.instruction(&wasm_encoder::Instruction::I32Eq);
         f.instruction(&wasm_encoder::Instruction::I32And);
-        f.instruction(&wasm_encoder::Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&wasm_encoder::Instruction::If(
+            wasm_encoder::BlockType::Result(ValType::I32),
+        ));
         f.instruction(&wasm_encoder::Instruction::LocalGet(1));
         f.instruction(&wasm_encoder::Instruction::LocalGet(3));
         f.instruction(&wasm_encoder::Instruction::I64LtS);
@@ -163,7 +214,12 @@ pub fn compile_to_wasm(module: &Module) -> Result<Vec<u8>> {
         code.function(&f);
     }
     {
-        let mut f = wasm_encoder::Function::new(vec![(0, ValType::I32), (1, ValType::I64), (2, ValType::I32), (3, ValType::I64)]);
+        let mut f = wasm_encoder::Function::new(vec![
+            (0, ValType::I32),
+            (1, ValType::I64),
+            (2, ValType::I32),
+            (3, ValType::I64),
+        ]);
         f.instruction(&wasm_encoder::Instruction::LocalGet(0));
         f.instruction(&wasm_encoder::Instruction::I32Const(TAG_INT));
         f.instruction(&wasm_encoder::Instruction::I32Eq);
@@ -171,7 +227,9 @@ pub fn compile_to_wasm(module: &Module) -> Result<Vec<u8>> {
         f.instruction(&wasm_encoder::Instruction::I32Const(TAG_INT));
         f.instruction(&wasm_encoder::Instruction::I32Eq);
         f.instruction(&wasm_encoder::Instruction::I32And);
-        f.instruction(&wasm_encoder::Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&wasm_encoder::Instruction::If(
+            wasm_encoder::BlockType::Result(ValType::I32),
+        ));
         f.instruction(&wasm_encoder::Instruction::LocalGet(1));
         f.instruction(&wasm_encoder::Instruction::LocalGet(3));
         f.instruction(&wasm_encoder::Instruction::I64GtS);
@@ -186,7 +244,9 @@ pub fn compile_to_wasm(module: &Module) -> Result<Vec<u8>> {
         f.instruction(&wasm_encoder::Instruction::LocalGet(0));
         f.instruction(&wasm_encoder::Instruction::I32Const(TAG_INT));
         f.instruction(&wasm_encoder::Instruction::I32Eq);
-        f.instruction(&wasm_encoder::Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&wasm_encoder::Instruction::If(
+            wasm_encoder::BlockType::Result(ValType::I32),
+        ));
         f.instruction(&wasm_encoder::Instruction::I64Const(0));
         f.instruction(&wasm_encoder::Instruction::LocalGet(1));
         f.instruction(&wasm_encoder::Instruction::I64Sub);
@@ -202,17 +262,23 @@ pub fn compile_to_wasm(module: &Module) -> Result<Vec<u8>> {
         f.instruction(&wasm_encoder::Instruction::LocalGet(0));
         f.instruction(&wasm_encoder::Instruction::I32Const(TAG_NONE));
         f.instruction(&wasm_encoder::Instruction::I32Eq);
-        f.instruction(&wasm_encoder::Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&wasm_encoder::Instruction::If(
+            wasm_encoder::BlockType::Result(ValType::I32),
+        ));
         f.instruction(&wasm_encoder::Instruction::I32Const(1));
         f.instruction(&wasm_encoder::Instruction::Else);
         f.instruction(&wasm_encoder::Instruction::LocalGet(0));
         f.instruction(&wasm_encoder::Instruction::I32Const(TAG_INT));
         f.instruction(&wasm_encoder::Instruction::I32Eq);
-        f.instruction(&wasm_encoder::Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&wasm_encoder::Instruction::If(
+            wasm_encoder::BlockType::Result(ValType::I32),
+        ));
         f.instruction(&wasm_encoder::Instruction::LocalGet(1));
         f.instruction(&wasm_encoder::Instruction::I64Const(0));
         f.instruction(&wasm_encoder::Instruction::I64Eq);
-        f.instruction(&wasm_encoder::Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&wasm_encoder::Instruction::If(
+            wasm_encoder::BlockType::Result(ValType::I32),
+        ));
         f.instruction(&wasm_encoder::Instruction::I32Const(1));
         f.instruction(&wasm_encoder::Instruction::Else);
         f.instruction(&wasm_encoder::Instruction::I32Const(0));
@@ -238,17 +304,23 @@ pub fn compile_to_wasm(module: &Module) -> Result<Vec<u8>> {
         f.instruction(&wasm_encoder::Instruction::LocalGet(0));
         f.instruction(&wasm_encoder::Instruction::I32Const(TAG_NONE));
         f.instruction(&wasm_encoder::Instruction::I32Eq);
-        f.instruction(&wasm_encoder::Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&wasm_encoder::Instruction::If(
+            wasm_encoder::BlockType::Result(ValType::I32),
+        ));
         f.instruction(&wasm_encoder::Instruction::I32Const(0));
         f.instruction(&wasm_encoder::Instruction::Else);
         f.instruction(&wasm_encoder::Instruction::LocalGet(0));
         f.instruction(&wasm_encoder::Instruction::I32Const(TAG_INT));
         f.instruction(&wasm_encoder::Instruction::I32Eq);
-        f.instruction(&wasm_encoder::Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&wasm_encoder::Instruction::If(
+            wasm_encoder::BlockType::Result(ValType::I32),
+        ));
         f.instruction(&wasm_encoder::Instruction::LocalGet(1));
         f.instruction(&wasm_encoder::Instruction::I64Const(0));
         f.instruction(&wasm_encoder::Instruction::I64Eq);
-        f.instruction(&wasm_encoder::Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&wasm_encoder::Instruction::If(
+            wasm_encoder::BlockType::Result(ValType::I32),
+        ));
         f.instruction(&wasm_encoder::Instruction::I32Const(0));
         f.instruction(&wasm_encoder::Instruction::Else);
         f.instruction(&wasm_encoder::Instruction::I32Const(1));
@@ -264,7 +336,21 @@ pub fn compile_to_wasm(module: &Module) -> Result<Vec<u8>> {
     let mut exports = ExportSection::new();
     exports.export("__tarvos_main", ExportKind::Func, 0);
     exports.export("__tarvos_print", ExportKind::Func, 1);
-    let names = ["__tarvos_add", "__tarvos_sub", "__tarvos_mul", "__tarvos_div", "__tarvos_mod", "__tarvos_eq", "__tarvos_neq", "__tarvos_lt", "__tarvos_gt", "__tarvos_neg", "__tarvos_not", "__tarvos_display", "__tarvos_truthiness"];
+    let names = [
+        "__tarvos_add",
+        "__tarvos_sub",
+        "__tarvos_mul",
+        "__tarvos_div",
+        "__tarvos_mod",
+        "__tarvos_eq",
+        "__tarvos_neq",
+        "__tarvos_lt",
+        "__tarvos_gt",
+        "__tarvos_neg",
+        "__tarvos_not",
+        "__tarvos_display",
+        "__tarvos_truthiness",
+    ];
     for (i, name) in names.iter().enumerate() {
         exports.export(name, ExportKind::Func, (2 + i) as u32);
     }

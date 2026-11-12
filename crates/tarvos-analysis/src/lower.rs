@@ -1017,15 +1017,16 @@ impl Lowerer {
             (MethodReceiver::Dict, "get" | "pop" | "setdefault", Type::Dict { value, .. }) => {
                 (**value).clone()
             }
-            (MethodReceiver::Dict, "keys", Type::Dict { key, .. }) => {
-                Type::Array(key.clone())
-            }
+            (MethodReceiver::Dict, "keys", Type::Dict { key, .. }) => Type::Array(key.clone()),
             (MethodReceiver::Dict, "values", Type::Dict { value, .. }) => {
                 Type::Array(value.clone())
             }
-            (MethodReceiver::Dict, "items", Type::Dict { key, value }) => Type::Array(
-                Box::new(Type::Tuple(vec![(**key).clone(), (**value).clone()])),
-            ),
+            (MethodReceiver::Dict, "items", Type::Dict { key, value }) => {
+                Type::Array(Box::new(Type::Tuple(vec![
+                    (**key).clone(),
+                    (**value).clone(),
+                ])))
+            }
             _ => return_type,
         };
 

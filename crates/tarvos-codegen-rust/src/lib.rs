@@ -2028,9 +2028,7 @@ impl RustCodegen {
     #[allow(dead_code)]
     fn statement_uses_set(stmt: &Stmt) -> bool {
         match stmt {
-            Stmt::StructDef { fields, .. } => {
-                fields.iter().any(|(_, ty)| Self::type_needs_set(ty))
-            }
+            Stmt::StructDef { fields, .. } => fields.iter().any(|(_, ty)| Self::type_needs_set(ty)),
             Stmt::Pass | Stmt::Break | Stmt::Continue | Stmt::Raise(_) => false,
             Stmt::Let { value, .. } | Stmt::Assign { value, .. } => Self::value_uses_set(value),
             Stmt::Destructure { value, .. } => Self::value_uses_set(value),
@@ -2089,7 +2087,9 @@ impl RustCodegen {
                     || Self::type_needs_set(return_type)
                     || args.iter().any(Self::value_uses_set)
             }
-            Value::Binary { left, right, ty, .. } => {
+            Value::Binary {
+                left, right, ty, ..
+            } => {
                 Self::type_needs_set(ty)
                     || Self::value_uses_set(left)
                     || Self::value_uses_set(right)
@@ -2126,10 +2126,9 @@ impl RustCodegen {
                     || upper.as_ref().is_some_and(|v| Self::value_uses_set(v))
                     || step.as_ref().is_some_and(|v| Self::value_uses_set(v))
             }
-            Value::Dict { keys, values, .. } => keys
-                .iter()
-                .chain(values.iter())
-                .any(Self::value_uses_set),
+            Value::Dict { keys, values, .. } => {
+                keys.iter().chain(values.iter()).any(Self::value_uses_set)
+            }
             Value::FormatString { parts } => parts.iter().any(|part| match part {
                 tarvos_ir::FormatPart::Value { value, .. } => Self::value_uses_set(value),
                 tarvos_ir::FormatPart::Literal(_) => false,
@@ -2153,9 +2152,7 @@ impl RustCodegen {
             Type::Set(_) => true,
             Type::Array(inner) => Self::type_needs_set(inner),
             Type::Tuple(types) => types.iter().any(Self::type_needs_set),
-            Type::Dict { key, value } => {
-                Self::type_needs_set(key) || Self::type_needs_set(value)
-            }
+            Type::Dict { key, value } => Self::type_needs_set(key) || Self::type_needs_set(value),
             _ => false,
         }
     }
@@ -3704,8 +3701,10 @@ impl RustCodegen {
             },
             // A field or slice type is not resolvable here, so fall back to
             // every impl rather than risk dropping one the program needs.
-            Value::None => {},
-            Value::Field { .. } | Value::Slice { .. } | Value::MethodCall { .. } => needs.require_all(),
+            Value::None => {}
+            Value::Field { .. } | Value::Slice { .. } | Value::MethodCall { .. } => {
+                needs.require_all()
+            }
         }
     }
 
@@ -4930,10 +4929,8 @@ impl RustCodegen {
                 } else {
                     object_str
                 };
-                let args_rendered: Result<Vec<_>, _> = args
-                    .iter()
-                    .map(|arg| Self::emit_value(arg, ctx))
-                    .collect();
+                let args_rendered: Result<Vec<_>, _> =
+                    args.iter().map(|arg| Self::emit_value(arg, ctx)).collect();
                 let args_rendered = args_rendered?;
                 let args_str = args_rendered.join(", ");
                 match method.as_str() {

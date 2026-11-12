@@ -1,6 +1,6 @@
 use anyhow::Result;
-use tarvos_ir::{FormatPart, Module, Stmt, UnaryOp, Value};
 use target_lexicon::Triple;
+use tarvos_ir::{FormatPart, Module, Stmt, UnaryOp, Value};
 
 #[allow(dead_code)]
 #[allow(dead_code)]
@@ -36,21 +36,32 @@ pub fn compile_to_clif(module: &Module) -> Result<String> {
 fn stmt_to_clif(stmt: &Stmt, indent: usize) -> Result<String> {
     let pad = "  ".repeat(indent);
     match stmt {
-        Stmt::Let { name, ty, value } => {
-            Ok(format!("{}let {} = {};  ;; type: {:?}", pad, name, value_to_clif(value)?, ty))
-        }
+        Stmt::Let { name, ty, value } => Ok(format!(
+            "{}let {} = {};  ;; type: {:?}",
+            pad,
+            name,
+            value_to_clif(value)?,
+            ty
+        )),
         Stmt::Print(values) => {
-            let vals: Vec<String> = values.iter().map(|v| value_to_clif(v)).collect::<Result<Vec<_>>>()?;
+            let vals: Vec<String> = values
+                .iter()
+                .map(|v| value_to_clif(v))
+                .collect::<Result<Vec<_>>>()?;
             Ok(format!("{}print {};", pad, vals.join(", ")))
         }
         Stmt::If { test, body, orelse } => {
             let test_clif = value_to_clif(test)?;
             let mut lines = vec![format!("{}if {} {{", pad, test_clif)];
-            for s in body { lines.push(stmt_to_clif(s, indent + 1)?); }
+            for s in body {
+                lines.push(stmt_to_clif(s, indent + 1)?);
+            }
             lines.push(format!("{}}}", pad));
             if !orelse.is_empty() {
                 lines.push(format!("{}else {{", pad));
-                for s in orelse { lines.push(stmt_to_clif(s, indent + 1)?); }
+                for s in orelse {
+                    lines.push(stmt_to_clif(s, indent + 1)?);
+                }
                 lines.push(format!("{}}}", pad));
             }
             Ok(lines.join("\n"))
@@ -58,46 +69,115 @@ fn stmt_to_clif(stmt: &Stmt, indent: usize) -> Result<String> {
         Stmt::While { test, body } => {
             let test_clif = value_to_clif(test)?;
             let mut lines = vec![format!("{}loop {{  ;; while {}", pad, test_clif)];
-            for s in body { lines.push(stmt_to_clif(s, indent + 1)?); }
+            for s in body {
+                lines.push(stmt_to_clif(s, indent + 1)?);
+            }
             lines.push(format!("{}}}", pad));
             Ok(lines.join("\n"))
         }
         Stmt::For { target, body, .. } => {
             let mut lines = vec![format!("{}for {} in iter {{", pad, target)];
-            for s in body { lines.push(stmt_to_clif(s, indent + 1)?); }
+            for s in body {
+                lines.push(stmt_to_clif(s, indent + 1)?);
+            }
             lines.push(format!("{}}}", pad));
             Ok(lines.join("\n"))
         }
-        Stmt::Function { name, params, return_type, body } => {
-            let param_str: Vec<String> = params.iter().map(|(n, t)| format!("{}: {:?}", n, t)).collect();
-            let mut lines = vec![format!("{}function {} ({}) -> {:?} {{", pad, name, param_str.join(", "), return_type)];
-            for s in body { lines.push(stmt_to_clif(s, indent + 1)?); }
+        Stmt::Function {
+            name,
+            params,
+            return_type,
+            body,
+        } => {
+            let param_str: Vec<String> = params
+                .iter()
+                .map(|(n, t)| format!("{}: {:?}", n, t))
+                .collect();
+            let mut lines = vec![format!(
+                "{}function {} ({}) -> {:?} {{",
+                pad,
+                name,
+                param_str.join(", "),
+                return_type
+            )];
+            for s in body {
+                lines.push(stmt_to_clif(s, indent + 1)?);
+            }
             lines.push(format!("{}}}", pad));
             Ok(lines.join("\n"))
         }
         Stmt::Return(val) => match val {
             Some(v) => Ok(format!("{}return {};", pad, value_to_clif(v)?)),
             None => Ok(format!("{}return;", pad)),
-        }
+        },
         Stmt::Pass => Ok(format!("{}nop;", pad)),
         Stmt::Break => Ok(format!("{}break;", pad)),
         Stmt::Continue => Ok(format!("{}continue;", pad)),
         Stmt::Expr(val) => Ok(format!("{}eval {};", pad, value_to_clif(val)?)),
-        Stmt::Assign { name, value } => Ok(format!("{}set {} = {};", pad, name, value_to_clif(value)?)),
+        Stmt::Assign { name, value } => {
+            Ok(format!("{}set {} = {};", pad, name, value_to_clif(value)?))
+        }
         Stmt::StructDef { name, fields } => {
-            let field_str: Vec<String> = fields.iter().map(|(n, t)| format!("{}: {:?}", n, t)).collect();
-            Ok(format!("{}struct {} {{{}}};", pad, name, field_str.join(", ")))
+            let field_str: Vec<String> = fields
+                .iter()
+                .map(|(n, t)| format!("{}: {:?}", n, t))
+                .collect();
+            Ok(format!(
+                "{}struct {} {{{}}};",
+                pad,
+                name,
+                field_str.join(", ")
+            ))
         }
-        Stmt::ListAppend { target, value } => Ok(format!("{}list_append {} {};", pad, target, value_to_clif(value)?)),
-        Stmt::IndexAssign { target, indices, value } => {
-            let idx_str: Vec<String> = indices.iter().map(|v| value_to_clif(v)).collect::<Result<Vec<_>>>()?;
-            Ok(format!("{}set_index {} [{}] = {};", pad, target, idx_str.join(", "), value_to_clif(value)?))
+        Stmt::ListAppend { target, value } => Ok(format!(
+            "{}list_append {} {};",
+            pad,
+            target,
+            value_to_clif(value)?
+        )),
+        Stmt::IndexAssign {
+            target,
+            indices,
+            value,
+        } => {
+            let idx_str: Vec<String> = indices
+                .iter()
+                .map(|v| value_to_clif(v))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(format!(
+                "{}set_index {} [{}] = {};",
+                pad,
+                target,
+                idx_str.join(", "),
+                value_to_clif(value)?
+            ))
         }
-        Stmt::Destructure { targets, value } => Ok(format!("{}destructure {} = {};", pad, targets.join(", "), value_to_clif(value)?)),
-        Stmt::FieldAssign { object, field, value } => Ok(format!("{}set_field {} .{} = {};", pad, value_to_clif(object)?, field, value_to_clif(value)?)),
-        Stmt::Raise(val) => match val { Some(v) => Ok(format!("{}raise {};", pad, value_to_clif(v)?)), None => Ok(format!("{}raise;", pad)) },
+        Stmt::Destructure { targets, value } => Ok(format!(
+            "{}destructure {} = {};",
+            pad,
+            targets.join(", "),
+            value_to_clif(value)?
+        )),
+        Stmt::FieldAssign {
+            object,
+            field,
+            value,
+        } => Ok(format!(
+            "{}set_field {} .{} = {};",
+            pad,
+            value_to_clif(object)?,
+            field,
+            value_to_clif(value)?
+        )),
+        Stmt::Raise(val) => match val {
+            Some(v) => Ok(format!("{}raise {};", pad, value_to_clif(v)?)),
+            None => Ok(format!("{}raise;", pad)),
+        },
         Stmt::Try { .. } => Ok(format!("{};; try statement (lowered by Rust codegen)", pad)),
-        Stmt::With { .. } => Ok(format!("{};; with statement (lowered by Rust codegen)", pad)),
+        Stmt::With { .. } => Ok(format!(
+            "{};; with statement (lowered by Rust codegen)",
+            pad
+        )),
     }
 }
 
@@ -110,7 +190,14 @@ fn value_to_clif(value: &Value) -> Result<String> {
         Value::Bool(b) => Ok(b.to_string()),
         Value::None => Ok("none".to_string()),
         Value::Name(n) => Ok(format!("${}", n)),
-        Value::Binary { left, op, right, .. } => Ok(format!("({} {} {})", value_to_clif(left)?, op.symbol(), value_to_clif(right)?)),
+        Value::Binary {
+            left, op, right, ..
+        } => Ok(format!(
+            "({} {} {})",
+            value_to_clif(left)?,
+            op.symbol(),
+            value_to_clif(right)?
+        )),
         Value::Unary { op, operand, .. } => {
             let sym = match op {
                 UnaryOp::Neg => "-",
@@ -120,17 +207,45 @@ fn value_to_clif(value: &Value) -> Result<String> {
             Ok(format!("({} {})", sym, value_to_clif(operand)?))
         }
         Value::Call { function, args, .. } => {
-            let arg_str: Vec<String> = args.iter().map(|v| value_to_clif(v)).collect::<Result<Vec<_>>>()?;
+            let arg_str: Vec<String> = args
+                .iter()
+                .map(|v| value_to_clif(v))
+                .collect::<Result<Vec<_>>>()?;
             Ok(format!("{}({})", function, arg_str.join(", ")))
         }
-        Value::Index { container, index, .. } => Ok(format!("{}[{}]", value_to_clif(container)?, value_to_clif(index)?)),
+        Value::Index {
+            container, index, ..
+        } => Ok(format!(
+            "{}[{}]",
+            value_to_clif(container)?,
+            value_to_clif(index)?
+        )),
         Value::Slice { container, .. } => Ok(format!("slice({})", value_to_clif(container)?)),
-        Value::MethodCall { object, method, args, .. } => {
-            let arg_str: Vec<String> = args.iter().map(|v| value_to_clif(v)).collect::<Result<Vec<_>>>()?;
-            Ok(format!("{}.{}({})", value_to_clif(object)?, method, arg_str.join(", ")))
+        Value::MethodCall {
+            object,
+            method,
+            args,
+            ..
+        } => {
+            let arg_str: Vec<String> = args
+                .iter()
+                .map(|v| value_to_clif(v))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(format!(
+                "{}.{}({})",
+                value_to_clif(object)?,
+                method,
+                arg_str.join(", ")
+            ))
         }
         Value::FormatString { parts } => {
-            let part_strs: Vec<String> = parts.iter().map(|p| match p { FormatPart::Literal(s) => Ok(format!("\"{}\"", s)), FormatPart::Value { value, .. } => value_to_clif(value) }).collect::<Result<Vec<_>>>()?;
+            let part_strs: Vec<String> = parts
+                .iter()
+                .map(|p| match p {
+                    FormatPart::Literal(s) => Ok(format!("\"{}\"", s)),
+                    FormatPart::Value { value, .. } => value_to_clif(value),
+                })
+                .collect::<Result<Vec<_>>>()?;
             Ok(format!("fstring({})", part_strs.join(", ")))
         }
         _ => Ok(format!("{{/* unsupported value */}}")),

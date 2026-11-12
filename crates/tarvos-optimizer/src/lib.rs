@@ -1887,8 +1887,15 @@ impl Optimizer {
             Value::Bool(b) => format!("bool:{b}"),
             Value::None => "none".to_string(),
             Value::Name(n) => format!("name:{n}"),
-            Value::Binary { left, op, right, .. } => {
-                format!("bin:({} {:?} {})", Self::value_key(left), op, Self::value_key(right))
+            Value::Binary {
+                left, op, right, ..
+            } => {
+                format!(
+                    "bin:({} {:?} {})",
+                    Self::value_key(left),
+                    op,
+                    Self::value_key(right)
+                )
             }
             Value::Unary { op, operand, .. } => {
                 format!("unary:{:?}({})", op, Self::value_key(operand))
@@ -1908,7 +1915,12 @@ impl Optimizer {
 
     fn cse_substitute(value: &Value, env: &HashMap<String, String>) -> Result<Value> {
         match value {
-            Value::Binary { left, op, right, ty } => Ok(Value::Binary {
+            Value::Binary {
+                left,
+                op,
+                right,
+                ty,
+            } => Ok(Value::Binary {
                 left: Box::new(Self::cse_substitute(left, env)?),
                 op: *op,
                 right: Box::new(Self::cse_substitute(right, env)?),
@@ -1919,7 +1931,12 @@ impl Optimizer {
                 operand: Box::new(Self::cse_substitute(operand, env)?),
                 ty: ty.clone(),
             }),
-            Value::Index { container, index, element_type, container_type } => Ok(Value::Index {
+            Value::Index {
+                container,
+                index,
+                element_type,
+                container_type,
+            } => Ok(Value::Index {
                 container: Box::new(Self::cse_substitute(container, env)?),
                 index: Box::new(Self::cse_substitute(index, env)?),
                 element_type: element_type.clone(),
@@ -1970,7 +1987,12 @@ impl Optimizer {
                         orelse: new_orelse,
                     });
                 }
-                Stmt::For { target, iter, iter_type, body } => {
+                Stmt::For {
+                    target,
+                    iter,
+                    iter_type,
+                    body,
+                } => {
                     let new_body = Self::sr_block(&body)?;
                     result.push(Stmt::For {
                         target: target.clone(),
@@ -1986,7 +2008,12 @@ impl Optimizer {
                         body: new_body,
                     });
                 }
-                Stmt::Function { name, params, return_type, body } => {
+                Stmt::Function {
+                    name,
+                    params,
+                    return_type,
+                    body,
+                } => {
                     let new_body = Self::sr_block(&body)?;
                     result.push(Stmt::Function {
                         name: name.clone(),
@@ -2011,12 +2038,32 @@ impl Optimizer {
             (Value::Bool(x), Value::Bool(y)) => x == y,
             (Value::None, Value::None) => true,
             (Value::Name(x), Value::Name(y)) => x == y,
-            (Value::Binary { left: l1, op: o1, right: r1, .. }, Value::Binary { left: l2, op: o2, right: r2, .. }) => {
-                o1 == o2 && Self::value_eq(l1, l2) && Self::value_eq(r1, r2)
-            }
-            (Value::Unary { op: o1, operand: op1, .. }, Value::Unary { op: o2, operand: op2, .. }) => {
-                o1 == o2 && Self::value_eq(op1, op2)
-            }
+            (
+                Value::Binary {
+                    left: l1,
+                    op: o1,
+                    right: r1,
+                    ..
+                },
+                Value::Binary {
+                    left: l2,
+                    op: o2,
+                    right: r2,
+                    ..
+                },
+            ) => o1 == o2 && Self::value_eq(l1, l2) && Self::value_eq(r1, r2),
+            (
+                Value::Unary {
+                    op: o1,
+                    operand: op1,
+                    ..
+                },
+                Value::Unary {
+                    op: o2,
+                    operand: op2,
+                    ..
+                },
+            ) => o1 == o2 && Self::value_eq(op1, op2),
             _ => false,
         }
     }
@@ -2154,7 +2201,12 @@ impl Optimizer {
                     ty: ty.clone(),
                 })
             }
-            Value::Binary { left, op, right, ty } => Ok(Value::Binary {
+            Value::Binary {
+                left,
+                op,
+                right,
+                ty,
+            } => Ok(Value::Binary {
                 left: Box::new(Self::sr_value(left.as_ref())?),
                 op: *op,
                 right: Box::new(Self::sr_value(right.as_ref())?),
@@ -2165,7 +2217,12 @@ impl Optimizer {
                 operand: Box::new(Self::sr_value(operand)?),
                 ty: ty.clone(),
             }),
-            Value::Index { container, index, element_type, container_type } => Ok(Value::Index {
+            Value::Index {
+                container,
+                index,
+                element_type,
+                container_type,
+            } => Ok(Value::Index {
                 container: Box::new(Self::sr_value(container)?),
                 index: Box::new(Self::sr_value(index)?),
                 element_type: element_type.clone(),

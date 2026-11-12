@@ -57,10 +57,26 @@ impl fmt::Display for Type {
             Type::None => write!(f, "None"),
             Type::Array(inner) => write!(f, "list[{}]", inner),
             Type::Set(inner) => write!(f, "set[{}]", inner),
-            Type::Tuple(types) => write!(f, "({})", types.iter().map(|t| t.to_string()).collect::<Vec<String>>().join(", ")),
+            Type::Tuple(types) => write!(
+                f,
+                "({})",
+                types
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            ),
             Type::Dict { key, value } => write!(f, "dict[{}, {}]", key, value),
             Type::Object(name) => write!(f, "class {}", name),
-            Type::Union(types) => write!(f, "{}", types.iter().map(|t| t.to_string()).collect::<Vec<String>>().join(" | ")),
+            Type::Union(types) => write!(
+                f,
+                "{}",
+                types
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<String>>()
+                    .join(" | ")
+            ),
             Type::MethodCall(name) => write!(f, "method({})", name),
             Type::Unknown => write!(f, "Unknown"),
             Type::Dynamic => write!(f, "Dynamic"),
