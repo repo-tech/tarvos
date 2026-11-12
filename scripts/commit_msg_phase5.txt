@@ -1,8 +1,0 @@
-fix(ci): unify Rust toolchain pinning across workflows and toolchain pin check
-
-- Changed toolchain setup actions from `dtolnay/rust-toolchain@1.98.0`
-  to `dtolnay/rust-toolchain@stable-x86_64-pc-windows-gnu` to match
-  rust-toolchain.toml pinning.
-- Updated RUSTUP_TOOLCHAIN env vars to use the stable channel name.
-- Updated Cargo cache keys to use the stable channel identifier.
-- `scripts/check_toolchain_pin.py` now passes consistently.
