@@ -1925,7 +1925,7 @@ impl Optimizer {
                 element_type: element_type.clone(),
                 container_type: container_type.clone(),
             }),
-            Value::Name(name) => {
+            Value::Name(_name) => {
                 // Don't substitute names - they're already variable references
                 Ok(value.clone())
             }

@@ -2025,6 +2025,7 @@ impl RustCodegen {
     /// answers for `HashMap`: does the emitted program refer to the type at all?
     /// A set literal lowers to a `__tarvos_set_of` call, and a set arriving
     /// from elsewhere still carries `Type::Set` in its call's return type.
+    #[allow(dead_code)]
     fn statement_uses_set(stmt: &Stmt) -> bool {
         match stmt {
             Stmt::StructDef { fields, .. } => {
@@ -2435,8 +2436,7 @@ impl RustCodegen {
             | Value::String(_)
             | Value::Bool(_)
             | Value::None
-            | Value::Name(_)
-            | Value::MethodCall { .. } => false,
+            | Value::Name(_) => false,
         }
     }
 
@@ -4922,7 +4922,7 @@ impl RustCodegen {
                 object,
                 method,
                 args,
-                return_type,
+                ..
             } => {
                 let object_str = Self::emit_value(object, ctx)?;
                 let boxed = if matches!(object.as_ref(), Value::Name(_) | Value::Call { .. }) {

@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
 use std::fmt;
 
 /// Tarvos type system - initial subset

@@ -8,13 +8,20 @@ use wasm_encoder::{
 
 const TAG_NONE: i32 = 0;
 const TAG_INT: i32 = 1;
+#[allow(dead_code)]
 const TAG_FLOAT: i32 = 2;
+#[allow(dead_code)]
 const TAG_BOOL: i32 = 3;
+#[allow(dead_code)]
 const TAG_STRING: i32 = 4;
+#[allow(dead_code)]
 const TAG_LIST: i32 = 5;
+#[allow(dead_code)]
 const TAG_DICT: i32 = 6;
+#[allow(dead_code)]
 const TAG_SET: i32 = 7;
 
+#[allow(dead_code)]
 fn val_type_to_tag(ty: &Type) -> i32 {
     match ty {
         Type::None => TAG_NONE,

@@ -107,6 +107,7 @@ impl IncrementalCache {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn gc(&self, max_age_seconds: u64) -> Result<u64> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -148,6 +149,7 @@ impl IncrementalCache {
         Ok(removed)
     }
 
+    #[allow(dead_code)]
     pub fn stats(&self) -> Result<CacheStats> {
         let mut ir_count = 0u64;
         let mut ir_bytes = 0u64;
@@ -245,6 +247,7 @@ impl IncrementalCache {
     }
 }
 
+#[allow(dead_code)]
 pub struct CacheStats {
     pub ir_entries: u64,
     pub ir_bytes: u64,

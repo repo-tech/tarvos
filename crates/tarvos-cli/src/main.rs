@@ -31,7 +31,29 @@ use tarvos_codegen_cloud::{compile_to_cloud_rust, generate_dockerfile, generate_
 use tarvos_codegen_wasm::{compile_to_wasm, compile_to_wat};
 use tarvos_parser::parse_python_ast;
 
-/// Long description shown by `tarvos --help`.
+/// Build profile selection for `tarvos build`.
+#[derive(Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum BuildProfile {
+    /// Default: opt-level 3 with fat LTO, balanced for shipping
+    Default,
+    /// Speed: opt-level 3, fat LTO, codegen-units = 1, maximum performance
+    Speed,
+    /// Minify: opt-level 'z', codegen-units = 1, symbol stripping, minimum size
+    Minify,
+    /// Native CPU: opt-level 3, target-cpu=native, for the build machine's CPU
+    NativeCpu,
+}
+
+impl std::fmt::Display for BuildProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildProfile::Default => write!(f, "default"),
+            BuildProfile::Speed => write!(f, "speed"),
+            BuildProfile::Minify => write!(f, "minify"),
+            BuildProfile::NativeCpu => write!(f, "native-cpu"),
+        }
+    }
+}
 const LONG_ABOUT: &str = "\
 Tarvos transpiles a statically analyzable subset of Python into optimized Rust
 and compiles it into a single native executable. The produced binary is a
@@ -378,6 +400,10 @@ enum Commands {
         /// producing an executable that runs Python on the target machine
         #[arg(long = "compat-launcher")]
         compat_launcher: bool,
+
+        /// Build profile: default, speed, minify, or native-cpu
+        #[arg(long, value_enum, default_value = "default")]
+        build_profile: BuildProfile,
     },
 
     /// Report what a built executable is and what it needs on the target machine
@@ -566,6 +592,7 @@ fn main() -> Result<()> {
             system_rust,
             strict_native,
             compat_launcher,
+            build_profile,
         }) => {
             let mut args = vec![input.to_string_lossy().to_string()];
             if let Some(o) = output {
@@ -584,6 +611,8 @@ fn main() -> Result<()> {
             if compat_launcher {
                 args.push("--compat-launcher".to_string());
             }
+            args.push("--build-profile".to_string());
+            args.push(build_profile.to_string());
             build_mode(&args)
         }
         Some(Commands::ValidateArtifact { artifact }) => validate_artifact_mode(&artifact),
@@ -814,7 +843,7 @@ pub(crate) fn compile_mode(args: &[String]) -> Result<()> {
     if !source_only
         && (format == "exe" || output_path.extension().and_then(|s| s.to_str()) == Some("exe"))
     {
-        compile_rust_binary(&output_path, &rust_source)?;
+        compile_rust_binary(&output_path, &rust_source, BuildProfile::Default)?;
     } else {
         println!("\n=== Generated Rust Code ===\n{}", rust_source);
     }
@@ -828,6 +857,7 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
     let mut prefer_system = false;
     let mut strict_native = false;
     let mut compat_launcher = false;
+    let mut build_profile = BuildProfile::Default;
     let mut iter = args.iter();
     let input_file = iter
         .next()
@@ -848,6 +878,17 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
             }
             "--compat-launcher" => {
                 compat_launcher = true;
+            }
+            "--build-profile" => {
+                if let Some(val) = iter.next() {
+                    build_profile = match val.as_str() {
+                        "default" => BuildProfile::Default,
+                        "speed" => BuildProfile::Speed,
+                        "minify" => BuildProfile::Minify,
+                        "native-cpu" => BuildProfile::NativeCpu,
+                        _ => BuildProfile::Default,
+                    };
+                }
             }
             _ => {
                 if output_file.is_none() {
@@ -939,7 +980,7 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
     // `inspect_err` rather than `map_err`: the error is logged and then returned
     // unchanged, so mapping it to itself only to get the side effect is exactly
     // what `inspect_err` exists for.
-    compile_rust_binary_toolchain(&output_path, &rust_source, false, prefer_system).inspect_err(
+    compile_rust_binary_toolchain(&output_path, &rust_source, false, prefer_system, build_profile).inspect_err(
         |_| {
             eprintln!(
                 "Rust native build unavailable; generated Rust remains in the user cache for this invocation."
@@ -1374,7 +1415,7 @@ fn prepare_native_run(args: &[String]) -> Result<(PathBuf, Vec<String>)> {
         Ok((cached_bin, args[1..].to_vec()))
     } else {
         println!("Cache miss: Binary stage — compiling native executable...");
-        compile_rust_binary_opt(&exe_path, &rust_source, true)?;
+        compile_rust_binary_opt(&exe_path, &rust_source, true, BuildProfile::Default)?;
         let metadata = std::fs::metadata(&exe_path)
             .with_context(|| format!("failed to stat {}", exe_path.display()))?;
         cache.put_binary(rust_hash, &exe_path, metadata.len())?;
@@ -2247,12 +2288,12 @@ fn find_python_command() -> Result<String> {
     core_find_python_command()
 }
 
-fn compile_rust_binary(output_path: &Path, rust_source: &str) -> Result<()> {
-    compile_rust_binary_opt(output_path, rust_source, false)
+fn compile_rust_binary(output_path: &Path, rust_source: &str, build_profile: BuildProfile) -> Result<()> {
+    compile_rust_binary_opt(output_path, rust_source, false, build_profile)
 }
 
-fn compile_rust_binary_opt(output_path: &Path, rust_source: &str, fast_dev: bool) -> Result<()> {
-    compile_rust_binary_toolchain(output_path, rust_source, fast_dev, false)
+fn compile_rust_binary_opt(output_path: &Path, rust_source: &str, fast_dev: bool, build_profile: BuildProfile) -> Result<()> {
+    compile_rust_binary_toolchain(output_path, rust_source, fast_dev, false, build_profile)
 }
 
 /// Extension a compiled artifact carries on this platform.
@@ -2324,6 +2365,7 @@ fn compile_rust_binary_toolchain(
     rust_source: &str,
     fast_dev: bool,
     prefer_system: bool,
+    build_profile: BuildProfile,
 ) -> Result<()> {
     let resolved = toolchain::resolve(prefer_system).or_else(|managed_error| {
         if prefer_system {
@@ -2436,22 +2478,47 @@ fn compile_rust_binary_toolchain(
             .arg("-C")
             .arg("strip=symbols");
     } else {
-        cmd.arg("-C")
-            .arg("opt-level=3")
-            .arg("-C")
-            .arg("lto=fat")
-            .arg("-C")
-            .arg("codegen-units=1")
-            .arg("-C")
-            .arg("strip=symbols");
-        // `target-cpu=native` used to be passed here. It tunes the generated code
-        // for whichever CPU happened to run the build, so a binary produced on a
-        // recent processor died with SIGILL on an older one. A build tool cannot
-        // know the machine a program will run on, so the baseline is used and the
-        // result stays portable across processors of the same architecture. The
-        // release workflow already took this position for the same reason; a
-        // `tarvos build` output was therefore *less* portable than the release
-        // binary of the same commit.
+        match build_profile {
+            BuildProfile::Minify => {
+                cmd.arg("-C")
+                    .arg("opt-level=z")
+                    .arg("-C")
+                    .arg("lto=fat")
+                    .arg("-C")
+                    .arg("codegen-units=1")
+                    .arg("-C")
+                    .arg("strip=symbols");
+            }
+            BuildProfile::NativeCpu => {
+                cmd.arg("-C")
+                    .arg("opt-level=3")
+                    .arg("-C")
+                    .arg("lto=fat")
+                    .arg("-C")
+                    .arg("codegen-units=1")
+                    .arg("-C")
+                    .arg("strip=symbols")
+                    .arg("-C")
+                    .arg("target-cpu=native");
+            }
+            BuildProfile::Speed | BuildProfile::Default => {
+                cmd.arg("-C")
+                    .arg("opt-level=3")
+                    .arg("-C")
+                    .arg("lto=fat")
+                    .arg("-C")
+                    .arg("codegen-units=1")
+                    .arg("-C")
+                    .arg("strip=symbols");
+            }
+        }
+        // `target-cpu=native` used to be passed here by default. It tunes the
+        // generated code for whichever CPU happened to run the build, so a
+        // binary produced on a recent processor died with SIGILL on an older
+        // one. A build tool cannot know the machine a program will run on, so
+        // the baseline is used and the result stays portable across processors
+        // of the same architecture. The `--native-cpu` build profile opts into
+        // this behaviour explicitly.
     }
 
     // Build into the cache first, then publish. Compiling straight into
@@ -2958,6 +3025,24 @@ pub(crate) fn benchmark_mode(args: &[String]) -> Result<()> {
 ///    checkout still finds the repository it was shipped with.
 /// 4. The build-time path, used only when it still exists, which keeps a
 ///    source build working from an unusual layout.
+/// Walk up from `start` to find the repository root: the first ancestor that
+/// contains a `benchmarks/run_benchmarks.py` marker file.
+///
+/// Returns `None` when no ancestor up to the filesystem root has the marker.
+fn find_repo_root_from(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.to_path_buf();
+    loop {
+        let marker = dir.join("benchmarks").join("run_benchmarks.py");
+        if marker.is_file() {
+            return Some(dir);
+        }
+        match dir.parent() {
+            Some(parent) if parent != dir => dir = parent.to_path_buf(),
+            _ => return None,
+        }
+    }
+}
+
 fn secure_input_path(input: &str, root: &Path) -> Result<PathBuf> {
     let candidate = PathBuf::from(input);
     let absolute = if candidate.is_absolute() {
