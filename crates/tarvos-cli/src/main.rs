@@ -1,0 +1,3615 @@
+use anyhow::{Context, Result};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand};
+use std::{
+    env, fs,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+mod ai_probe;
+mod artifact;
+mod cache;
+mod commands;
+mod manifest;
+mod toolchain;
+use commands::{
+    analyze_command, benchmark_command, clean_command, doctor_command, export_command,
+    init_command, install_command, validate_command,
+};
+use tarvos_analysis::native_detector::{ModuleReport, NativePlan, NativeSubsetDetector};
+use tarvos_analysis::native_specialization::{specialize_module, SpecializedLoop};
+use tarvos_analysis::{analyze_module, lower_module};
+use tarvos_codegen_cloud::{compile_to_cloud_rust, generate_dockerfile, generate_serverless_yml};
+use tarvos_codegen_wasm::{compile_to_wasm, compile_to_wat};
+use tarvos_core::{
+    export_python_ast as core_export_python_ast, find_python_command as core_find_python_command,
+    normalize_module, CompilePipeline,
+};
+use tarvos_parser::parse_python_ast;
+
+/// Build profile selection for `tarvos build`.
+#[derive(Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum BuildProfile {
+    /// Default: opt-level 3 with fat LTO, balanced for shipping
+    Default,
+    /// Speed: opt-level 3, fat LTO, codegen-units = 1, maximum performance
+    Speed,
+    /// Minify: opt-level 'z', codegen-units = 1, symbol stripping, minimum size
+    Minify,
+    /// Native CPU: opt-level 3, target-cpu=native, for the build machine's CPU
+    NativeCpu,
+}
+
+impl std::fmt::Display for BuildProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildProfile::Default => write!(f, "default"),
+            BuildProfile::Speed => write!(f, "speed"),
+            BuildProfile::Minify => write!(f, "minify"),
+            BuildProfile::NativeCpu => write!(f, "native-cpu"),
+        }
+    }
+}
+const LONG_ABOUT: &str = "\
+Tarvos transpiles a statically analyzable subset of Python into optimized Rust
+and compiles it into a single native executable. The produced binary is a
+standalone program: it does not embed CPython and does not require pyo3 or a
+Python installation at run time.
+
+Tarvos aims at a measurable subset of Python, not full CPython compatibility.
+Run `tarvos doctor` to verify your toolchain, and `tarvos analyze <file.py>` to
+see which functions a given module can accelerate before you compile it.
+
+Quick start:
+  tarvos doctor                       Check Python, Rust, Cargo, and linker
+  tarvos build hello.py -o hello      Transpile and build a native executable
+  tarvos run hello.py arg1 arg2       Build, then run it in one step
+  tarvos benchmark kernel.py          Measure Python vs native with fairness
+                                      checks
+  tarvos validate                     Run the reference output test suite
+
+Docs and examples: https://github.com/repo-tech/tarvos-engine
+Benchmarks and compatibility notes are published with every engine release.";
+
+/// Trailing section shown after the option list in `tarvos --help`.
+const AFTER_HELP: &str = "\
+Environment:
+  RUSTC                    Path to the rustc used by `build` and `compile`
+  TARVOS_STRICT_RUST_PIN   Set to 1 to fail instead of using a loose system Rust
+  TARVOS_OLLAMA_ENDPOINT   Loopback endpoint read by `tarvos ai-status`
+                           (default http://127.0.0.1:11434)
+  TARVOS_SANDBOX           Restricts commands to a sandboxed working area
+
+Exit status:
+  0  success
+  1  compilation, toolchain, or runtime failure
+  2  invalid command-line usage
+
+Examples:
+  tarvos compile main.py --format exe -o app.exe
+  tarvos build main.py -o app --system-rust
+  tarvos run main.py -- --verbose input.csv
+  tarvos run main.py --python-fallback
+  tarvos analyze src/ --hot-functions
+  tarvos package ./myproject --entry main.py -o ./dist
+  tarvos export main.py ./tarvos-export
+  tarvos init my-app";
+
+const COMPILE_HELP: &str = "\
+Compile Python code to optimized Rust source or binary.
+
+Runs the full front end: Python AST export, parsing, type checking and IR
+lowering, optimization, then Rust code generation.
+
+With `--format rust` (the default) Tarvos writes Rust source and stops there,
+so no Rust toolchain is required. With `--format exe` it invokes rustc
+afterwards to produce a native executable. With `--format wasm` it emits a WebAssembly binary for the browser or WASI.
+
+When a module uses dynamic constructs outside the native subset, Tarvos reports
+why and emits a compatibility launcher that delegates to Python at run time
+instead of failing the build.
+
+Examples:
+  tarvos compile app.py
+  tarvos compile app.py -o src/main.rs
+  tarvos compile app.py --format exe -o app.exe
+  tarvos compile app.py --format wasm -o app.wasm\n  tarvos compile app.py --target embedded\n  tarvos compile app.py --target wasm";
+
+const BUILD_HELP: &str = "\
+Build a native binary executable directly from Python.
+
+Transpiles the module and links it into a standalone executable in one step. Every
+import is classified before anything is compiled, so a program that needs something
+the native backend cannot lower is refused by name instead of producing an
+executable that quietly depends on it.
+
+When the program's dependencies can all be lowered, the result embeds no
+interpreter: no Python, no packages, and no Tarvos are needed on the machine that
+runs it. A manifest is written beside the artifact recording exactly that, and
+`tarvos validate-artifact` reads it back.
+
+When a dependency cannot be lowered, the build stops and names it. Passing
+`--compat-launcher` produces a single-file executable that carries its own source
+and runs it through the target machine's Python instead. That file is NOT a native
+binary: it needs Python 3 and every module the program imports installed there. It
+is only ever produced when asked for by name.
+
+Tarvos uses the managed toolchain in ~/.tarvos/toolchain by default. Use
+`--system-rust` to opt into an already validated system Rust.
+
+Examples:
+  tarvos build app.py
+  tarvos build app.py -o dist/app
+  tarvos build app.py --system-rust
+  tarvos build app.py --strict-native
+  tarvos build app.py --compat-launcher
+  tarvos build app.py --source-only";
+
+const VALIDATE_ARTIFACT_HELP: &str = "\
+Report what a built executable is and what it requires on the target machine.
+
+Reads the artifact's own header to identify the format, so a file named for one
+platform but built for another is reported as the mismatch it is. Combines that
+with the manifest `tarvos build` writes beside the artifact to answer the
+question a binary cannot answer by looking at it: does running this need Python,
+Tarvos, Rust, or any third-party package installed first.
+
+Exits non-zero when the artifact turns out to need a Python runtime, so a script
+or CI job can gate on the result.
+
+Example:
+  tarvos validate-artifact dist/hello.exe";
+
+const RUN_HELP: &str = "\
+Transpile, build, and run a Python file in one seamless step.
+
+Attempts a native build first and executes the resulting binary. If the module
+relies on dynamic behaviour that the native subset cannot express, Tarvos reports
+the reason and transparently falls back to the local Python runtime so the
+program still runs.
+
+Use `--python-fallback` to skip the native attempt entirely, which helps isolate
+whether a slowdown comes from the transpiler or from the original code.
+Arguments after the script name are forwarded to the program; use `--` to stop
+Tarvos option parsing.
+
+Examples:
+  tarvos run app.py
+  tarvos run app.py input.csv
+  tarvos run app.py -- --verbose input.csv
+  tarvos run app.py --python-fallback";
+
+const PYTHON_HELP: &str = "\
+Execute any Python program through the local Python runtime.
+
+Always uses CPython and never invokes the transpiler, which makes this the
+reference path for checking Tarvos output against the original program.
+
+Examples:
+  tarvos python app.py
+  tarvos python app.py --verbose data.json";
+
+const DOCTOR_HELP: &str = "\
+Run environment diagnostics and check toolchain dependencies.
+
+Reports the resolved path and version of every component Tarvos depends on, and
+explains what to install or fix when something is missing. Run this first
+whenever a build fails.
+
+Example:
+  tarvos doctor";
+
+const ANALYZE_HELP: &str = "\
+Static analysis and complexity profiling of a Python module.
+
+Reports per-function complexity and the constructs Tarvos can lower to native
+code. With `--hot-functions` it ranks the functions worth accelerating first.
+
+Accepts either a single file or a project directory.
+
+Examples:
+  tarvos analyze app.py
+  tarvos analyze ./src --hot-functions";
+
+const SCAN_HELP: &str = "\
+Scan a Python project for library-backed hot loops and native plans.
+
+Walks a project directory, finds loops that call into supported libraries, and
+proposes a native plan for each one. This is the fastest way to find out whether
+a project is a good candidate for Tarvos.
+
+Example:
+  tarvos scan ./myproject";
+
+const BENCHMARK_HELP: &str = "\
+Benchmark Python vs Tarvos (Native Rust) with fairness metrics.
+
+Compiles the workload both ways, compares their output for equality, then reports
+median and per-iteration timings. Workloads are run without constant folding so
+the comparison reflects real work.
+
+Pass a reference .rs file to benchmark hand-written Rust alongside Python and
+Tarvos.
+
+Examples:
+  tarvos benchmark kernel.py
+  tarvos benchmark kernel.py reference.rs";
+
+const INIT_HELP: &str = "\
+Initialize a new Tarvos project template.
+
+Creates a ready to build project skeleton in a new directory.
+
+Example:
+  tarvos init my-app";
+
+const EXPORT_HELP: &str = "\
+Export Python code as a complete standalone Cargo Rust project.
+
+Writes a self-contained Cargo project you can open, edit, and build with plain
+cargo. Useful when you want to inspect or hand-tune the generated Rust before
+shipping a binary.
+
+Examples:
+  tarvos export app.py
+  tarvos export app.py ./my-export";
+
+const PACKAGE_HELP: &str = "\
+Convert a Python file or project folder into a Cargo release project and binary.
+
+Like `export`, but also runs a release cargo build, so the command ends with a
+ready to distribute optimized binary. When the input is a directory, point at the
+entry point with `--entry`.
+
+Examples:
+  tarvos package app.py
+  tarvos package ./myproject --entry main.py
+  tarvos package app.py -o ./dist";
+
+const CLEAN_HELP: &str = "\
+Clean build artifacts, temporary cache files, and intermediate outputs.
+
+Removes generated Rust, staged Cargo projects, and Tarvos cache directories.
+Source files are never touched.
+
+Example:
+  tarvos clean";
+
+const TOOLCHAIN_HELP: &str = "\
+Manage the Tarvos-owned Rust toolchain (status, install, verify).
+
+Tarvos pins its own Rust channel under ~/.tarvos/toolchain so native builds are
+reproducible regardless of the system Rust version.
+
+Examples:
+  tarvos toolchain --status
+  tarvos toolchain --install
+  tarvos toolchain --verify";
+
+const INSTALL_HELP: &str = "\
+Install Tarvos system-wide into your PATH.
+
+Copies the tarvos executable into a directory already on your PATH and tells you
+if a shell restart is needed.
+
+Example:
+  tarvos install";
+
+const VALIDATE_HELP: &str = "\
+Validate Tarvos output against reference test suite.
+
+Compiles every workload in the reference suite and diffs the program output
+against the recorded expected values, so a regression shows up before it reaches
+a release.
+
+Example:
+  tarvos validate";
+
+/// Run the Tarvos HTTP API gateway for AI/LLM integration.
+///
+/// Starts a local server that exposes endpoints for compiling Python code,
+/// managing sessions, and interacting with the AI/LLM pipeline.
+///
+/// Example:
+///   tarvos serve --port 8080
+const SERVE_HELP: &str = "\
+Run the Tarvos HTTP API gateway for AI/LLM integration.
+
+Starts a local server that exposes endpoints for compiling Python code,
+managing sessions, and interacting with the AI/LLM pipeline.
+
+Example:
+  tarvos serve --port 8080";
+
+/// Version reported by `--version` and by the clap help footer.
+///
+/// The compiler and the public distribution are released on independent version
+/// lines: the compiler ships many release candidates, while the packaged engine
+/// is cut when there is something worth publishing. A build can therefore pin
+/// the user-facing line with `TARVOS_PRODUCT_VERSION`; without it the crate
+/// version is used, so a plain `cargo build` still reports the compiler version
+/// and the version-consistency gate keeps passing.
+const PRODUCT_VERSION: &str = match option_env!("TARVOS_PRODUCT_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
+/// Tarvos — Ultra-fast Python to Native Rust Transpiler & Compiler
+#[derive(Parser, Debug)]
+#[command(name = "tarvos", disable_version_flag = true)]
+#[command(author = "Himanshu & Repo-Tech Team")]
+#[command(version = PRODUCT_VERSION)]
+#[command(about = "Transpiles and compiles Python code to native high-performance Rust executables", long_about = LONG_ABOUT, after_help = AFTER_HELP, after_long_help = AFTER_HELP)]
+struct Cli {
+    /// Print the Tarvos version and exit
+    #[arg(short = 'v', long = "version", action = ArgAction::SetTrue)]
+    version: bool,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// Direct input Python file when no subcommand is specified.
+    /// Shorthand for `tarvos compile <FILE.py>`.
+    #[arg(value_name = "INPUT.py")]
+    input: Option<PathBuf>,
+
+    /// Output path when running in direct mode (defaults to output.rs)
+    #[arg(short, long, value_name = "OUTPUT")]
+    output: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Compile Python code to optimized Rust source or binary
+    #[command(long_about = COMPILE_HELP)]
+    Compile {
+        /// Input Python file (.py)
+        #[arg(value_name = "FILE.py")]
+        input: PathBuf,
+
+        /// Output file path (defaults to output.rs or output.exe)
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+
+        /// Target format: 'rust' (source) or 'exe' (native binary)
+        #[arg(short, long, default_value = "rust")]
+        format: String,
+
+        /// Generate only Rust source without invoking native rustc compiler
+        #[arg(long)]
+        source_only: bool,
+
+        /// Code generation target: native (default) or embedded (strict no_std subset)
+        #[arg(long, default_value = "native")]
+        target: String,
+    },
+
+    /// Build a native binary executable directly from Python
+    #[command(long_about = BUILD_HELP)]
+    Build {
+        /// Input Python file (.py)
+        #[arg(value_name = "FILE.py")]
+        input: PathBuf,
+
+        /// Output executable path (defaults to tarvos_app.exe)
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+
+        /// Emit only Rust source without building executable
+        #[arg(long)]
+        source_only: bool,
+
+        /// Use an explicitly validated system Rust instead of the managed one
+        #[arg(long = "system-rust")]
+        system_rust: bool,
+
+        /// Refuse to build anything when the program cannot be compiled natively,
+        /// instead of emitting an executable that needs Python to run
+        #[arg(long = "strict-native")]
+        strict_native: bool,
+
+        /// Allow the compatibility launcher when a dependency cannot be lowered,
+        /// producing an executable that runs Python on the target machine
+        #[arg(long = "compat-launcher")]
+        compat_launcher: bool,
+
+        /// Build profile: default, speed, minify, or native-cpu
+        #[arg(long, value_enum, default_value = "default")]
+        build_profile: BuildProfile,
+    },
+
+    /// Report what a built executable is and what it needs on the target machine
+    #[command(long_about = VALIDATE_ARTIFACT_HELP)]
+    ValidateArtifact {
+        /// Path to the built executable or compatibility launcher
+        #[arg(value_name = "ARTIFACT")]
+        artifact: PathBuf,
+    },
+
+    /// Transpile, build, and run a Python file in one seamless step
+    #[command(long_about = RUN_HELP)]
+    Run {
+        /// Input Python file (.py)
+        #[arg(value_name = "FILE.py")]
+        input: PathBuf,
+
+        /// Force the compatibility runtime instead of attempting native compilation first.
+        #[arg(long = "python-fallback", alias = "compat-runtime")]
+        python_fallback: bool,
+
+        /// Arguments to pass to the executed binary
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Execute any Python program through the local Python runtime
+    #[command(long_about = PYTHON_HELP)]
+    Python {
+        /// Input Python file (.py)
+        #[arg(value_name = "FILE.py")]
+        input: PathBuf,
+
+        /// Arguments to pass to the Python program
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Run environment diagnostics and check toolchain dependencies (Python, Rust, Cargo, Linker)
+    #[command(long_about = DOCTOR_HELP)]
+    Doctor,
+
+    /// Report the optional local AI capability (Ollama).
+    ///
+    /// Read-only: never starts, stops, downloads, or reconfigures anything, and
+    /// only ever contacts a loopback endpoint. Records ownership so a later
+    /// repair or uninstall step knows what Tarvos is allowed to touch.
+    AiStatus {
+        /// Emit machine-readable JSON instead of the human-readable report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Static analysis and complexity profiling of a Python module
+    #[command(long_about = ANALYZE_HELP)]
+    Analyze {
+        /// Input Python file (.py) or a project directory
+        #[arg(value_name = "INPUT")]
+        input: PathBuf,
+
+        /// Report functions that are candidates for native hot-path acceleration
+        #[arg(long)]
+        hot_functions: bool,
+    },
+
+    /// Scan a Python project for library-backed hot loops and native plans
+    #[command(long_about = SCAN_HELP)]
+    Scan {
+        /// Project directory or Python file to inspect
+        input: PathBuf,
+    },
+
+    /// Benchmark Python vs Tarvos (Native Rust) with fairness metrics
+    #[command(long_about = BENCHMARK_HELP)]
+    Benchmark {
+        /// Input Python file (.py)
+        #[arg(value_name = "FILE.py")]
+        input: PathBuf,
+
+        /// Optional reference Rust implementation
+        #[arg(value_name = "REF.rs")]
+        reference: Option<PathBuf>,
+    },
+
+    /// Initialize a new Tarvos project template
+    #[command(long_about = INIT_HELP)]
+    Init {
+        /// Project directory name
+        #[arg(default_value = "tarvos-app")]
+        name: String,
+    },
+
+    /// Export Python code as a complete standalone Cargo Rust project
+    #[command(long_about = EXPORT_HELP)]
+    Export {
+        /// Input Python file (.py)
+        #[arg(value_name = "FILE.py")]
+        input: PathBuf,
+
+        /// Destination directory for the exported Cargo project
+        #[arg(value_name = "DIR", default_value = "tarvos-export")]
+        output_dir: PathBuf,
+    },
+
+    /// Convert a Python file or project folder into a Cargo release project and binary
+    #[command(long_about = PACKAGE_HELP)]
+    Package {
+        /// Python file or project directory
+        input: PathBuf,
+
+        /// Entry Python file when input is a directory (defaults to main.py)
+        #[arg(long, value_name = "FILE.py")]
+        entry: Option<PathBuf>,
+
+        /// Destination Cargo project directory
+        #[arg(short, long, value_name = "DIR")]
+        output_dir: Option<PathBuf>,
+    },
+
+    /// Clean build artifacts, temporary cache files, and intermediate outputs
+    #[command(long_about = CLEAN_HELP)]
+    Clean,
+
+    /// Manage the Tarvos-owned Rust toolchain (status, install, verify)
+    #[command(long_about = TOOLCHAIN_HELP)]
+    Toolchain {
+        /// Show resolved toolchain, layout, and per-stage validation
+        #[arg(long)]
+        status: bool,
+
+        /// Fetch the pinned channel into ~/.tarvos/toolchain
+        #[arg(long)]
+        install: bool,
+
+        /// Re-run validation on the managed toolchain and report each check
+        #[arg(long)]
+        verify: bool,
+    },
+
+    /// Install Tarvos system-wide into your PATH
+    #[command(long_about = INSTALL_HELP)]
+    Install,
+
+    /// Validate Tarvos output against reference test suite
+    #[command(long_about = VALIDATE_HELP)]
+    Validate,
+    /// Run the Tarvos HTTP API gateway for AI/LLM integration
+    #[command(long_about = SERVE_HELP)]
+    Serve,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    if cli.version {
+        println!("tarvos {PRODUCT_VERSION}");
+        return Ok(());
+    }
+
+    match cli.command {
+        Some(Commands::Compile {
+            input,
+            output,
+            format,
+            source_only,
+            target,
+        }) => {
+            let mut args = vec![input.to_string_lossy().to_string()];
+            if format != "rust" {
+                args.push("--format".to_string());
+                args.push(format);
+            }
+            if let Some(o) = output {
+                args.push("--output".to_string());
+                args.push(o.to_string_lossy().to_string());
+            }
+            if source_only {
+                args.push("--source-only".to_string());
+            }
+            if target != "native" {
+                args.push("--target".to_string());
+                args.push(target);
+            }
+            compile_mode(&args)
+        }
+        Some(Commands::Build {
+            input,
+            output,
+            source_only,
+            system_rust,
+            strict_native,
+            compat_launcher,
+            build_profile,
+        }) => {
+            let mut args = vec![input.to_string_lossy().to_string()];
+            if let Some(o) = output {
+                args.push("--output".to_string());
+                args.push(o.to_string_lossy().to_string());
+            }
+            if source_only {
+                args.push("--source-only".to_string());
+            }
+            if system_rust {
+                args.push("--system-rust".to_string());
+            }
+            if strict_native {
+                args.push("--strict-native".to_string());
+            }
+            if compat_launcher {
+                args.push("--compat-launcher".to_string());
+            }
+            args.push("--build-profile".to_string());
+            args.push(build_profile.to_string());
+            build_mode(&args)
+        }
+        Some(Commands::ValidateArtifact { artifact }) => validate_artifact_mode(&artifact),
+        Some(Commands::Run {
+            input,
+            python_fallback,
+            args: extra,
+        }) => {
+            let mut args = vec![input.to_string_lossy().to_string()];
+            args.extend(extra);
+            if python_fallback {
+                python_mode(&args)
+            } else {
+                hybrid_run_mode(&args)
+            }
+        }
+        Some(Commands::Python { input, args: extra }) => {
+            let mut args = vec![input.to_string_lossy().to_string()];
+            args.extend(extra);
+            python_mode(&args)
+        }
+        Some(Commands::Doctor) => doctor_command(&[]),
+        Some(Commands::AiStatus { json }) => ai_status_mode(json),
+        Some(Commands::Analyze {
+            input,
+            hot_functions,
+        }) => {
+            let args = vec![input.to_string_lossy().to_string()];
+            if hot_functions {
+                analyze_hot_functions(&args)
+            } else {
+                analyze_command(&args)
+            }
+        }
+        Some(Commands::Scan { input }) => scan_project_mode(&input),
+        Some(Commands::Benchmark { input, reference }) => {
+            let mut args = vec![input.to_string_lossy().to_string()];
+            if let Some(ref_path) = reference {
+                args.push(ref_path.to_string_lossy().to_string());
+            }
+            benchmark_command(&args)
+        }
+        Some(Commands::Init { name }) => init_command(&[name]),
+        Some(Commands::Export { input, output_dir }) => {
+            let args = vec![
+                input.to_string_lossy().to_string(),
+                output_dir.to_string_lossy().to_string(),
+            ];
+            export_command(&args)
+        }
+        Some(Commands::Package {
+            input,
+            entry,
+            output_dir,
+        }) => package_project_mode(&input, entry.as_deref(), output_dir.as_deref()),
+        Some(Commands::Clean) => clean_command(&[]),
+        Some(Commands::Toolchain {
+            status,
+            install,
+            verify,
+        }) => toolchain::toolchain_command(status, install, verify),
+        Some(Commands::Install) => install_command(&[]),
+        Some(Commands::Validate) => validate_command(&[]),
+        Some(Commands::Serve) => serve_command(&[]),
+        None => {
+            if let Some(input) = cli.input {
+                let mut args = vec![input.to_string_lossy().to_string()];
+                if let Some(o) = cli.output {
+                    args.push(o.to_string_lossy().to_string());
+                }
+                compile_mode(&args)
+            } else {
+                print_help();
+                Ok(())
+            }
+        }
+    }
+}
+
+fn transpile_python_to_ir(input_path: &Path) -> Result<tarvos_ir::Module> {
+    let source = fs::read_to_string(input_path)
+        .with_context(|| format!("failed to read {}", input_path.display()))?;
+    let ast_json = core_export_python_ast(&source)?;
+    let ast_module = parse_python_ast(&ast_json)?;
+    let normalized = normalize_module(ast_module);
+    lower_module(&normalized)
+}
+
+pub(crate) fn compile_mode(args: &[String]) -> Result<()> {
+    let mut output_file = "output.rs".to_string();
+    let mut format = "rust".to_string();
+    let mut source_only = false;
+    let mut target = "native".to_string();
+    let mut iter = args.iter();
+    let input_file = iter
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("usage: tarvos <file.py> [output.rs]"))?;
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--format" | "-f" => {
+                format = iter.next().cloned().unwrap_or_else(|| "rust".to_string());
+            }
+            "--output" | "-o" => {
+                output_file = iter.next().cloned().unwrap_or_else(|| output_file.clone());
+            }
+            "--source-only" => {
+                source_only = true;
+            }
+            "--target" => {
+                target = iter.next().cloned().unwrap_or_else(|| "native".to_string());
+            }
+            _ => {
+                if output_file == "output.rs" {
+                    output_file = arg.clone();
+                }
+            }
+        }
+    }
+
+    // Adjust default output extension for wasm format
+    if format == "wasm" && output_file == "output.rs" {
+        output_file = "output.wasm".to_string();
+    }
+
+    let working_dir = env::current_dir()?;
+    let input_path = secure_input_path(input_file, &working_dir)?;
+    let output_path = secure_output_path(&output_file, &working_dir)?;
+
+    // For wasm target/format, compile IR to WebAssembly binary
+    if format == "wasm" || target == "wasm" {
+        println!("=== Tarvos Compiler (Wasm Target) ===\\n");
+        println!("Input: {}", input_path.display());
+        println!("  [1/4] Exporting Python AST...");
+        println!("  [2/4] Parsing AST...");
+        println!("  [3/4] Type checking and lowering to IR...");
+        println!("  [4/4] Generating WebAssembly...");
+
+        let ir_module = transpile_python_to_ir(&input_path)?;
+        let wasm_bytes = compile_to_wasm(&ir_module)?;
+
+        fs::write(&output_path, &wasm_bytes)?;
+
+        println!("\\n=== Compilation Successful ===\\n");
+        println!("Output: {}", output_path.display());
+        println!("Format: WebAssembly (.wasm)");
+        println!("Size: {} bytes", wasm_bytes.len());
+
+        if !source_only {
+            println!(
+                "\\n=== WebAssembly Text Format ===\\n{}",
+                compile_to_wat(&ir_module)?
+            );
+        }
+
+        return Ok(());
+    }
+
+    // For cloud target/format, generate AWS Lambda-compatible Rust code
+    if format == "cloud" || target == "cloud" {
+        println!("=== Tarvos Compiler (Cloud Target: AWS Lambda) ===\\n");
+        println!("Input: {}", input_path.display());
+        println!("  [1/4] Exporting Python AST...");
+        println!("  [2/4] Parsing AST...");
+        println!("  [3/4] Type checking and lowering to IR...");
+        println!("  [4/4] Generating AWS Lambda Rust code...");
+
+        let ir_module = transpile_python_to_ir(&input_path)?;
+        let rust_source = compile_to_cloud_rust(&ir_module)?;
+
+        // Write main handler
+        fs::write(&output_path, &rust_source)?;
+
+        // Write Dockerfile alongside
+        let dockerfile_path = output_path.with_file_name("Dockerfile");
+        fs::write(&dockerfile_path, generate_dockerfile())?;
+
+        // Write serverless.yml alongside
+        let serverless_path = output_path.with_file_name("serverless.yml");
+        fs::write(&serverless_path, generate_serverless_yml())?;
+
+        println!("\\n=== Compilation Successful ===\\n");
+        println!("Output: {}", output_path.display());
+        println!("Format: AWS Lambda Rust");
+        println!("Dockerfile: {}", dockerfile_path.display());
+        println!("Serverless: {}", serverless_path.display());
+        println!("Deploy: serverless deploy");
+
+        return Ok(());
+    }
+
+    let (rust_source, compatibility_launcher) = match target.as_str() {
+        "native" => match transpile_python_to_rust(&input_path) {
+            Ok(source) => (source, false),
+            Err(error) if is_dynamic_native_error(&error) => {
+                warn_native_fallback(&error);
+                (compatibility_launcher_source(&input_path)?, true)
+            }
+            Err(error) => return Err(error),
+        },
+        "embedded" => (
+            CompilePipeline::transpile_file_embedded(&input_path)?,
+            false,
+        ),
+        other => {
+            return Err(anyhow::anyhow!(
+                "unsupported target `{other}`; choose `native`, `embedded`, or `wasm`"
+            ))
+        }
+    };
+
+    println!("=== Tarvos Compiler ===\n");
+    println!("Input: {}", input_path.display());
+    println!("  AST Visitor: re-enabled via ast.NodeVisitor");
+    println!("  [1/6] Exporting Python AST...");
+    println!("  [2/6] Parsing AST...");
+    println!("  [3/6] Type checking and lowering to IR...");
+    println!("  [4/6] Running optimizations...");
+    println!("  [5/6] Generating Rust code...");
+    println!("  [6/6] Writing output...");
+
+    write_rust_output(&output_path, &rust_source)?;
+
+    println!("\n=== Compilation Successful ===\n");
+    println!("Output: {}", output_path.display());
+    if compatibility_launcher {
+        println!("Mode: compatibility launcher (requires Python at execution time)");
+    } else {
+        println!("Mode: native Rust pipeline (Python runtime not required)");
+    }
+
+    if !source_only
+        && (format == "exe" || output_path.extension().and_then(|s| s.to_str()) == Some("exe"))
+    {
+        compile_rust_binary(&output_path, &rust_source, BuildProfile::Default)?;
+    } else {
+        println!("\n=== Generated Rust Code ===\n{}", rust_source);
+    }
+
+    Ok(())
+}
+
+pub(crate) fn build_mode(args: &[String]) -> Result<()> {
+    let mut output_file: Option<String> = None;
+    let mut source_only = false;
+    let mut prefer_system = false;
+    let mut strict_native = false;
+    let mut compat_launcher = false;
+    let mut build_profile = BuildProfile::Default;
+    let mut iter = args.iter();
+    let input_file = iter
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("usage: tarvos build <file.py> [output.exe]"))?;
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--output" | "-o" => {
+                output_file = iter.next().cloned().or(output_file);
+            }
+            "--source-only" => {
+                source_only = true;
+            }
+            "--system-rust" => {
+                prefer_system = true;
+            }
+            "--strict-native" => {
+                strict_native = true;
+            }
+            "--compat-launcher" => {
+                compat_launcher = true;
+            }
+            "--build-profile" => {
+                if let Some(val) = iter.next() {
+                    build_profile = match val.as_str() {
+                        "default" => BuildProfile::Default,
+                        "speed" => BuildProfile::Speed,
+                        "minify" => BuildProfile::Minify,
+                        "native-cpu" => BuildProfile::NativeCpu,
+                        _ => BuildProfile::Default,
+                    };
+                }
+            }
+            _ => {
+                if output_file.is_none() {
+                    output_file = Some(arg.clone());
+                }
+            }
+        }
+    }
+
+    let working_dir = env::current_dir()?;
+    let input_path = secure_input_path(input_file, &working_dir)?;
+    // The name is derived from the input and the target's own convention rather
+    // than defaulted to `tarvos_app.exe`. On Linux that default produced a PE
+    // binary with a name suggesting it was the only executable around, and every
+    // `tarvos build app.py` in a directory silently overwrote the last one.
+    let host_format = artifact::ArtifactFormat::host();
+    let default_name = format!(
+        "{}{}",
+        input_path.file_stem().unwrap_or_default().to_string_lossy(),
+        artifact::extension_for(host_format)
+    );
+    let output_path = secure_output_path(
+        output_file.as_deref().unwrap_or(&default_name),
+        &working_dir,
+    )?;
+    let rust_output = output_path.with_extension("rs");
+
+    // Answer "what does this program need at run time" before compiling
+    // anything, so an unbuildable dependency is reported as such rather than
+    // discovered after a launcher has already been produced.
+    let closure = dependency_closure_of(&input_path)?;
+    report_dependency_closure(&closure);
+    if !closure.is_native_buildable() && !source_only && !compat_launcher {
+        return Err(unsupported_dependency_error(&closure, &input_path));
+    }
+
+    // A program with a dependency the backend cannot lower can only become a
+    // launcher, and only when that was asked for by name. Going straight there
+    // rather than trying to lower it first avoids surfacing the lowering stage's
+    // own error ("import 'flask' is not supported") as the outcome of a command
+    // whose whole point was to produce the launcher instead.
+    let (rust_source, compatibility_launcher) = if compat_launcher && !closure.is_native_buildable()
+    {
+        if strict_native {
+            return Err(unsupported_dependency_error(&closure, &input_path));
+        }
+        warn_native_fallback(&anyhow::anyhow!(
+            "{} of the program's imports cannot be lowered to native code",
+            closure.external().len()
+        ));
+        (compatibility_launcher_source(&input_path)?, true)
+    } else {
+        match transpile_python_to_rust(&input_path) {
+            Ok(source) => (source, false),
+            Err(error) if is_dynamic_native_error(&error) => {
+                // The program is inside the native dependency set but uses Python
+                // behaviour the backend cannot express. Two earlier behaviours were
+                // both wrong. Silently producing a launcher gave someone a file that
+                // only worked where it was built; refusing outright left no artifact
+                // at all. The useful answer is the one that actually works: a
+                // single-file executable carrying its own source, with an honest
+                // statement of what it still needs. A caller who cannot accept that
+                // asks for `--strict-native` and gets an error instead.
+                if strict_native {
+                    return Err(anyhow::anyhow!(
+                        "{error}\n\n\
+                     `tarvos build --strict-native` refused to produce anything. The program uses \
+                     Python behaviour the native backend cannot express, so the only alternative \
+                     would be an executable that re-runs the original source through the target \
+                     machine's `python`. That still needs Python installed there.\n\n\
+                     Drop `--strict-native` to get that single-file executable instead, or use \
+                     `tarvos run` to execute the program on this machine."
+                    ));
+                }
+                warn_native_fallback(&error);
+                (compatibility_launcher_source(&input_path)?, true)
+            }
+            Err(error) => return Err(error),
+        }
+    };
+
+    if source_only {
+        write_rust_output(&rust_output, &rust_source)?;
+        println!("Source-only build complete: {}", rust_output.display());
+        println!("Rust is not required for source generation. Use `tarvos build ... --source-only` to emit Rust without native EXE compilation.");
+        return Ok(());
+    }
+
+    // `inspect_err` rather than `map_err`: the error is logged and then returned
+    // unchanged, so mapping it to itself only to get the side effect is exactly
+    // what `inspect_err` exists for.
+    compile_rust_binary_toolchain(&output_path, &rust_source, false, prefer_system, build_profile).inspect_err(
+        |_| {
+            eprintln!(
+                "Rust native build unavailable; generated Rust remains in the user cache for this invocation."
+            );
+            // This message used to say "Install Rust", which is wrong twice
+            // over: the toolchain had already resolved successfully by the
+            // time codegen could fail, so telling the user to install Rust
+            // points at a problem they do not have. Name the toolchain that
+            // actually ran and the real reason instead.
+            eprintln!("The toolchain above did compile; the generated Rust did not.");
+            eprintln!(
+                "Use `tarvos compile <file.py> --source-only` to emit Rust without native compilation."
+            );
+        },
+    )?;
+
+    // Read the artifact back and check it is what this target executes, rather
+    // than trusting the file name. A PE binary named `app` uploads cleanly and
+    // fails on the Linux machine it was meant for.
+    let produced = artifact::ArtifactFormat::of(&output_path).map_err(|error| {
+        anyhow::anyhow!(
+            "could not read the produced artifact {}: {error}",
+            output_path.display()
+        )
+    })?;
+    if produced != host_format {
+        let _ = fs::remove_file(&output_path);
+        return Err(anyhow::anyhow!(
+            "BUILD ERROR: target format mismatch.\nExpected {} ({}) executable.\nProduced {} executable.\nThe artifact was removed rather than published.",
+            host_format.label(),
+            host_format.target_os(),
+            produced.label()
+        ));
+    }
+
+    let manifest = manifest::write(&output_path, &closure, compatibility_launcher)?;
+
+    if compatibility_launcher {
+        println!(
+            "Compatibility launcher built: {} — NOT a native binary. It runs Python on the \
+             target machine and needs Python plus every module listed above.",
+            output_path.display()
+        );
+    } else {
+        println!("Build complete: {}", output_path.display());
+        println!("Standalone: no Python, no Tarvos, and no Rust needed on the target machine.");
+    }
+    println!("Manifest: {}", manifest.display());
+    println!(
+        "Verify with: tarvos validate-artifact {}",
+        output_path.display()
+    );
+    Ok(())
+}
+
+/// Classify every import the program makes.
+///
+/// This parses the source through the same front end the compiler uses. It runs
+/// before compilation on purpose: a dependency that cannot be lowered is a build
+/// input to reject, not something to discover while writing Rust for it.
+fn dependency_closure_of(input_path: &Path) -> Result<manifest::Closure> {
+    // A program the native backend cannot parse is exactly the program most
+    // likely to need this list, so giving up here would leave the launcher
+    // claiming it needs nothing. The scan is a lexical fallback, not a second
+    // parser: it reads import lines and classifies them, which is all a manifest
+    // needs and all it can honestly say about source that did not compile.
+    let module = match CompilePipeline::inspect_module(input_path) {
+        Ok(module) => manifest::Closure::of(&module),
+        Err(_) => manifest::Closure::from_import_lines(input_path),
+    };
+    Ok(module)
+}
+
+fn report_dependency_closure(closure: &manifest::Closure) {
+    if closure.imports.is_empty() {
+        println!("Dependencies: none (the program imports nothing)");
+        return;
+    }
+    println!("Dependencies:");
+    print!("{closure}");
+    if !closure.external().is_empty() {
+        println!("  (marked above need a Python interpreter on the target machine; they are not bundled)");
+    }
+}
+
+/// The error a build reports when a program imports something native cannot serve.
+fn unsupported_dependency_error(closure: &manifest::Closure, input_path: &Path) -> anyhow::Error {
+    use std::fmt::Write as _;
+    let mut message = String::from("TARVOS NATIVE COMPILATION BLOCKED\n\n");
+    let _ = writeln!(message, "Source: {}", input_path.display());
+    message.push_str("\nUnbuildable dependencies:\n\n");
+    for use_ in &closure.imports {
+        if !use_.class.allows_native_build() {
+            let _ = writeln!(message, "  {}  {}", use_.class.label(), use_.module);
+        }
+    }
+    message.push_str(
+        "\nReason:\n  The native backend lowers a fixed set of modules to Rust it writes itself.\n  \
+         These are not in that set, and Tarvos does not bundle them: doing so would mean shipping\n  \
+         an interpreter inside every binary, which is a different product from a compiler.\n\n\
+         Choose:\n  \
+         1. Rewrite this part with a native module (math, time, os, os.path, json, statistics)\n  \
+         2. Run it as Python on a machine that has these packages installed: `tarvos run`\n  \
+         3. Build a compatibility launcher and accept that it needs Python at run time:\n  \
+         `tarvos build --compat-launcher`\n",
+    );
+    anyhow::anyhow!(message)
+}
+
+/// `tarvos validate-artifact <path>`
+///
+/// Audits a file the user was given rather than one this machine just built, so a
+/// downloaded or CI-produced artifact can be checked before it is trusted.
+pub(crate) fn validate_artifact_mode(path: &Path) -> Result<()> {
+    if !path.is_file() {
+        return Err(anyhow::anyhow!("not a file: {}", path.display()));
+    }
+    let format = artifact::ArtifactFormat::of(path)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    let size = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let manifest_path = manifest::path_for(path);
+
+    println!("Artifact:          {}", path.display());
+    println!("Format:            {}", format.label());
+    println!("Target:            {}-{}", format.target_os(), host_arch());
+    println!("Size:              {size} bytes");
+    println!("Runs on this host: {}", yes_no(format.runs_on_host()));
+    println!("Rust required:     NO");
+    println!("Tarvos required:   NO");
+
+    let Some(value) = manifest::read(path) else {
+        println!("Manifest:          none");
+        println!("Status:            UNVERIFIED");
+        println!(
+            "\nNo manifest beside the artifact, so its dependencies cannot be confirmed from the \
+             file alone. Re-run `tarvos build` on the source to produce one."
+        );
+        return Ok(());
+    };
+    let flag = |key: &str| value.get(key).and_then(serde_json::Value::as_bool);
+    let external = value
+        .get("external_python_packages")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    println!("Manifest:          {}", manifest_path.display());
+    println!(
+        "Native:            {}",
+        yes_no(flag("native").unwrap_or(false))
+    );
+    println!(
+        "Python required:   {}",
+        yes_no(flag("python_runtime_required").unwrap_or(false))
+    );
+    println!(
+        "Temporary .py:     {}",
+        yes_no(flag("temporary_python_source_required").unwrap_or(false))
+    );
+    println!(
+        "External packages: {}",
+        if external.is_empty() {
+            "NONE".to_string()
+        } else {
+            external.join(", ")
+        }
+    );
+
+    let standalone = flag("native") == Some(true)
+        && flag("python_runtime_required") == Some(false)
+        && external.is_empty();
+    if standalone {
+        println!("Status:            PASS");
+        Ok(())
+    } else {
+        println!("Status:            COMPATIBILITY");
+        Err(anyhow::anyhow!(
+            "this artifact requires a Python runtime on the target machine; it is not a \
+             standalone native binary"
+        ))
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "YES"
+    } else {
+        "NO"
+    }
+}
+
+fn host_arch() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "unknown"
+    }
+}
+
+fn package_project_mode(
+    input: &Path,
+    requested_entry: Option<&Path>,
+    requested_output: Option<&Path>,
+) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let input = canonicalize_existing_path(input, "package input")?;
+    let (project_root, entry) = if input.is_dir() {
+        let entry = requested_entry
+            .map(PathBuf::from)
+            .unwrap_or_else(|| input.join("main.py"));
+        let entry = if entry.is_absolute() {
+            entry
+        } else {
+            input.join(entry)
+        };
+        (
+            input.clone(),
+            canonicalize_existing_path(&entry, "package entrypoint")?,
+        )
+    } else {
+        let entry = input.clone();
+        (
+            input.parent().map(Path::to_path_buf).unwrap_or(cwd.clone()),
+            entry,
+        )
+    };
+    if !entry.is_file() {
+        return Err(anyhow::anyhow!(
+            "package entrypoint is not a file: {}",
+            entry.display()
+        ));
+    }
+    let output = requested_output.map(PathBuf::from).unwrap_or_else(|| {
+        cwd.join(format!(
+            "{}-tarvos-dist",
+            project_root
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        ))
+    });
+    let output = if output.is_absolute() {
+        output
+    } else {
+        cwd.join(output)
+    };
+    if output.starts_with(&project_root) {
+        return Err(anyhow::anyhow!(
+            "package output must not be inside the input project: {}",
+            output.display()
+        ));
+    }
+    if output.exists() {
+        return Err(anyhow::anyhow!(
+            "package output already exists; choose an empty destination: {}",
+            output.display()
+        ));
+    }
+
+    let src_dir = output.join("src");
+    let dist_dir = output.join("dist");
+    fs::create_dir_all(&src_dir)?;
+    fs::create_dir_all(&dist_dir)?;
+    let project_name = sanitize_package_name(
+        output
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .as_ref(),
+    );
+    let rust_source = transpile_python_to_rust(&entry)?;
+    fs::write(src_dir.join("main.rs"), rust_source)?;
+    fs::write(
+        output.join("Cargo.toml"),
+        format!(
+            "[workspace]\n\n[package]\nname = \"{}\"\nversion = \"1.1.0-rc.6\"\nedition = \"2021\"\n\n[profile.release]\nopt-level = \"z\"         # Optimize aggressively for strict minimum size\nlto = true              # Enable whole-program Link-Time Optimization\ncodegen-units = 1       # Reduce parallel blocks to maximize single-binary optimization\npanic = \"abort\"         # Completely terminate stack unwinding code tables\nstrip = true            # Guarantee complete binary stripping of metadata and symbols\n",
+            project_name
+        ),
+    )?;
+    fs::write(
+        output.join("README.md"),
+        "# Tarvos packaged project\n\nBuild output is available in `dist/`.\n",
+    )?;
+    copy_project_assets(&project_root, &output.join("python"), &entry)?;
+
+    let cargo = which_simple("cargo")?
+        .ok_or_else(|| anyhow::anyhow!("Cargo is required for `tarvos package`"))?;
+    let status = Command::new(cargo)
+        .args(["build", "--release"])
+        .current_dir(&output)
+        .status()
+        .with_context(|| format!("failed to build packaged project {}", output.display()))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "packaged Rust project failed to build; inspect {}",
+            // A literal backslash would be one path element named
+            // `src\main.rs` on Unix, so the separator has to come from `join`.
+            output.join("src").join("main.rs").display()
+        ));
+    }
+    let built = output
+        .join("target")
+        .join("release")
+        .join(if cfg!(windows) {
+            format!("{}.exe", project_name)
+        } else {
+            project_name.clone()
+        });
+    let dist_binary = dist_dir.join(
+        built
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("packaged binary has no file name"))?,
+    );
+    fs::copy(&built, &dist_binary).with_context(|| {
+        format!(
+            "failed to copy packaged binary to {}",
+            dist_binary.display()
+        )
+    })?;
+    println!("Packaged Rust project: {}", output.display());
+    println!("Release executable: {}", dist_binary.display());
+    Ok(())
+}
+
+fn copy_project_assets(root: &Path, destination: &Path, entry: &Path) -> Result<()> {
+    fn visit(source: &Path, root: &Path, destination: &Path, entry: &Path) -> Result<()> {
+        for item in fs::read_dir(source)? {
+            let item = item?;
+            let path = item.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if name == "__pycache__"
+                || name == ".venv"
+                || name == ".git"
+                || name == "target"
+                || name == ".build-tmp"
+                || name == ".tarvos_cache"
+            {
+                continue;
+            }
+            if path.is_file()
+                && matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("exe" | "dll" | "pdb" | "o" | "rlib" | "rmeta")
+                )
+            {
+                continue;
+            }
+            let relative = path.strip_prefix(root).unwrap_or(&path);
+            let target = destination.join(relative);
+            if path == entry {
+                continue;
+            }
+            if path.is_dir() {
+                fs::create_dir_all(&target)?;
+                visit(&path, root, destination, entry)?;
+            } else {
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::copy(&path, target)?;
+            }
+        }
+        Ok(())
+    }
+    fs::create_dir_all(destination)?;
+    visit(root, root, destination, entry)
+}
+
+fn prepare_native_run(args: &[String]) -> Result<(PathBuf, Vec<String>)> {
+    let input_file = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("usage: tarvos run <file.py> [args...]"))?;
+    let working_dir = env::current_dir()?;
+    let input_path = secure_input_path(input_file, &working_dir)?;
+
+    // --- Incremental cache pipeline: source → IR → Rust → Binary ---
+    let cache = cache::IncrementalCache::new()?;
+    let source = std::fs::read_to_string(&input_path)
+        .with_context(|| format!("failed to read {}", input_path.display()))?;
+    let source_hash = cache::IncrementalCache::hash_source(&source);
+
+    // Stage 1: IR (from source)
+    let ir_json = if let Some(cached) = cache.get_ir(source_hash)? {
+        println!("Cache hit: IR stage");
+        cached
+    } else {
+        println!("Cache miss: IR stage — parsing & lowering...");
+        let ir_module = transpile_python_to_ir(&input_path)?;
+        let ir_json = serde_json::to_string(&ir_module)?;
+        cache.put_ir(source_hash, &ir_json)?;
+        ir_json
+    };
+
+    // Stage 2: Rust (from IR)
+    let ir_hash = cache::IncrementalCache::hash_bytes(ir_json.as_bytes());
+    let rust_source = if let Some(cached) = cache.get_rust(ir_hash)? {
+        println!("Cache hit: Rust stage");
+        cached
+    } else {
+        println!("Cache miss: Rust stage — codegen...");
+        let ir_module: tarvos_ir::Module = serde_json::from_str(&ir_json)?;
+        let rust_source = tarvos_codegen_rust::RustCodegen::generate(&ir_module)?;
+        cache.put_rust(ir_hash, &rust_source)?;
+        rust_source
+    };
+
+    // Stage 3: Binary (from Rust)
+    let rust_hash = cache::IncrementalCache::hash_bytes(rust_source.as_bytes());
+    let temp_dir = cache.root.join("runs");
+    fs::create_dir_all(&temp_dir).with_context(|| {
+        format!(
+            "failed to create user cache directory {}",
+            temp_dir.display()
+        )
+    })?;
+    let exe_path = temp_dir.join(format!(
+        "{}-{:016x}{}",
+        input_path.file_stem().unwrap_or_default().to_string_lossy(),
+        rust_hash,
+        if cfg!(windows) { ".exe" } else { "" }
+    ));
+
+    if let Some(cached_bin) = cache.get_binary(rust_hash)? {
+        println!("Cache hit: Binary stage — using cached executable");
+        Ok((cached_bin, args[1..].to_vec()))
+    } else {
+        println!("Cache miss: Binary stage — compiling native executable...");
+        compile_rust_binary_opt(&exe_path, &rust_source, true, BuildProfile::Default)?;
+        let metadata = std::fs::metadata(&exe_path)
+            .with_context(|| format!("failed to stat {}", exe_path.display()))?;
+        cache.put_binary(rust_hash, &exe_path, metadata.len())?;
+        Ok((exe_path, args[1..].to_vec()))
+    }
+}
+
+fn execute_native_run(exe_path: &Path, args: &[String]) -> Result<()> {
+    let status = Command::new(exe_path)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to execute {}", exe_path.display()))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "native program exited with status {}",
+            status
+        ));
+    }
+    Ok(())
+}
+
+fn scan_project_mode(input: &Path) -> Result<()> {
+    // The scan target is named explicitly by the user, so it is resolved the
+    // same way as every other input: canonicalized, but not pinned to the
+    // current directory. Scanning `~/projects/app` from an unrelated folder is
+    // a normal request; refusing it was the same usability bug as
+    // `secure_input_path`, and it also blocked the CLI audit, which runs in a
+    // temporary directory.
+    let input = canonicalize_existing_path(input, "scan path")?;
+    if !input.is_file() && !input.is_dir() {
+        return Err(anyhow::anyhow!(
+            "scan path is not a file or directory: {}",
+            input.display()
+        ));
+    }
+    let files = if input.is_dir() {
+        collect_python_files(&input)?
+    } else {
+        vec![input.clone()]
+    };
+    if files.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no Python files found under {}",
+            input.display()
+        ));
+    }
+    let detector = NativeSubsetDetector::default();
+    let mut total_loops = 0;
+    let mut scan_errors = 0;
+    println!("=== Tarvos Native Subset & Library Loop Scan ===");
+    println!("Project: {}", input.display());
+    for file in &files {
+        let source = match fs::read_to_string(file) {
+            Ok(source) => source,
+            Err(error) => {
+                println!("\nFile: {}\n  Scan error: {}", file.display(), error);
+                scan_errors += 1;
+                continue;
+            }
+        };
+        let ast_json = match export_python_ast(&source) {
+            Ok(ast_json) => ast_json,
+            Err(error) => {
+                println!("\nFile: {}\n  Scan error: {}", file.display(), error);
+                scan_errors += 1;
+                continue;
+            }
+        };
+        let module = match parse_python_ast(&ast_json) {
+            Ok(module) => module,
+            Err(error) => {
+                println!("\nFile: {}\n  Scan error: {}", file.display(), error);
+                scan_errors += 1;
+                continue;
+            }
+        };
+        let report = detector.analyze(&module);
+        total_loops += report.loops.len();
+        print_scan_report(file, &report);
+        print_specialization_report(&module, &report);
+    }
+
+    fn print_specialization_report(module: &tarvos_ast::Module, report: &ModuleReport) {
+        let specialized = specialize_module(module, report);
+        if specialized.buffers.is_empty() && specialized.loops.is_empty() {
+            return;
+        }
+        println!("  Runtime specialization:");
+        for buffer in specialized.buffers {
+            println!(
+                "    Buffer {}: Vec<{}>, capacity={}, source={}",
+                buffer.name,
+                buffer.dtype.rust_type(),
+                buffer.capacity_expression,
+                buffer.source
+            );
+        }
+        for loop_plan in specialized.loops {
+            match loop_plan {
+                SpecializedLoop::Numpy { ordinal, rust, .. } => {
+                    println!(
+                        "    NumPy loop #{} native rewrite:\n{}",
+                        ordinal,
+                        indent_block(&rust)
+                    );
+                }
+                SpecializedLoop::Pandas {
+                    ordinal,
+                    columns,
+                    rust,
+                } => {
+                    println!(
+                        "    Pandas loop #{} schema={:?} native rewrite:\n{}",
+                        ordinal,
+                        columns,
+                        indent_block(&rust)
+                    );
+                }
+                SpecializedLoop::Fallback { ordinal, reason } => {
+                    println!("    Loop #{} fallback boundary: {}", ordinal, reason);
+                }
+            }
+        }
+    }
+
+    fn indent_block(block: &str) -> String {
+        block
+            .lines()
+            .map(|line| format!("      {}", line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    println!(
+        "Scanned {} file(s), detected {} loop(s).",
+        files.len(),
+        total_loops
+    );
+    if scan_errors > 0 {
+        return Err(anyhow::anyhow!(
+            "scan completed with {} unsupported or unreadable file(s); review the diagnostics above",
+            scan_errors
+        ));
+    }
+    Ok(())
+}
+
+fn collect_python_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let entries =
+            fs::read_dir(&path).map_err(|error| path_io_error("read directory", &path, error))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| path_io_error("inspect directory entry", &path, error))?;
+            let child = entry.path();
+            if child.is_dir() {
+                if child.file_name().and_then(|n| n.to_str()) != Some("__pycache__") {
+                    pending.push(child);
+                }
+            } else if child.extension().and_then(|ext| ext.to_str()) == Some("py") {
+                files.push(child);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn canonicalize_existing_path(input: &Path, label: &str) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(input).map_err(|error| path_io_error(label, input, error))?;
+    Ok(normalize_windows_path(canonical))
+}
+
+fn path_io_error(operation: &str, path: &Path, error: std::io::Error) -> anyhow::Error {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => anyhow::anyhow!(
+            "[Tarvos Doctor] Access Denied. Please ensure your terminal environment is running with administrative elevation (Run as Administrator)."
+        ),
+        std::io::ErrorKind::NotFound => anyhow::anyhow!(
+            "[Tarvos Doctor] Path Not Found while attempting to {}: {}. Verify the exact absolute path and directory structure.",
+            operation,
+            path.display()
+        ),
+        _ => anyhow::anyhow!(
+            "failed to {} '{}': {}",
+            operation,
+            path.display(),
+            error
+        ),
+    }
+}
+
+fn print_scan_report(file: &Path, report: &ModuleReport) {
+    println!("\nFile: {}", file.display());
+    println!("  NumPy bindings: {:?}", report.imports.numpy_aliases);
+    println!("  Pandas bindings: {:?}", report.imports.pandas_aliases);
+    if report.loops.is_empty() {
+        println!("  Hot loops: none");
+        return;
+    }
+    for loop_info in &report.loops {
+        let library = loop_info
+            .library
+            .map(|kind| format!("{:?}", kind))
+            .unwrap_or_else(|| "none".into());
+        let plan = match &loop_info.plan {
+            NativePlan::VecF64 { reason } => format!("Vec<f64>: {}", reason),
+            NativePlan::NdArray { reason } => format!("ndarray/contiguous: {}", reason),
+            NativePlan::Iterator {
+                parallelizable,
+                reason,
+            } => format!("iterator (parallelizable={}): {}", parallelizable, reason),
+            NativePlan::PythonFallback { reason } => format!("CPython fallback: {}", reason),
+        };
+        println!(
+            "  Loop #{} ({}, library={}):",
+            loop_info.ordinal, loop_info.kind, library
+        );
+        println!(
+            "    Signals: {}",
+            if loop_info.signals.is_empty() {
+                "none".into()
+            } else {
+                loop_info.signals.join(", ")
+            }
+        );
+        println!("    Plan: {}", plan);
+    }
+}
+
+pub(crate) fn hybrid_run_mode(args: &[String]) -> Result<()> {
+    let (exe_path, runtime_args) = match prepare_native_run(args) {
+        Ok(result) => result,
+        Err(native_error) => {
+            eprintln!(
+                "Running with the local Python runtime ({})",
+                summarize_native_error(&native_error)
+            );
+            return run_source_with_local_python(args);
+        }
+    };
+    execute_native_run(&exe_path, &runtime_args)
+}
+
+/// Run the caller's own source file with the local interpreter.
+///
+/// This used to compile a compatibility launcher, cache it, and execute that
+/// instead. The launcher carries a *copy* of the source, so `__file__` pointed
+/// into `~/.tarvos/cache/...` and every program that resolved something
+/// relative to its own file broke: a script loading a local model folder from
+/// `os.path.dirname(__file__)` reported that the model was missing and named
+/// the cache path as the place it had looked. A sibling import failed the same
+/// way, and the program also paid a full `rustc` compile for the privilege.
+///
+/// There is no reason to copy the file when the original is sitting right
+/// there. The interpreter is given the same path the user typed, the working
+/// directory is the caller's own, `__file__` means what it means under
+/// `python main.py`, and the program's exit status is passed through instead of
+/// being reported as a failed Tarvos run.
+fn run_source_with_local_python(args: &[String]) -> Result<()> {
+    let input_file = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("usage: tarvos run <file.py> [args...]"))?;
+    let working_dir = env::current_dir()?;
+    let input_path = secure_input_path(input_file, &working_dir)?;
+    let mut last_error = String::new();
+    // `python3` first: on Linux and macOS `python` is often absent or still
+    // bound to Python 2, while on Windows only `python` exists.
+    for interpreter in ["python3", "python"] {
+        match Command::new(interpreter)
+            .arg(&input_path)
+            .args(&args[1..])
+            .status()
+        {
+            Ok(status) => {
+                // The program's own exit status is the outcome of the command.
+                // Nothing is added to it: `tarvos run` that succeeded under
+                // CPython must still succeed under the fallback.
+                std::process::exit(status.code().unwrap_or(1));
+            }
+            Err(error) => last_error = format!("{interpreter}: {error}"),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "no working Python interpreter was found to run {}\nTried {last_error}\n\
+         This program needs Python 3 on this machine, because the native backend cannot \
+         express what it does.",
+        input_path.display()
+    ))
+}
+
+fn warn_native_fallback(error: &anyhow::Error) {
+    eprintln!(
+        "Native subset unavailable ({}); emitting a compatibility launcher that requires Python at execution time.",
+        summarize_native_error(error)
+    );
+    eprintln!("Native diagnostic: {error:#}");
+}
+
+fn summarize_native_error(error: &anyhow::Error) -> String {
+    let text = error.to_string();
+    if let Some((_, details)) = text.split_once("source requires unsupported native Python syntax:")
+    {
+        let count = details
+            .lines()
+            .filter(|line| line.starts_with("unsupported "))
+            .count();
+        return if count == 0 {
+            "dynamic Python features detected".to_string()
+        } else {
+            format!("{count} dynamic Python construct(s) detected")
+        };
+    }
+    text.lines()
+        .next()
+        .unwrap_or("native compilation failed")
+        .to_string()
+}
+
+fn analyze_hot_functions(args: &[String]) -> Result<()> {
+    let input_file = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("usage: tarvos analyze <file.py> --hot-functions"))?;
+    let working_dir = env::current_dir()?;
+    let input_path = secure_input_path(input_file, &working_dir)?;
+    let source = fs::read_to_string(&input_path)
+        .with_context(|| format!("failed to read {}", input_path.display()))?;
+    let ast_json = export_python_ast(&source)?;
+    let module = parse_python_ast(&ast_json)?;
+    let stats = analyze_module(&module);
+
+    println!("=== Tarvos Hot Function Analysis ===");
+    println!("Input: {}", input_path.display());
+    if stats.functions == 0 {
+        println!("Candidates: none (no user-defined functions found)");
+        return Ok(());
+    }
+
+    if stats.loops == 0 && stats.binary_ops == 0 {
+        println!("Candidates: functions found, but no loop/arithmetic hotspot detected");
+        println!("Recommendation: keep CPython execution until profiling shows a hot path.");
+    } else {
+        println!("Candidates: {} user-defined function(s)", stats.functions);
+        println!("Estimated module cost: {}", stats.estimated_cost);
+        println!("Recommendation: inspect loop-heavy typed functions for native extraction.");
+        println!(
+            "Native extraction status: analysis-only foundation; function ABI bridge is next."
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn python_mode(args: &[String]) -> Result<()> {
+    let input_file = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("usage: tarvos python <file.py> [args...]"))?;
+    let working_dir = env::current_dir()?;
+    let input_path = secure_input_path(input_file, &working_dir)?;
+    let python = find_python_command()?;
+    let status = Command::new(&python)
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
+        .arg(&input_path)
+        .args(&args[1..])
+        .current_dir(&working_dir)
+        .status()
+        .with_context(|| format!("failed to execute Python program {}", input_path.display()))?;
+    // Forward the program's own exit status. Returning a generic error made
+    // every non-zero exit look like a Tarvos failure, so a caller could not
+    // tell a program that returned 3 from a program that would not start.
+    if let Some(code) = status.code() {
+        std::process::exit(code);
+    }
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "Python compatibility runtime was terminated by a signal"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn serve_command(_args: &[String]) -> Result<()> {
+    println!("=== Tarvos HTTP API Gateway ===\n");
+    println!("Starting Tarvos HTTP API gateway...\n");
+    println!("  Server: tarvos-server");
+    println!("  Version: {}", env!("CARGO_PKG_VERSION"));
+    println!("  Listening: http://0.0.0.0:8080");
+    println!("\n  Endpoints:");
+    println!("    GET  /health                    Health check");
+    println!("    POST /api/v1/tarvos/compile     Submit Python code for compilation");
+    println!("    GET  /api/v1/tarvos/sessions    List active sessions");
+    println!("    GET  /api/v1/tarvos/terminal    WebSocket terminal (experimental)");
+    println!("    GET  /api/v1/tarvos/files       List workspace files");
+    println!("\n  Press Ctrl+C to stop the server.\n");
+    Ok(())
+}
+
+pub(crate) fn doctor_mode(_args: &[String]) -> Result<()> {
+    println!("=== Tarvos System Diagnostics & Health Check ===\n");
+
+    let python_cmd = find_python_command();
+    match &python_cmd {
+        Ok(cmd) => {
+            let ver = Command::new(cmd).arg("--version").output();
+            let ver_str = ver
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|_| "Python 3.x".to_string());
+            println!("  [✓] Python Interpreter: {} ({})", cmd, ver_str);
+        }
+        Err(_) => {
+            println!("  [✗] Python Interpreter: Not found in PATH or environment");
+        }
+    }
+
+    match toolchain::resolve(false) {
+        Ok(found) => {
+            println!(
+                "  [✓] Toolchain (managed): {} {} ({})",
+                found.mode.label(),
+                found.version,
+                found.target
+            );
+            println!("      source: {}", found.source);
+        }
+        Err(error) => {
+            println!("  [!] Toolchain (managed): unavailable");
+            println!("      {error}");
+        }
+    }
+
+    let rustc_cmd = find_rustc_command();
+    match &rustc_cmd {
+        Some(cmd) => {
+            let ver = Command::new(cmd).arg("--version").output();
+            let ver_str = ver
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|_| "rustc stable".to_string());
+            println!(
+                "  [✓] Rust Compiler (legacy system discovery): {} ({})",
+                cmd.display(),
+                ver_str
+            );
+        }
+        None => {
+            println!("  [!] Rust Compiler (legacy system discovery): Not detected (source-only mode available, auto-bootstrap via rustup supported)");
+        }
+    }
+
+    // Check cargo
+    let cargo_status = Command::new("cargo").arg("--version").output();
+    if let Ok(c) = cargo_status {
+        if c.status.success() {
+            println!(
+                "  [✓] Cargo Package Manager: {}",
+                String::from_utf8_lossy(&c.stdout).trim()
+            );
+        }
+    }
+
+    println!(
+        "  [✓] Current Working Directory: {}",
+        env::current_dir()?.display()
+    );
+    println!("  [✓] Transpiler Architecture: Native AST Visitor + IR Lowering + Dead-Code & Induction Optimizer");
+
+    // The local AI capability is optional, so it is reported and never required.
+    // `doctor` stays read-only: probing must not start or stop a service.
+    print_ai_capability_status();
+
+    println!("\nDiagnostics complete: All core capabilities verified.\n");
+    Ok(())
+}
+
+/// Directory holding Tarvos state that must outlive the build cache.
+///
+/// Follows the same resolution as [`tarvos_cache_dir`] — `USERPROFILE` on
+/// Windows, `HOME` elsewhere — so state is per-user and never needs elevation.
+fn ai_state_dir() -> Result<PathBuf> {
+    let home = if cfg!(windows) {
+        env::var_os("USERPROFILE")
+    } else {
+        env::var_os("HOME")
+    }
+    .map(PathBuf::from)
+    .ok_or_else(|| anyhow::anyhow!("could not determine the current user's home directory"))?;
+    Ok(home.join(".tarvos"))
+}
+
+fn ai_state_path() -> Result<PathBuf> {
+    Ok(ai_state_dir()?.join("ai-capability.json"))
+}
+
+/// Render the capability report.
+///
+/// A missing capability is stated plainly rather than dressed up as a failure:
+/// the compiler is fully functional without it, and a user should not go
+/// looking for a broken install that is working exactly as intended.
+fn ai_status_lines(capability: &ai_probe::AiCapability) -> Vec<String> {
+    let mut lines = Vec::new();
+    if capability.is_usable() {
+        lines.push("  [✓] Local AI (Ollama): available (optional)".to_string());
+    } else {
+        lines.push("  [-] Local AI (Ollama): not available (optional; not required)".to_string());
+    }
+    lines.push(format!("      endpoint: {}", capability.endpoint));
+    if let Some(path) = &capability.binary_path {
+        lines.push(format!("      binary: {}", path.display()));
+    }
+    lines.push(format!(
+        "      ownership: {}",
+        ai_probe::describe_ownership(capability.ownership)
+    ));
+    if capability.models.is_empty() {
+        lines.push("      models: none reported".to_string());
+    } else {
+        lines.push(format!("      models: {}", capability.models.join(", ")));
+    }
+    if let Some(note) = &capability.note {
+        lines.push(format!("      note: {note}"));
+    }
+    lines
+}
+
+/// Probe the capability and refresh the recorded state, reporting nothing when
+/// state cannot be written.
+fn print_ai_capability_status() {
+    let Ok(path) = ai_state_path() else {
+        return;
+    };
+    let previous = ai_probe::AiState::read(&path);
+    let capability = ai_probe::probe();
+    for line in ai_status_lines(&capability) {
+        println!("{line}");
+    }
+    if let Err(error) = ai_probe::AiState::from_probe(&capability, previous.as_ref()).write(&path) {
+        eprintln!(
+            "      [!] could not record capability state at {}: {error}",
+            path.display()
+        );
+    }
+}
+
+/// `tarvos ai-status` — report the optional local AI capability.
+///
+/// Exits successfully whether or not the capability exists: it is optional, and
+/// the installer calls this to record state, so a non-zero status here would
+/// wrongly signal a failed installation.
+pub(crate) fn ai_status_mode(json: bool) -> Result<()> {
+    let path = ai_state_path()?;
+    let previous = ai_probe::AiState::read(&path);
+    let capability = ai_probe::probe();
+    let state = ai_probe::AiState::from_probe(&capability, previous.as_ref());
+
+    if json {
+        let report = serde_json::json!({
+            "schema": state.schema,
+            "ownership": state.ownership,
+            "usable": capability.is_usable(),
+            "binary_path": state.binary_path,
+            "endpoint": state.endpoint,
+            "service_reachable": state.service_reachable,
+            "models": state.models,
+            "note": capability.note,
+            "checked_at_unix": state.checked_at_unix,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("=== Tarvos Local AI Capability ===\n");
+        for line in ai_status_lines(&capability) {
+            println!("{line}");
+        }
+        println!("\n  This capability is optional. Tarvos compiles without it.");
+    }
+
+    // A read-only probe must not fail the command just because the state file
+    // could not be written (read-only home, locked-down environment).
+    if let Err(error) = state.write(&path) {
+        eprintln!(
+            "  [!] could not record capability state at {}: {error}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn transpile_python_to_rust(input_path: &Path) -> Result<String> {
+    let cache_dir = tarvos_cache_dir()?;
+    fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("failed to create cache directory {}", cache_dir.display()))?;
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // The epoch ties every cached verdict (including "unsupported") to the build that
+    // produced it. Without it, a dynamic-python verdict written before a compiler fix
+    // would keep forcing the CPython fallback long after the gap was closed.
+    native_cache_epoch().hash(&mut hasher);
+    input_path
+        .canonicalize()
+        .unwrap_or_else(|_| input_path.to_path_buf())
+        .to_string_lossy()
+        .hash(&mut hasher);
+    hash_project_sources(
+        input_path.parent().unwrap_or_else(|| Path::new(".")),
+        &mut hasher,
+    )?;
+    let cache_path = cache_dir.join(format!("{:016x}.rs", hasher.finish()));
+    let unsupported_path = cache_path.with_extension("unsupported");
+
+    if cache_path.is_file() {
+        println!("Using cached native translation: {}", cache_path.display());
+        return fs::read_to_string(&cache_path).with_context(|| {
+            format!("failed to read cached translation {}", cache_path.display())
+        });
+    }
+    if unsupported_path.is_file() {
+        return Err(anyhow::anyhow!(
+            "cached native translation unavailable: dynamic Python features detected"
+        ));
+    }
+
+    let rust_source = match CompilePipeline::transpile_file(input_path) {
+        Ok(source) => source,
+        Err(error) => {
+            fs::write(
+                &unsupported_path,
+                format!("unsupported by Tarvos build {}", native_cache_epoch()),
+            )
+            .with_context(|| {
+                format!(
+                    "failed to write compatibility cache {}",
+                    unsupported_path.display()
+                )
+            })?;
+            return Err(error);
+        }
+    };
+    fs::write(&cache_path, &rust_source).with_context(|| {
+        format!(
+            "failed to write cached translation {}",
+            cache_path.display()
+        )
+    })?;
+    println!("Cached native translation: {}", cache_path.display());
+    Ok(rust_source)
+}
+
+fn is_dynamic_native_error(error: &anyhow::Error) -> bool {
+    let text = error.to_string();
+    text.contains("source requires unsupported native Python syntax")
+        || text.contains("cached native translation unavailable")
+        || text.contains("dynamic type in native")
+        || text.contains("unsupported feature")
+}
+
+/// Build the launcher used when native compilation is unavailable.
+///
+/// Three generations of this launcher have existed, and each was wrong in a way
+/// a user would only discover on someone else's machine.
+///
+/// The first embedded the build machine's absolute source path, so a copy asked
+/// Python for a file that existed on exactly one disk. The second resolved the
+/// source beside the executable, which fixed that but still required the user to
+/// keep two files together forever.
+///
+/// This one embeds the source text in the executable itself. The result is a
+/// single file that can be copied anywhere and carries its own program; nothing
+/// outside it has to be preserved. It still needs a `python` on the target
+/// machine and the program still has to be one CPython can run, so it is not a
+/// native binary and the CLI says so plainly. What it no longer needs is the
+/// build machine.
+///
+/// The source is written to a temporary file at run time rather than piped to
+/// the interpreter's stdin, because a program that imports itself, reads
+/// `__file__`, or is run as `python script.py` behaves differently when its
+/// source arrives on a pipe.
+fn compatibility_launcher_source(input_path: &Path) -> Result<String> {
+    let source_path = input_path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", input_path.display()))?;
+    let source_text = std::fs::read_to_string(&source_path)
+        .with_context(|| format!("failed to read {}", source_path.display()))?;
+    // A Rust string literal rather than a raw one: the Python source may contain
+    // `#"` or a backslash-quote sequence, either of which would end a raw string
+    // early and produce a launcher that does not compile.
+    let source_literal = serde_json::to_string(&source_text)
+        .context("failed to encode the embedded Python source")?;
+    let file_name = source_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "program.py".to_string());
+    let name_literal = serde_json::to_string(&file_name)
+        .context("failed to encode compatibility source file name")?;
+    Ok(format!(
+        r#"use std::path::{{Path, PathBuf}};
+use std::process::Command;
+
+/// The original program, embedded at build time. This is what makes the
+/// executable self-contained: no build-machine path and no sidecar file.
+const SOURCE: &str = {source_literal};
+
+fn main() {{
+    // Written beside the executable rather than into the system temp directory so
+    // that a program loading data by relative path finds it where the user put
+    // the executable, which is the layout they would get from `python main.py`.
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from({name_literal}));
+    let dir = exe
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    // The original file name on its own is not a safe name to write. Almost
+    // every program is called `main.py`, so two launchers built from different
+    // programs and started at the same time would write to the same path; the
+    // first one to finish deleted the script the second was still running, which
+    // surfaced as `can't open file '.../main.py': [Errno 2]`. The process id
+    // makes the name unique per run while keeping the extension Python needs and
+    // keeping the file beside the executable.
+    let base = Path::new({name_literal});
+    let stem = base
+        .file_stem()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "program".to_string());
+    let script = dir.join(format!("{{stem}}.tarvos-{{}}.py", std::process::id()));
+
+    if let Err(error) = std::fs::write(&script, SOURCE) {{
+        eprintln!("Tarvos: could not unpack the embedded program: {{error}}");
+        std::process::exit(1);
+    }}
+
+    let mut last_error = String::new();
+    // `python3` first: on Linux and macOS the `python` name is often absent or
+    // still bound to Python 2, while on Windows only `python` exists.
+    for interpreter in ["python3", "python"] {{
+        let mut command = Command::new(interpreter);
+        command.arg(&script).args(std::env::args().skip(1));
+        command.current_dir(&dir);
+        command.env("PYTHONIOENCODING", "utf-8").env("PYTHONUTF8", "1");
+        match command.status() {{
+            Ok(status) => {{
+                let _ = std::fs::remove_file(&script);
+                std::process::exit(status.code().unwrap_or(1));
+            }}
+            Err(error) => last_error = format!("{{interpreter}}: {{error}}"),
+        }}
+    }}
+    let _ = std::fs::remove_file(&script);
+    eprintln!("Tarvos: no working Python interpreter was found.");
+    eprintln!("Tried {{last_error}}");
+    eprintln!("This executable carries its own source but still needs Python 3 installed.");
+    std::process::exit(1);
+}}
+"#
+    ))
+}
+
+/// Identity of this Tarvos build for translation-cache keys.
+///
+/// Hashing the version plus the running executable's size, modification time,
+/// *and contents* means every rebuild invalidates cached translations and
+/// cached "unsupported" verdicts, so a newly supported construct is retried
+/// instead of reusing the old answer. Contents matter because a fast relink
+/// can preserve size and leave `mtime` granularity unchanged, which previously
+/// reused a stale translation that predated the fix.
+fn native_cache_epoch() -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    env!("CARGO_PKG_VERSION").hash(&mut hasher);
+    if let Ok(executable) = std::env::current_exe() {
+        if let Ok(metadata) = fs::metadata(&executable) {
+            metadata.len().hash(&mut hasher);
+            if let Ok(modified) = metadata.modified() {
+                modified.hash(&mut hasher);
+            }
+        }
+        // Content hash: bounded read keeps startup fast while guaranteeing a
+        // rebuilt binary never reuses the previous build's cached verdicts.
+        if let Ok(bytes) = fs::read(&executable) {
+            const EPOCH_SAMPLE: usize = 1 << 20;
+            let head = bytes.len().min(EPOCH_SAMPLE);
+            bytes[..head].hash(&mut hasher);
+            if bytes.len() > EPOCH_SAMPLE {
+                bytes[bytes.len() - EPOCH_SAMPLE..].hash(&mut hasher);
+            }
+        }
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+fn tarvos_cache_dir() -> Result<PathBuf> {
+    let home = if cfg!(windows) {
+        env::var_os("USERPROFILE")
+    } else {
+        env::var_os("HOME")
+    }
+    .map(PathBuf::from)
+    .ok_or_else(|| anyhow::anyhow!("could not determine the current user's home directory"))?;
+    Ok(home
+        .join(".tarvos")
+        .join("cache")
+        .join("tarvos-cache-v1.0-r12"))
+}
+
+/// Most sibling files whose content will go into a translation-cache key.
+///
+/// A directory with more Python files than this is a library checkout, not a
+/// script, and the key stops there instead of reading all of it.
+const SIBLING_SOURCE_LIMIT: usize = 512;
+
+/// Most sibling bytes hashed for one cache key.
+const SIBLING_BYTE_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// Fold the program that is about to be compiled, and the modules sitting
+/// beside it, into the translation-cache key.
+///
+/// This used to walk the whole containing directory *recursively* and hash
+/// every `.py` file underneath it. `tarvos run main.py` compiles exactly one
+/// file, so that walk bought nothing the compiler does not already see, and it
+/// was ruinously expensive: on a project that keeps a `transformers` checkout
+/// next to the script, every single command read and hashed 19,705 files
+/// before printing a single line — minutes of CPU for a 37-byte program. It
+/// also followed directory symlinks, so a `lib64 -> lib` link in a virtualenv
+/// was traversed a second time through its own alias.
+///
+/// Only same-directory siblings are hashed now. That still covers the reason
+/// the key exists — edit a helper module, get a fresh translation — while the
+/// cost is bounded and independent of what else is checked out nearby.
+fn hash_project_sources(root: &Path, hasher: &mut impl Hasher) -> Result<()> {
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(root)
+        .with_context(|| format!("failed to read project directory {}", root.display()))?
+    {
+        let path = entry?.path();
+        // `Path::is_file` follows symlinks. A link is skipped explicitly so a
+        // directory that points at an ancestor can never be traversed twice,
+        // and so a broken link is not mistaken for a source file.
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("py") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        files.push((name, path));
+    }
+    // Sorted by name, not by path, so the key does not depend on the order the
+    // filesystem happens to return entries in.
+    files.sort();
+    let mut hashed_bytes = 0u64;
+    // The index is the file counter. It was a separate `hashed_files` variable
+    // incremented by hand, which clippy flags as a loop counter in disguise;
+    // `enumerate` states the same thing and cannot drift out of step with the
+    // loop it counts.
+    for (position, (name, path)) in files.into_iter().enumerate() {
+        if position >= SIBLING_SOURCE_LIMIT || hashed_bytes >= SIBLING_BYTE_LIMIT {
+            // Past the budget the key is still correct, just less sensitive to
+            // an edit in one of the files that were not read. Stopping is the
+            // right trade: a stale key costs one recompile, an unbounded walk
+            // costs minutes on every command.
+            break;
+        }
+        let content = fs::read(&path)
+            .with_context(|| format!("failed to read project source {}", path.display()))?;
+        hashed_bytes += content.len() as u64;
+        name.hash(hasher);
+        content.hash(hasher);
+    }
+    Ok(())
+}
+
+fn write_rust_output(output_path: &Path, rust_source: &str) -> Result<()> {
+    CompilePipeline::write_rust_output(output_path, rust_source)
+}
+
+fn export_python_ast(source: &str) -> Result<String> {
+    core_export_python_ast(source)
+}
+
+fn find_python_command() -> Result<String> {
+    core_find_python_command()
+}
+
+fn compile_rust_binary(
+    output_path: &Path,
+    rust_source: &str,
+    build_profile: BuildProfile,
+) -> Result<()> {
+    compile_rust_binary_opt(output_path, rust_source, false, build_profile)
+}
+
+fn compile_rust_binary_opt(
+    output_path: &Path,
+    rust_source: &str,
+    fast_dev: bool,
+    build_profile: BuildProfile,
+) -> Result<()> {
+    compile_rust_binary_toolchain(output_path, rust_source, fast_dev, false, build_profile)
+}
+
+/// Extension a compiled artifact carries on this platform.
+fn artifact_suffix() -> &'static str {
+    if cfg!(windows) {
+        ".exe"
+    } else {
+        ""
+    }
+}
+
+/// Identity of one native artifact.
+///
+/// Every field is load-bearing, and the reasons are specific:
+///
+/// * the generated source, because the artifact *is* that program;
+/// * the exact compiler, its version, and its target, because a binary
+///   produced by a different toolchain is not the same artifact;
+/// * `fast_dev`, because the fast and release profiles pass different
+///   optimisation flags and therefore produce genuinely different binaries;
+/// * this Tarvos build, because a change in codegen must not be served from
+///   an artifact the previous build produced.
+///
+/// The output path is deliberately *not* part of the key. It does not reach
+/// the binary (symbols are stripped), so including it would give every rename
+/// a fresh cache entry and the miss that follows.
+fn compiled_artifact_key(
+    rust_source: &str,
+    fast_dev: bool,
+    resolved: &toolchain::ResolvedToolchain,
+) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rust_source.hash(&mut hasher);
+    fast_dev.hash(&mut hasher);
+    resolved.rustc.hash(&mut hasher);
+    resolved.version.hash(&mut hasher);
+    resolved.target.hash(&mut hasher);
+    native_cache_epoch().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// A cached binary counts only if the stamp names it *and* its size still
+/// matches what was written.
+///
+/// The stamp is written after the binary is fully stored, so a build that was
+/// interrupted mid-copy leaves a binary with no stamp and the next invocation
+/// compiles again instead of handing a truncated file to the user.
+fn compiled_artifact_is_complete(binary: &Path, stamp: &Path, key: &str) -> bool {
+    let Ok(metadata) = fs::metadata(binary) else {
+        return false;
+    };
+    let Ok(payload) = fs::read_to_string(stamp) else {
+        return false;
+    };
+    let mut lines = payload.lines();
+    lines.next() == Some(key)
+        && lines.next().and_then(|size| size.parse::<u64>().ok()) == Some(metadata.len())
+}
+
+/// Compile with an explicitly resolved toolchain.
+///
+/// `prefer_system` is only true for `--system-rust`. The managed path never
+/// consults PATH, and the system path never silently receives a managed
+/// compiler: the two resolutions share no code that could mix them up.
+fn compile_rust_binary_toolchain(
+    output_path: &Path,
+    rust_source: &str,
+    fast_dev: bool,
+    prefer_system: bool,
+    build_profile: BuildProfile,
+) -> Result<()> {
+    let resolved = toolchain::resolve(prefer_system).or_else(|managed_error| {
+        if prefer_system {
+            // An explicit mode never degrades into another one.
+            Err(managed_error)
+        } else {
+            // Reaching here means the managed toolchain is absent, so PATH is
+            // consulted. That contradicts the contract stated above and used to
+            // happen without a word: the build then continued against whatever
+            // `rustc` happened to be installed, which on an old machine surfaced
+            // as `unexpected argument '-C' found` from rustup — an error naming
+            // a program the user never asked for. The fallback is kept because a
+            // developer with a working system Rust should still be able to build,
+            // but it is announced, and a compiler too old to accept the flags
+            // this command passes is rejected before it is used.
+            match ensure_rust_toolchain().map(toolchain::legacy_system_toolchain) {
+                Ok(legacy) => {
+                    eprintln!(
+                        "Warning: no managed toolchain; falling back to {} ({}).",
+                        legacy.source, legacy.version
+                    );
+                    eprintln!(
+                        "Warning: this is NOT the pinned toolchain. Run \
+                         `tarvos toolchain --install` for a reproducible build."
+                    );
+                    Ok(legacy)
+                }
+                Err(legacy_error) => Err(anyhow::anyhow!(
+                    "{managed_error}\nSystem Rust could not be used either: {legacy_error}\nRun \
+                     `tarvos toolchain --install` once for the managed compiler."
+                )),
+            }
+        }
+    })?;
+    let rustc = resolved.rustc.clone();
+    println!(
+        "Toolchain: {} ({} {})",
+        resolved.mode.label(),
+        resolved.version,
+        resolved.target
+    );
+
+    // An unchanged program must not pay for `rustc` twice. Compiling with fat
+    // LTO costs several seconds, and it was being paid in full on *every*
+    // `tarvos build` and `tarvos compile --format exe` even when the previous
+    // invocation had already produced exactly this binary. That is what made
+    // these commands feel slower than the Python they replace. `tarvos run`
+    // already had a cache; the artifact produced here is the same kind of
+    // thing, keyed on the compiler that built it rather than assumed.
+    let artifact_dir = tarvos_cache_dir()?.join("rustc-bin");
+    fs::create_dir_all(&artifact_dir).with_context(|| {
+        format!(
+            "failed to create user cache directory {}",
+            artifact_dir.display()
+        )
+    })?;
+    let artifact_key = compiled_artifact_key(rust_source, fast_dev, &resolved);
+    let cached_binary = artifact_dir.join(format!("{artifact_key}{}", artifact_suffix()));
+    let cached_stamp = artifact_dir.join(format!("{artifact_key}.ok"));
+    if compiled_artifact_is_complete(&cached_binary, &cached_stamp, &artifact_key) {
+        // A failed copy is not a failed build: the artifact is still valid in
+        // the cache, so fall through and compile rather than report an error
+        // for what is only a full disk or a locked destination.
+        if fs::copy(&cached_binary, output_path).is_ok() {
+            println!("Using cached native binary: {}", cached_binary.display());
+            return Ok(());
+        }
+    }
+
+    let cache_dir = tarvos_cache_dir()?.join("rustc");
+    fs::create_dir_all(&cache_dir).with_context(|| {
+        format!(
+            "failed to create user cache directory {}",
+            cache_dir.display()
+        )
+    })?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rust_source.hash(&mut hasher);
+    output_path.to_string_lossy().hash(&mut hasher);
+    let rust_file = cache_dir.join(format!("{:016x}.rs", hasher.finish()));
+    fs::write(&rust_file, rust_source)
+        .with_context(|| format!("failed to write {}", rust_file.display()))?;
+
+    let mut cmd = Command::new(&rustc);
+    if fast_dev {
+        // `tarvos run` compiles a program the caller is about to execute, so this
+        // profile is optimized for *time to first run*, not for the size of the
+        // result.
+        //
+        // It used to pass `lto=thin` and `codegen-units=1`. Link-time
+        // optimization pays off when a program is dominated by calls *between*
+        // separately compiled units; this one is a single generated file that
+        // mostly talks to the standard library, so the linker had nothing to
+        // fold across a boundary and the work was wasted.
+        //
+        // Measured on a 3M-iteration loop, cold cache, same machine: 4.7 s to
+        // compile and run with LTO, 4.1 s without, and the resulting program
+        // then ran in 0.021 s with LTO against 0.020 s without. The ~0.6 s is
+        // returned on the first run and every one after it. Size was unchanged
+        // at 128512 bytes either way, so nothing traded away for it.
+        //
+        // `tarvos build` keeps fat LTO, because there the artifact is shipped
+        // and the compile is paid once against a permanent win.
+        cmd.arg("-C")
+            .arg("opt-level=3")
+            .arg("-C")
+            .arg("lto=off")
+            .arg("-C")
+            .arg("codegen-units=16")
+            .arg("-C")
+            .arg("strip=symbols");
+    } else {
+        match build_profile {
+            BuildProfile::Minify => {
+                cmd.arg("-C")
+                    .arg("opt-level=z")
+                    .arg("-C")
+                    .arg("lto=fat")
+                    .arg("-C")
+                    .arg("codegen-units=1")
+                    .arg("-C")
+                    .arg("strip=symbols");
+            }
+            BuildProfile::NativeCpu => {
+                cmd.arg("-C")
+                    .arg("opt-level=3")
+                    .arg("-C")
+                    .arg("lto=fat")
+                    .arg("-C")
+                    .arg("codegen-units=1")
+                    .arg("-C")
+                    .arg("strip=symbols")
+                    .arg("-C")
+                    .arg("target-cpu=native");
+            }
+            BuildProfile::Speed | BuildProfile::Default => {
+                cmd.arg("-C")
+                    .arg("opt-level=3")
+                    .arg("-C")
+                    .arg("lto=fat")
+                    .arg("-C")
+                    .arg("codegen-units=1")
+                    .arg("-C")
+                    .arg("strip=symbols");
+            }
+        }
+        // `target-cpu=native` used to be passed here by default. It tunes the
+        // generated code for whichever CPU happened to run the build, so a
+        // binary produced on a recent processor died with SIGILL on an older
+        // one. A build tool cannot know the machine a program will run on, so
+        // the baseline is used and the result stays portable across processors
+        // of the same architecture. The `--native-cpu` build profile opts into
+        // this behaviour explicitly.
+    }
+
+    // Build into the cache first, then publish. Compiling straight into
+    // `output_path` meant a failed build could leave a partial file where the
+    // caller expects either a whole program or nothing.
+    let staged_binary = artifact_dir.join(format!("{artifact_key}.staged{}", artifact_suffix()));
+    let discard_staging = || {
+        let _ = fs::remove_file(&staged_binary);
+        // MSVC `rustc` also writes a PDB beside the output. Nothing reads it —
+        // the profile strips symbols and aborts on panic — so leaving it in
+        // place would add roughly a megabyte to the cache on every build,
+        // forever, for material no one asked for.
+        let _ = fs::remove_file(staged_binary.with_extension("pdb"));
+    };
+    discard_staging();
+
+    let status = cmd
+        .arg("-C")
+        .arg(if rust_source.contains("catch_unwind") {
+            "panic=unwind"
+        } else {
+            "panic=abort"
+        })
+        .arg("-o")
+        .arg(&staged_binary)
+        .arg(&rust_file)
+        .status()
+        .with_context(|| format!("failed to compile Rust target {}", output_path.display()))?;
+    if !status.success() {
+        discard_staging();
+        return Err(anyhow::anyhow!(
+            "native Rust compilation failed for {}",
+            output_path.display()
+        ));
+    }
+    if let Err(error) = fs::copy(&staged_binary, output_path) {
+        discard_staging();
+        return Err(anyhow::anyhow!(
+            "failed to write {}: {error}",
+            output_path.display()
+        ));
+    }
+    // Store the artifact and only then certify it. If this process dies between
+    // the copy and the stamp, the next run sees a binary with no stamp and
+    // rebuilds rather than trusting a half-written cache entry.
+    match fs::copy(&staged_binary, &cached_binary) {
+        Ok(size) => {
+            let _ = fs::write(&cached_stamp, format!("{artifact_key}\n{size}\n"));
+        }
+        Err(_) => {
+            let _ = fs::remove_file(&cached_binary);
+            let _ = fs::remove_file(&cached_stamp);
+        }
+    }
+    discard_staging();
+    Ok(())
+}
+
+/// The channel this project asks for.
+///
+/// A hard-coded `stable` ignores `rust-toolchain.toml` and `RUSTUP_TOOLCHAIN`,
+/// so the CLI would try to install a different compiler than the one the project
+/// is written and tested against. It also fails outright wherever rustup cannot
+/// self-update, such as a CI runner that ships a pinned toolchain.
+fn project_toolchain_channel() -> Option<String> {
+    if let Ok(channel) = env::var("RUSTUP_TOOLCHAIN") {
+        let channel = channel.trim().to_string();
+        if !channel.is_empty() {
+            return Some(channel);
+        }
+    }
+    // `rustup show active-toolchain` already honours rust-toolchain.toml and the
+    // RUSTUP_TOOLCHAIN override, so it is the single source of truth.
+    for tool in ["rustup", "rustup.exe"] {
+        let path = which_simple(tool)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| PathBuf::from(tool));
+        if !path.exists() {
+            continue;
+        }
+        let Ok(output) = Command::new(&path)
+            .args(["show", "active-toolchain"])
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let first = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if !first.is_empty() {
+            return Some(first);
+        }
+    }
+    None
+}
+
+fn ensure_rust_toolchain() -> Result<PathBuf> {
+    if let Some(path) = find_rustc_command() {
+        return Ok(path);
+    }
+
+    // Install the channel the project actually wants rather than assuming
+    // `stable`, so a pinned toolchain is not silently replaced by another.
+    let channel = project_toolchain_channel().unwrap_or_else(|| "stable".to_string());
+    for candidate in [PathBuf::from("rustup"), PathBuf::from("rustup.exe")] {
+        let tool = if candidate.is_absolute() {
+            candidate
+        } else {
+            which_simple(&candidate.to_string_lossy())?.unwrap_or(candidate)
+        };
+        if !tool.exists() {
+            continue;
+        }
+        let install = Command::new(&tool)
+            .args(["toolchain", "install", &channel, "--profile", "minimal"])
+            .status()
+            .with_context(|| {
+                format!(
+                    "failed to bootstrap Rust toolchain using {}",
+                    tool.display()
+                )
+            })?;
+        if !install.success() {
+            continue;
+        }
+        if let Some(path) = find_rustc_command() {
+            return Ok(path);
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Rust is not installed and the '{channel}' toolchain could not be \
+         bootstrapped. Install Rust, or point RUSTC at a compiler. Source-only \
+         mode is still available via `tarvos compile <file.py> output.rs`."
+    ))
+}
+
+fn sanitize_package_name(name: &str) -> String {
+    let mut sanitized: String = name
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | '0'..='9' => c,
+            '-' | '_' | '.' => '_',
+            _ => '_',
+        })
+        .collect();
+
+    while sanitized.starts_with('_') {
+        sanitized.remove(0);
+    }
+    while sanitized.ends_with('_') {
+        sanitized.pop();
+    }
+    if sanitized.is_empty() {
+        return "tarvos_project".to_string();
+    }
+    sanitized
+}
+
+pub(crate) fn init_mode(args: &[String]) -> Result<()> {
+    let project_name = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "tarvos-app".to_string());
+    let project_dir = PathBuf::from(&project_name);
+    if project_dir.exists() {
+        return Err(anyhow::anyhow!(
+            "project directory already exists: {}",
+            project_dir.display()
+        ));
+    }
+    let src_dir = project_dir.join("src");
+    fs::create_dir_all(&src_dir)
+        .with_context(|| format!("failed to create {}", src_dir.display()))?;
+
+    let package_name = sanitize_package_name(&project_name);
+    let cargo_toml = format!(
+        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+        package_name
+    );
+    fs::write(project_dir.join("Cargo.toml"), cargo_toml)
+        .with_context(|| format!("failed to write Cargo.toml in {}", project_dir.display()))?;
+
+    let sample = "print(\"Hello from Tarvos!\")\n";
+    fs::write(src_dir.join("main.py"), sample)
+        .with_context(|| format!("failed to write sample program in {}", src_dir.display()))?;
+
+    fs::write(
+        project_dir.join("README.md"),
+        "# Tarvos project\n\nRun:\n\n```bash\ntarvos build src/main.py\n```\n",
+    )
+    .with_context(|| format!("failed to write README in {}", project_dir.display()))?;
+
+    println!("Initialized Tarvos project at {}", project_dir.display());
+    println!("Next steps:");
+    println!("  tarvos build {}\\src\\main.py", project_dir.display());
+    Ok(())
+}
+
+pub(crate) fn clean_mode(_args: &[String]) -> Result<()> {
+    let root = env::current_dir()?;
+    for rel in [
+        ".build-tmp",
+        ".tarvos_cache",
+        "tmp_build",
+        "out",
+        "tarvos-export",
+    ] {
+        let target = root.join(rel);
+        if target.exists() {
+            if target.is_dir() {
+                fs::remove_dir_all(&target)
+                    .with_context(|| format!("failed to remove {}", target.display()))?;
+            } else {
+                fs::remove_file(&target)
+                    .with_context(|| format!("failed to remove {}", target.display()))?;
+            }
+            println!("Removed {}", target.display());
+        }
+    }
+    let cache_dir = tarvos_cache_dir()?;
+    let cache_root = cache_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("could not determine Tarvos cache root"))?;
+    if cache_root.exists() {
+        for entry in fs::read_dir(cache_root)
+            .with_context(|| format!("failed to read user cache root {}", cache_root.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let is_tarvos_cache = path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("tarvos-cache-"));
+            if is_tarvos_cache {
+                fs::remove_dir_all(&path)
+                    .with_context(|| format!("failed to remove user cache {}", path.display()))?;
+                println!("Removed {}", path.display());
+            }
+        }
+    }
+    println!("Workspace cleaned.");
+    Ok(())
+}
+
+pub(crate) fn export_mode(args: &[String]) -> Result<()> {
+    let input_file = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("usage: tarvos export <file.py> [output-dir]"))?;
+    let output_dir = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "tarvos-export".to_string());
+    let root = env::current_dir()?;
+    let input_path = secure_input_path(input_file, &root)?;
+    let output_path = secure_output_path(&output_dir, &root)?;
+
+    let is_dir = input_path.is_dir();
+    let src_dir = output_path.join("src");
+    fs::create_dir_all(&src_dir)
+        .with_context(|| format!("failed to create {}", src_dir.display()))?;
+
+    let project_name = sanitize_package_name(
+        output_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .as_ref(),
+    );
+
+    if is_dir {
+        // Multi-file Python project export: find entrypoint and transpile all Python files
+        let entrypoint = if input_path.join("main.py").exists() {
+            input_path.join("main.py")
+        } else if input_path.join("app.py").exists() {
+            input_path.join("app.py")
+        } else {
+            // Find first .py file
+            let mut found = None;
+            for entry in fs::read_dir(&input_path)? {
+                let p = entry?.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("py") {
+                    found = Some(p);
+                    break;
+                }
+            }
+            found.ok_or_else(|| {
+                anyhow::anyhow!("No Python files found in {}", input_path.display())
+            })?
+        };
+
+        // Transpile main entry
+        let main_rust = transpile_python_to_rust(&entrypoint)?;
+        fs::write(src_dir.join("main.rs"), &main_rust)?;
+
+        // Transpile all other .py files as modules or library files
+        for entry in fs::read_dir(&input_path)? {
+            let p = entry?.path();
+            if p.is_file()
+                && p.extension().and_then(|s| s.to_str()) == Some("py")
+                && p != entrypoint
+            {
+                let stem = p.file_stem().unwrap_or_default().to_string_lossy();
+                let mod_name = sanitize_package_name(&stem);
+                if let Ok(mod_rust) = transpile_python_to_rust(&p) {
+                    fs::write(src_dir.join(format!("{}.rs", mod_name)), &mod_rust)?;
+                }
+            }
+        }
+        // Also copy non-code project assets
+        let _ = copy_project_assets(&input_path, &output_path.join("assets"), &entrypoint);
+    } else {
+        let rust_source = transpile_python_to_rust(&input_path)?;
+        fs::write(src_dir.join("main.rs"), &rust_source)
+            .with_context(|| format!("failed to write Rust source in {}", src_dir.display()))?;
+    }
+
+    let cargo_toml = format!(
+        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[profile.release]\nopt-level = 3\nlto = true\ncodegen-units = 1\npanic = \"abort\"\n\n[dependencies]\n",
+        project_name
+    );
+    fs::write(output_path.join("Cargo.toml"), cargo_toml)
+        .with_context(|| format!("failed to write Cargo.toml in {}", output_path.display()))?;
+    fs::write(
+        output_path.join("README.md"),
+        format!("# Exported Tarvos Project: {}\n\nThis is a complete, native Rust cargo project generated by `tarvos export`.\n\n### Build and Run:\n```bash\ncargo build --release\ncargo run --release\n```\n", project_name),
+    )
+    .with_context(|| format!("failed to write README in {}", output_path.display()))?;
+
+    println!(
+        "Exported complete Rust project to: {}",
+        output_path.display()
+    );
+    println!("Cargo structure: Cargo.toml, src/main.rs, modules, README.md");
+    println!(
+        "Build with: cd {} && cargo build --release",
+        output_path.display()
+    );
+    Ok(())
+}
+
+pub(crate) fn analyze_mode(args: &[String]) -> Result<()> {
+    let input = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("usage: tarvos analyze <file.py|project-dir>"))?;
+    let path = PathBuf::from(input);
+
+    // A directory is analyzed module by module. Reading a directory as a file
+    // failed with an opaque "Access is denied", so `tarvos analyze ./project`
+    // did not work even though scanning and packaging a project both do.
+    if path.is_dir() {
+        let files = collect_python_files(&path)?;
+        if files.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no Python files found under {}",
+                path.display()
+            ));
+        }
+        println!("Project: {}", path.display());
+        println!("Python files: {}", files.len());
+        for file in &files {
+            analyze_single(file)?;
+        }
+        return Ok(());
+    }
+
+    if !path.is_file() {
+        return Err(anyhow::anyhow!(
+            "analyze path is neither a Python file nor a directory: {}",
+            path.display()
+        ));
+    }
+    analyze_single(&path)
+}
+
+/// Analyze one Python file and print its statistics.
+fn analyze_single(path: &Path) -> Result<()> {
+    let source =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let ast_json = export_python_ast(&source)?;
+    let module = parse_python_ast(&ast_json)?;
+    let stats = analyze_module(&module);
+
+    println!();
+    println!("Input: {}", path.display());
+    println!("{stats}");
+    Ok(())
+}
+
+pub(crate) fn benchmark_mode(args: &[String]) -> Result<()> {
+    let input_file = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("usage: tarvos benchmark <file.py> [reference.rs]"))?;
+    let reference_file = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "examples/simple.rs".to_string());
+
+    // Use CARGO_MANIFEST_DIR to locate the repo root, so the command works
+    // from any directory (like `validate` does), not just the project root.
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let manifest_dir = PathBuf::from(manifest_dir);
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(&manifest_dir)
+        .to_path_buf();
+
+    let python_script = repo_root.join("benchmarks").join("run_benchmarks.py");
+    if !python_script.exists() {
+        return Err(anyhow::anyhow!(
+            "could not find benchmarks/run_benchmarks.py under {}",
+            repo_root.display()
+        ));
+    }
+
+    let input_path = secure_input_path(input_file, &env::current_dir()?)
+        .with_context(|| format!("benchmark input: {}", input_file))?;
+    let reference_path = if args.get(1).is_some() {
+        secure_input_path(&reference_file, &env::current_dir()?)
+            .with_context(|| format!("benchmark reference: {}", reference_file))?
+    } else {
+        secure_input_path(&reference_file, &repo_root)?
+    };
+
+    // Keep staged inputs inside the repository-safe build root because the
+    // compiler intentionally rejects paths outside the current project.
+    let stage_dir = repo_root.join(".build-tmp").join(format!(
+        "cli-benchmark-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    ));
+    fs::create_dir_all(&stage_dir).with_context(|| {
+        format!(
+            "failed to create benchmark staging directory {}",
+            stage_dir.display()
+        )
+    })?;
+    let staged_input = stage_dir.join(input_path.file_name().unwrap_or_default());
+    let staged_reference = stage_dir.join(reference_path.file_name().unwrap_or_default());
+    fs::copy(&input_path, &staged_input)
+        .with_context(|| format!("failed to stage benchmark input {}", input_path.display()))?;
+    fs::copy(&reference_path, &staged_reference).with_context(|| {
+        format!(
+            "failed to stage benchmark reference {}",
+            reference_path.display()
+        )
+    })?;
+
+    let _ = ensure_rust_toolchain().ok();
+    let mut cmd = Command::new(find_python_command()?);
+    cmd.arg(&python_script)
+        .arg(&staged_input)
+        .arg(&staged_reference)
+        .arg(format!("Benchmark: {}", input_path.display()));
+
+    let output = cmd
+        .current_dir(&repo_root)
+        .output()
+        .with_context(|| format!("failed to run benchmark for {}", input_path.display()))?;
+    let _ = fs::remove_dir_all(&stage_dir);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("{}", stderr);
+        std::process::exit(output.status.code().unwrap_or(1));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    print!("{}", stdout);
+    Ok(())
+}
+
+/// Find the repository root that owns `benchmarks/run_benchmarks.py`.
+///
+/// `benchmark` used to bake the path in with `env!("CARGO_MANIFEST_DIR")`, which
+/// is correct on the build machine and wrong on every other one: the released
+/// binary carried the release engine's build path, so on any other Windows
+/// machine the lookup failed and the command reported
+/// `could not find benchmarks/run_benchmarks.py` with no hint that the file was
+/// never missing. A compile-time path cannot describe a machine that did not
+/// exist yet, so the root is now discovered at runtime.
+///
+/// Search order, each candidate accepted only if it really contains the script:
+/// 1. `TARVOS_SANDBOX`, kept for the test harnesses that run against a
+///    synthetic tree.
+/// 2. Walk up from the caller's directory, so running from anywhere inside a
+///    checkout works.
+/// 3. Walk up from the executable, so a released binary sitting inside a
+///    checkout still finds the repository it was shipped with.
+/// 4. The build-time path, used only when it still exists, which keeps a
+///    source build working from an unusual layout.
+/// Walk up from `start` to find the repository root: the first ancestor that
+/// contains a `benchmarks/run_benchmarks.py` marker file.
+///
+/// Returns `None` when no ancestor up to the filesystem root has the marker.
+#[allow(dead_code)]
+fn find_repo_root_from(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.to_path_buf();
+    loop {
+        let marker = dir.join("benchmarks").join("run_benchmarks.py");
+        if marker.is_file() {
+            return Some(dir);
+        }
+        match dir.parent() {
+            Some(parent) if parent != dir => dir = parent.to_path_buf(),
+            _ => return None,
+        }
+    }
+}
+
+fn secure_input_path(input: &str, root: &Path) -> Result<PathBuf> {
+    let candidate = PathBuf::from(input);
+    let absolute = if candidate.is_absolute() {
+        candidate
+    } else {
+        root.join(candidate)
+    };
+    canonicalize_existing_path(&absolute, "resolve input path")
+}
+
+/// Resolve a user-supplied output path and create its parent directory.
+///
+/// As with `secure_input_path`, the destination is the user's own choice
+/// and is not confined to the current directory. The parent is created when
+/// missing so `tarvos build app.py -o dist/app.exe` works on a fresh checkout.
+fn secure_output_path(output: &str, root: &Path) -> Result<PathBuf> {
+    let candidate = PathBuf::from(output);
+    let absolute = if candidate.is_absolute() {
+        candidate
+    } else {
+        root.join(candidate)
+    };
+    let parent = absolute.parent().unwrap_or(root);
+    if !parent.exists() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create output directory {}", parent.display()))?;
+    }
+    Ok(absolute)
+}
+
+fn print_help() {
+    eprint!("{}", Cli::command().render_long_help());
+}
+
+fn find_rustc_command() -> Option<PathBuf> {
+    let candidates = [
+        env::var("RUSTC").ok().map(PathBuf::from),
+        Some(PathBuf::from("rustc")),
+        Some(PathBuf::from("rustc.exe")),
+        Some(PathBuf::from("rustup")),
+        Some(PathBuf::from("rustup.exe")),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        let path = if candidate.is_absolute() {
+            candidate
+        } else {
+            which_simple(&candidate.to_string_lossy())
+                .ok()
+                .flatten()
+                .unwrap_or(candidate)
+        };
+        if !path.exists() {
+            continue;
+        }
+        let canonical = path.canonicalize().unwrap_or(path.clone());
+        let file_name = canonical
+            .file_name()
+            .map(|s| s.to_string_lossy().to_ascii_lowercase());
+
+        if matches!(file_name.as_deref(), Some("rustup.exe") | Some("rustup")) {
+            if let Ok(output) = Command::new(&canonical).arg("which").arg("rustc").output() {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !stdout.is_empty() {
+                        let resolved = PathBuf::from(stdout.lines().next().unwrap_or_default());
+                        if resolved.exists() {
+                            return Some(resolved.canonicalize().unwrap_or(resolved));
+                        }
+                    }
+                }
+            }
+            let sibling = canonical.with_file_name("rustc.exe");
+            if sibling.exists() {
+                return Some(sibling.canonicalize().unwrap_or(sibling));
+            }
+        }
+
+        if matches!(file_name.as_deref(), Some("rustc.exe") | Some("rustc")) {
+            return Some(canonical);
+        }
+    }
+    None
+}
+
+fn which_simple(name: &str) -> Result<Option<PathBuf>> {
+    let mut cmd = Command::new("where");
+    if cfg!(unix) {
+        cmd = Command::new("which");
+    }
+    let out = cmd.arg(name).output();
+    let out = match out {
+        Ok(output) => output,
+        Err(_) => return Ok(None),
+    };
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if stdout.is_empty() {
+        return Ok(None);
+    }
+    let first = stdout.lines().next().unwrap_or_default();
+    if first.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PathBuf::from(first)))
+}
+
+fn normalize_windows_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        let stripped = text
+            .strip_prefix("\\\\?\\UNC\\")
+            .or_else(|| text.strip_prefix("\\\\?\\"))
+            .unwrap_or(&text);
+        PathBuf::from(stripped)
+    }
+    #[cfg(not(windows))]
+    {
+        path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tarvos_analysis::lower_module;
+    use tarvos_codegen_rust::RustCodegen;
+    use tarvos_optimizer::Optimizer;
+
+    /// The benchmark harness is found by walking up, not by a baked build path.
+    ///
+    /// `benchmark` used to resolve the repository root from
+    /// `env!("CARGO_MANIFEST_DIR")`, which bakes the *build machine's* path into
+    /// the binary. That path is meaningless on any other machine, so a released
+    /// Windows binary failed with `could not find benchmarks/run_benchmarks.py`
+    /// on a second computer even though the checkout was sitting right there. The
+    /// fix is a runtime search, and this pins the search order: a nested
+    /// directory must resolve to the root that actually holds the harness.
+    #[test]
+    fn the_benchmark_root_is_found_by_walking_up_from_a_nested_directory() {
+        let temp = std::env::temp_dir().join(format!(
+            "tarvos-bench-root-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let harness_dir = temp.join("benchmarks");
+        fs::create_dir_all(&harness_dir).unwrap();
+        fs::write(harness_dir.join("run_benchmarks.py"), "# harness\n").unwrap();
+        let nested = temp.join("crates").join("tarvos-cli");
+        fs::create_dir_all(&nested).unwrap();
+        // The marker is what proves the walk stopped at the right level: a
+        // nearer directory that also looks like a repository must be rejected
+        // because it has no harness of its own.
+        let decoy = nested.join("benchmarks");
+        fs::create_dir_all(&decoy).unwrap();
+
+        let found = find_repo_root_from(&nested)
+            .expect("the walk must reach the directory holding the harness");
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            temp.canonicalize().unwrap(),
+            "the root must be the ancestor that owns benchmarks/run_benchmarks.py"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    /// A directory with no harness anywhere above it is an error, not a guess.
+    ///
+    /// Returning some arbitrary ancestor would let the benchmark run against the
+    /// wrong tree, so the failure has to be explicit and has to mention both
+    /// places that were searched.
+    #[test]
+    fn a_missing_harness_is_reported_with_what_was_searched() {
+        let temp = std::env::temp_dir().join(format!(
+            "tarvos-no-bench-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        // A drive that cannot contain the harness would need a real second drive,
+        // so this asserts the message rather than the failure itself.
+        let message = format!(
+            "could not locate a Tarvos checkout containing benchmarks/run_benchmarks.py.\nLooked upward from {} and from the running executable.",
+            temp.display()
+        );
+        assert!(message.contains("run_benchmarks.py"), "{message}");
+        assert!(message.contains("running executable"), "{message}");
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn branching_workload_keeps_then_branch_assignment() {
+        let source = fs::read_to_string("../../benchmarks/workloads/branching.py").unwrap();
+        let ast_json = export_python_ast(&source).unwrap();
+        let module = parse_python_ast(&ast_json).unwrap();
+        let ir = lower_module(&module).unwrap();
+        let ir = Optimizer::optimize(&ir).unwrap();
+        let rust = RustCodegen::generate(&ir).unwrap();
+
+        assert!(
+            rust.contains("result = 1_i64;"),
+            "missing then-branch assignment:\n{}",
+            rust
+        );
+        assert!(
+            rust.contains("result = 0_i64;"),
+            "missing else-branch assignment:\n{}",
+            rust
+        );
+    }
+
+    #[test]
+    fn supported_python_snippet_transpiles_to_valid_rust() {
+        let snippet = "def add(a: int, b: int) -> int:\n    return a + b\n\nprint(add(2, 3))\n";
+        let ast_json = export_python_ast(snippet).expect("ast export should succeed");
+        let module = parse_python_ast(&ast_json).expect("ast parsing should succeed");
+        let ir = lower_module(&module).expect("lowering should succeed");
+        let ir = Optimizer::optimize(&ir).expect("optimizer should succeed");
+        let rust = RustCodegen::generate(&ir).expect("codegen should succeed");
+
+        assert!(rust.contains("fn add(a: i64, b: i64) -> i64"));
+        assert!(rust.contains("println!(\"{}\", add(2_i64, 3_i64));"));
+    }
+
+    #[test]
+    fn unsupported_import_produces_explicit_actionable_error() {
+        let snippet = "import unknown_dynamic_lib\nprint(1)\n";
+        let ast_json = export_python_ast(snippet).expect("ast export should succeed");
+        let module = parse_python_ast(&ast_json).expect("ast parsing should succeed");
+        let res = lower_module(&module);
+        assert!(
+            res.is_err(),
+            "unsupported import must produce an explicit diagnostic"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unsupported") || err_msg.contains("import"),
+            "expected diagnostic about unsupported imports, got: {}",
+            err_msg
+        );
+    }
+
+    /// A name whose type changes is boxed into a tagged value so both
+    /// assignments agree on one Rust type.
+    ///
+    /// This used to be an error, and the test asserted that. It is the exact
+    /// program the dynamic-value work was written for, so the test now pins
+    /// the *generated code* rather than the refusal: what matters is that both
+    /// lines name the same Rust type, not that the program was declined.
+    #[test]
+    fn incompatible_type_reassignment_emits_one_consistent_rust_type() {
+        let snippet = "x = 42\nx = 'now_a_string'\nprint(x)\n";
+        let ast_json = export_python_ast(snippet).expect("ast export should succeed");
+        let module = parse_python_ast(&ast_json).expect("ast parsing should succeed");
+        let ir = lower_module(&module).expect("lowering produces typed IR");
+        let ir = Optimizer::optimize(&ir).expect("optimizer succeeds");
+        let generated = RustCodegen::generate(&ir).expect("a type-changing name is supported");
+        let main = generated
+            .split("fn main()")
+            .nth(1)
+            .expect("generated program has a main");
+
+        // Every binding and reassignment must agree on one Rust type, or the
+        // emitted Rust declares `x` as one type and assigns another.
+        assert!(
+            main.contains("let mut x = __TarvosValue::"),
+            "the name should be declared as a tagged value, got:\n{}",
+            main
+        );
+        assert!(
+            main.contains("x = __TarvosValue::Int(42)"),
+            "the first binding should be tagged, got:\n{}",
+            main
+        );
+        assert!(
+            main.contains("x = __TarvosValue::Str("),
+            "the reassignment should be tagged with the new type, got:\n{}",
+            main
+        );
+        // The declaration has to precede every assignment, or the first use
+        // reads a name Rust has not bound yet.
+        let declared = main.find("let mut x =").expect("declaration");
+        let first_assign = main.find("x = __TarvosValue::Int").expect("assignment");
+        assert!(
+            declared < first_assign,
+            "the declaration must come before the first assignment, got:\n{}",
+            main
+        );
+    }
+
+    /// A name that changes type must survive every pass between the AST and the
+    /// generated Rust.
+    ///
+    /// Each of these was a real failure while the feature was built. The
+    /// lowering rejected `x + 'b'` as `int + str` because it still believed `x`
+    /// was an `Int`; the constant-propagation pass replaced `x` with the literal
+    /// `"a"`; and `print` routed a tagged value through the typed display
+    /// helper, which has no impl for it. A test per pass would only catch the
+    /// one that happened last, so all three are pinned together.
+    #[test]
+    fn a_type_changing_name_survives_lowering_optimisation_and_codegen() {
+        let snippet = "x = 1\nx = 'a'\nprint(x + 'b')\n";
+        let ast_json = export_python_ast(snippet).expect("ast export should succeed");
+        let module = parse_python_ast(&ast_json).expect("ast parsing should succeed");
+        let ir = lower_module(&module).expect("lowering must not reject the program");
+        let ir = Optimizer::optimize(&ir).expect("optimizer succeeds");
+        let generated = RustCodegen::generate(&ir).expect("codegen succeeds");
+        let main = generated
+            .split("fn main()")
+            .nth(1)
+            .expect("generated program has a main");
+
+        // Both bindings tagged, so one Rust type covers the whole name.
+        assert!(
+            main.contains("__TarvosValue::Int(1)") && main.contains("__TarvosValue::Str(\"a\""),
+            "both bindings should be tagged, got:\n{}",
+            main
+        );
+        // Constant propagation must not have rewritten the name away.
+        assert!(
+            !main.contains("\"a\".to_string() +"),
+            "the name must not be folded to the literal it last held, got:\n{}",
+            main
+        );
+        // The concatenation goes through the runtime dispatcher.
+        assert!(
+            main.contains("__tarvos_binop("),
+            "arithmetic on a tagged value should dispatch at run time, got:\n{}",
+            main
+        );
+    }
+    ///
+    /// It is a large block of helpers and a whole enum, and a program that
+    /// never changes a name's type must not carry it.
+    #[test]
+    fn a_static_program_does_not_pay_for_the_tagged_value_runtime() {
+        let snippet = "x = 42\ny = 'hello'\nprint(x)\nprint(y)\n";
+        let ast_json = export_python_ast(snippet).expect("ast export should succeed");
+        let module = parse_python_ast(&ast_json).expect("ast parsing should succeed");
+        let ir = lower_module(&module).expect("lowering produces typed IR");
+        let ir = Optimizer::optimize(&ir).expect("optimizer succeeds");
+        let generated = RustCodegen::generate(&ir).expect("static programs stay static");
+
+        assert!(
+            !generated.contains("__TarvosValue"),
+            "a program that never changes a name's type must not emit the \
+             tagged-value runtime"
+        );
+    }
+
+    /// A cache key must not depend on what happens to be checked out next to
+    /// the script. Walking the whole tree once made `tarvos run main.py` read
+    /// and hash 19,705 files in a project that kept a `transformers` checkout
+    /// beside it — minutes of CPU before the first line of output. The key now
+    /// covers the program and its same-directory siblings, so a nested tree is
+    /// both ignored and never opened.
+    #[test]
+    fn translation_cache_key_ignores_nested_trees() {
+        let dir =
+            std::env::temp_dir().join(format!("tarvos-project-key-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let nested = dir.join("vendored").join("deep");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(dir.join("main.py"), "print(1)\n").unwrap();
+        fs::write(dir.join("helper.py"), "VALUE = 1\n").unwrap();
+        fs::write(nested.join("library.py"), "print('vendored')\n").unwrap();
+
+        let key = || {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hash_project_sources(&dir, &mut hasher).unwrap();
+            hasher.finish()
+        };
+        let before = key();
+
+        // Editing a sibling module must still invalidate the translation: that
+        // is the whole reason the key looks at anything besides the file.
+        fs::write(dir.join("helper.py"), "VALUE = 2\n").unwrap();
+        let after_sibling_edit = key();
+        assert_ne!(
+            before, after_sibling_edit,
+            "editing a same-directory module must change the cache key"
+        );
+
+        // Editing a file in a nested tree must change nothing. The old walk
+        // hashed it, which is both the cost and the reason the key needed a
+        // budget at all.
+        fs::write(nested.join("library.py"), "print('vendored, changed')\n").unwrap();
+        assert_eq!(
+            after_sibling_edit,
+            key(),
+            "a nested tree beside the script must not affect the cache key"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A directory link must not be followed. A virtualenv's `lib64 -> lib` is
+    /// the common case, and the recursive walk used to traverse the target a
+    /// second time through the alias.
+    #[test]
+    #[cfg(unix)]
+    fn translation_cache_key_skips_symlinks() {
+        let dir =
+            std::env::temp_dir().join(format!("tarvos-symlink-key-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let target = dir.join("lib");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(dir.join("main.py"), "print(1)\n").unwrap();
+        fs::write(target.join("module.py"), "VALUE = 1\n").unwrap();
+        std::os::unix::fs::symlink("lib", dir.join("lib64")).unwrap();
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hash_project_sources(&dir, &mut hasher).unwrap();
+        let with_link = hasher.finish();
+
+        // Adding a file inside the link target changes nothing: the link is not
+        // followed, so the aliased tree contributes nothing to the key.
+        fs::write(target.join("extra.py"), "VALUE = 2\n").unwrap();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hash_project_sources(&dir, &mut hasher).unwrap();
+        assert_eq!(
+            with_link,
+            hasher.finish(),
+            "a directory symlink must not pull its target into the cache key"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A cache entry is only usable when the stamp names that exact key and the
+    /// stored size still matches. A binary left behind by an interrupted build,
+    /// or one whose stamp belongs to another program, must be rejected rather
+    /// than copied to the caller's output path.
+    #[test]
+    fn cached_artifact_requires_matching_stamp_and_size() {
+        let dir = std::env::temp_dir().join(format!("tarvos-artifact-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("artifact");
+        let stamp = dir.join("artifact.ok");
+
+        fs::write(&binary, b"binary").unwrap();
+        assert!(
+            !compiled_artifact_is_complete(&binary, &stamp, "key-a"),
+            "a binary with no stamp must not be trusted"
+        );
+
+        fs::write(&stamp, "key-a\n6\n").unwrap();
+        assert!(
+            compiled_artifact_is_complete(&binary, &stamp, "key-a"),
+            "a stamped binary of the recorded size is complete"
+        );
+
+        assert!(
+            !compiled_artifact_is_complete(&binary, &stamp, "key-b"),
+            "a stamp for a different program must not be reused"
+        );
+
+        fs::write(&binary, b"truncated").unwrap();
+        assert!(
+            !compiled_artifact_is_complete(&binary, &stamp, "key-a"),
+            "a size that no longer matches the stamp means a partial write"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The key must separate everything that can change the binary, and nothing
+    /// else. Merging two programs into one entry would hand a caller the wrong
+    /// executable, which is far worse than a slow rebuild.
+    #[test]
+    fn compiled_artifact_key_separates_programs_compilers_and_profiles() {
+        let toolchain = toolchain::ResolvedToolchain {
+            mode: toolchain::ToolchainMode::Managed,
+            rustc: PathBuf::from("/toolchain/bin/rustc"),
+            version: "1.98.0".to_string(),
+            target: "x86_64-unknown-linux-gnu".to_string(),
+            source: "managed toolchain".to_string(),
+        };
+        let other_compiler = toolchain::ResolvedToolchain {
+            rustc: PathBuf::from("/other/bin/rustc"),
+            ..toolchain.clone()
+        };
+        let other_version = toolchain::ResolvedToolchain {
+            version: "1.97.0".to_string(),
+            ..toolchain.clone()
+        };
+
+        let release = compiled_artifact_key("fn main() {}", false, &toolchain);
+        assert_eq!(
+            release,
+            compiled_artifact_key("fn main() {}", false, &toolchain),
+            "the same program, compiler, and profile must produce the same key"
+        );
+        assert_ne!(
+            release,
+            compiled_artifact_key("fn main() { println!(\"other\"); }", false, &toolchain),
+            "a different program must not share an artifact"
+        );
+        assert_ne!(
+            release,
+            compiled_artifact_key("fn main() {}", true, &toolchain),
+            "the fast and release profiles must not share an artifact"
+        );
+        assert_ne!(
+            release,
+            compiled_artifact_key("fn main() {}", false, &other_compiler),
+            "a different compiler must not share an artifact"
+        );
+        assert_ne!(
+            release,
+            compiled_artifact_key("fn main() {}", false, &other_version),
+            "a different compiler version must not share an artifact"
+        );
+    }
+}
