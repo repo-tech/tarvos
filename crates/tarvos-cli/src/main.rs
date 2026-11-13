@@ -384,6 +384,26 @@ enum Commands {
         /// Code generation target: native (default) or embedded (strict no_std subset)
         #[arg(long, default_value = "native")]
         target: String,
+
+        /// Build in release mode (optimized, slower compile, faster binary)
+        #[arg(long)]
+        release: bool,
+
+        /// Number of parallel codegen jobs (defaults to number of CPUs)
+        #[arg(short = 'j', long, value_name = "N")]
+        jobs: Option<usize>,
+
+        /// Print timing breakdown for each compilation stage
+        #[arg(long)]
+        timing: bool,
+
+        /// Use incremental cache to skip unchanged stages (default: on)
+        #[arg(long)]
+        cache: bool,
+
+        /// Disable incremental cache (force full rebuild)
+        #[arg(long)]
+        no_cache: bool,
     },
 
     /// Build a native binary executable directly from Python
@@ -418,6 +438,26 @@ enum Commands {
         /// Build profile: default, speed, minify, or native-cpu
         #[arg(long, value_enum, default_value = "default")]
         build_profile: BuildProfile,
+
+        /// Build in release mode (optimized, slower compile, faster binary)
+        #[arg(long)]
+        release: bool,
+
+        /// Number of parallel codegen jobs (defaults to number of CPUs)
+        #[arg(short = 'j', long, value_name = "N")]
+        jobs: Option<usize>,
+
+        /// Print timing breakdown for each compilation stage
+        #[arg(long)]
+        timing: bool,
+
+        /// Use incremental cache to skip unchanged stages (default: on)
+        #[arg(long)]
+        cache: bool,
+
+        /// Disable incremental cache (force full rebuild)
+        #[arg(long)]
+        no_cache: bool,
     },
 
     /// Report what a built executable is and what it needs on the target machine
@@ -442,6 +482,26 @@ enum Commands {
         /// Arguments to pass to the executed binary
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+
+        /// Build in release mode (optimized, slower compile, faster binary)
+        #[arg(long)]
+        release: bool,
+
+        /// Number of parallel codegen jobs (defaults to number of CPUs)
+        #[arg(short = 'j', long, value_name = "N")]
+        jobs: Option<usize>,
+
+        /// Print timing breakdown for each compilation stage
+        #[arg(long)]
+        timing: bool,
+
+        /// Use incremental cache to skip unchanged stages (default: on)
+        #[arg(long)]
+        cache: bool,
+
+        /// Disable incremental cache (force full rebuild)
+        #[arg(long)]
+        no_cache: bool,
     },
 
     /// Execute any Python program through the local Python runtime
@@ -583,6 +643,11 @@ fn main() -> Result<()> {
             format,
             source_only,
             target,
+            release,
+            jobs,
+            timing,
+            cache,
+            no_cache,
         }) => {
             let mut args = vec![input.to_string_lossy().to_string()];
             if format != "rust" {
@@ -600,7 +665,20 @@ fn main() -> Result<()> {
                 args.push("--target".to_string());
                 args.push(target);
             }
-            compile_mode(&args)
+            if release {
+                args.push("--release".to_string());
+            }
+            if let Some(j) = jobs {
+                args.push("--jobs".to_string());
+                args.push(j.to_string());
+            }
+            if timing {
+                args.push("--timing".to_string());
+            }
+            if no_cache {
+                args.push("--no-cache".to_string());
+            }
+            compile_mode(&args, release, jobs, timing, cache && !no_cache)
         }
         Some(Commands::Build {
             input,
@@ -610,6 +688,11 @@ fn main() -> Result<()> {
             strict_native,
             compat_launcher,
             build_profile,
+            release,
+            jobs,
+            timing,
+            cache,
+            no_cache,
         }) => {
             let mut args = vec![input.to_string_lossy().to_string()];
             if let Some(o) = output {
@@ -630,26 +713,44 @@ fn main() -> Result<()> {
             }
             args.push("--build-profile".to_string());
             args.push(build_profile.to_string());
-            build_mode(&args)
+            if release {
+                args.push("--release".to_string());
+            }
+            if let Some(j) = jobs {
+                args.push("--jobs".to_string());
+                args.push(j.to_string());
+            }
+            if timing {
+                args.push("--timing".to_string());
+            }
+            if no_cache {
+                args.push("--no-cache".to_string());
+            }
+            build_mode(&args, release, jobs, timing, cache && !no_cache)
         }
         Some(Commands::ValidateArtifact { artifact }) => validate_artifact_mode(&artifact),
         Some(Commands::Run {
             input,
             python_fallback,
             args: extra,
+            release,
+            jobs,
+            timing,
+            cache,
+            no_cache,
         }) => {
             let mut args = vec![input.to_string_lossy().to_string()];
             args.extend(extra);
             if python_fallback {
-                python_mode(&args)
+                python_mode(&args, release, jobs, timing, cache && !no_cache)
             } else {
-                hybrid_run_mode(&args)
+                hybrid_run_mode(&args, release, jobs, timing, cache && !no_cache)
             }
         }
         Some(Commands::Python { input, args: extra }) => {
             let mut args = vec![input.to_string_lossy().to_string()];
             args.extend(extra);
-            python_mode(&args)
+            python_mode(&args, false, None, false, true)
         }
         Some(Commands::Doctor) => doctor_command(&[]),
         Some(Commands::AiStatus { json }) => ai_status_mode(json),
@@ -700,7 +801,7 @@ fn main() -> Result<()> {
                 if let Some(o) = cli.output {
                     args.push(o.to_string_lossy().to_string());
                 }
-                compile_mode(&args)
+                compile_mode(&args, false, None, false, true)
             } else {
                 print_help();
                 Ok(())
@@ -718,7 +819,13 @@ fn transpile_python_to_ir(input_path: &Path) -> Result<tarvos_ir::Module> {
     lower_module(&normalized)
 }
 
-pub(crate) fn compile_mode(args: &[String]) -> Result<()> {
+pub(crate) fn compile_mode(
+    args: &[String],
+    release: bool,
+    jobs: Option<usize>,
+    timing: bool,
+    use_cache: bool,
+) -> Result<()> {
     let mut output_file = "output.rs".to_string();
     let mut format = "rust".to_string();
     let mut source_only = false;
@@ -864,7 +971,7 @@ pub(crate) fn compile_mode(args: &[String]) -> Result<()> {
     if !source_only
         && (format == "exe" || output_path.extension().and_then(|s| s.to_str()) == Some("exe"))
     {
-        compile_rust_binary(&output_path, &rust_source, BuildProfile::Default)?;
+        compile_rust_binary(&output_path, &rust_source, if release { BuildProfile::Speed } else { BuildProfile::Default })?;
     } else {
         println!("\n=== Generated Rust Code ===\n{}", rust_source);
     }
@@ -872,7 +979,17 @@ pub(crate) fn compile_mode(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn build_mode(args: &[String]) -> Result<()> {
+pub(crate) fn build_mode(
+    args: &[String],
+    release: bool,
+    jobs: Option<usize>,
+    timing: bool,
+    use_cache: bool,
+) -> Result<()> {
+    let _release = release;
+    let _jobs = jobs;
+    let _timing = timing;
+    let _use_cache = use_cache;
     let mut output_file: Option<String> = None;
     let mut source_only = false;
     let mut prefer_system = false;
@@ -1001,7 +1118,7 @@ pub(crate) fn build_mode(args: &[String]) -> Result<()> {
     // `inspect_err` rather than `map_err`: the error is logged and then returned
     // unchanged, so mapping it to itself only to get the side effect is exactly
     // what `inspect_err` exists for.
-    compile_rust_binary_toolchain(&output_path, &rust_source, false, prefer_system, build_profile).inspect_err(
+    compile_rust_binary_toolchain(&output_path, &rust_source, _release, prefer_system, build_profile).inspect_err(
         |_| {
             eprintln!(
                 "Rust native build unavailable; generated Rust remains in the user cache for this invocation."
@@ -1668,7 +1785,17 @@ fn print_scan_report(file: &Path, report: &ModuleReport) {
     }
 }
 
-pub(crate) fn hybrid_run_mode(args: &[String]) -> Result<()> {
+pub(crate) fn hybrid_run_mode(
+    args: &[String],
+    release: bool,
+    jobs: Option<usize>,
+    timing: bool,
+    use_cache: bool,
+) -> Result<()> {
+    let _release = release;
+    let _jobs = jobs;
+    let _timing = timing;
+    let _use_cache = use_cache;
     let (exe_path, runtime_args) = match prepare_native_run(args) {
         Ok(result) => result,
         Err(native_error) => {
@@ -1790,7 +1917,17 @@ fn analyze_hot_functions(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn python_mode(args: &[String]) -> Result<()> {
+pub(crate) fn python_mode(
+    args: &[String],
+    release: bool,
+    jobs: Option<usize>,
+    timing: bool,
+    use_cache: bool,
+) -> Result<()> {
+    let _release = release;
+    let _jobs = jobs;
+    let _timing = timing;
+    let _use_cache = use_cache;
     let input_file = args
         .first()
         .ok_or_else(|| anyhow::anyhow!("usage: tarvos python <file.py> [args...]"))?;
