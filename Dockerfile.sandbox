@@ -1,0 +1,38 @@
+FROM rust:1.88-slim AS builder
+
+WORKDIR /workspace
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY python ./python
+COPY benchmarks ./benchmarks
+COPY examples ./examples
+COPY validation ./validation
+RUN cargo build --locked --release --bin tarvos
+
+FROM rust:1.88-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TARVOS_PYTHON=python3 \
+    TARVOS_SANDBOX=1 \
+    PATH="/usr/local/cargo/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes ca-certificates htop nano python3 python-is-python3 sudo util-linux vim \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --home-dir /home/tarvosuser --shell /bin/bash tarvosuser \
+    && mkdir -p /home/tarvosuser/workspace \
+    && chown -R tarvosuser:tarvosuser /home/tarvosuser
+
+COPY --from=builder /workspace/target/release/tarvos /usr/local/bin/tarvos
+RUN chmod 0555 /usr/local/bin/tarvos
+COPY --from=builder /workspace/benchmarks/run_benchmarks.py /workspace/benchmarks/run_benchmarks.py
+COPY --from=builder /workspace/examples/simple.py /workspace/examples/simple.py
+COPY --from=builder /workspace/examples/simple.rs /workspace/examples/simple.rs
+COPY --from=builder /workspace/examples/if_example.py /workspace/examples/if_example.py
+COPY --from=builder /workspace/examples/if_example.rs /workspace/examples/if_example.rs
+RUN printf '#!/bin/bash\nTARGET="${1:-.}"\nprintf "\\033]777;tarvos:open;%%s\\007" "$TARGET"\n' > /usr/local/bin/code && chmod 0755 /usr/local/bin/code
+RUN chown -R tarvosuser:tarvosuser /workspace
+
+USER tarvosuser
+WORKDIR /home/tarvosuser/workspace
+ENTRYPOINT ["/bin/bash"]

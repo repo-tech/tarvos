@@ -1,0 +1,528 @@
+name: CI
+
+# Fast compiler health plus real native validation on every supported platform.
+#
+# This workflow answers "is the source healthy, and does a compiled native
+# program behave like CPython?". It never builds release artifacts, never
+# touches a tag, and never creates, edits, or deletes a release. Release work
+# is tag-gated in release.yml.
+#
+# The `native` job is the one that matters most: it compiles Python to a real
+# executable and compares its output with CPython. The unit tests only assert the
+# SHAPE of generated Rust, so a wrong constant or a wrong operator passes them.
+
+on:
+  pull_request:
+    branches: [ main, master, develop ]
+  push:
+    branches: [ main, master, develop ]
+  # Cross-platform verification is expensive, so the full target sweep runs on
+  # demand and on a weekly schedule instead of on every commit.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+# Least privilege: this workflow only ever reads the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Only a superseded pull request run is cancelled. Push, schedule, and manual
+  # runs are never cancelled, so an in-flight check is always left visible
+  # instead of being silently replaced.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  quality:
+    # Static name for the same reason as the native job: a matrix expression in
+    # `name` is rendered literally, which makes the run list and any failure
+    # notification unreadable. The platform is printed by the Report context step.
+    name: Compiler gates
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      # Tests compile Rust through the Tarvos CLI from a temporary directory
+      # outside the checkout, where rust-toolchain.toml is not visible. Without
+      # this the CLI's rustup lookup resolves whatever the runner default is,
+      # so the same source would build differently on different days.
+      RUSTUP_TOOLCHAIN: ${{ matrix.os == 'windows-latest' && 'stable-x86_64-pc-windows-gnu' || 'stable-x86_64-unknown-linux-gnu' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ windows-latest, ubuntu-latest ]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # CPython is the *oracle* for the differential suite, so its version is a
+      # correctness boundary, not a preference. It is pinned to 3.12 deliberately:
+      # a few statistics results differ between 3.12 and 3.13 (a single-element
+      # median_grouped/quantiles input raises on 3.12 and returns a value on
+      # 3.13), so a floating "latest" Python would make the suite non-deterministic.
+      # Any change here must be accompanied by re-verifying tests/corpus.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+
+      # The gate tests compile Rust *through* the Tarvos CLI, and the CLI
+      # deliberately prefers its own managed toolchain over whatever rustup
+      # resolves. On a runner where that toolchain was never installed, every
+      # native-compilation test finds no managed rustc and falls back to CPython,
+      # which the tests then correctly report as a failure. Installing it here is
+      # what makes these tests measure the compiler rather than the runner.
+      - name: Install the managed toolchain
+        run: cargo run --release -p tarvos-cli -- toolchain --install
+
+      - name: Cache Cargo and build output
+        # First-party only. A third-party cache action would add a new
+        # external trust boundary while the current failure is still
+        # unexplained. The key carries the OS, the pinned toolchain, and
+        # Cargo.lock, so a toolchain bump or dependency change cannot
+        # silently reuse a stale build.
+        uses: actions/cache@v4
+        with:
+          # Only Cargo's download cache. `target/` is deliberately NOT cached:
+          # the key below has no source component, so a restored target tree
+          # would let a test run against a binary built from an older commit.
+          # For a compiler, that is a correctness hazard, not a speed-up.
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-rust-stable-x86_64-pc-windows-gnu-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-stable-x86_64-pc-windows-gnu-
+      - name: Report context
+        shell: bash
+        run: |
+          echo "os      : ${{ matrix.os }}"
+          echo "commit  : ${{ github.sha }}"
+          echo "event   : ${{ github.event_name }}"
+          echo "cargo   : $(cargo --version)"
+          echo "rustc   : $(rustc --version)"
+          echo "python  : $(python --version 2>&1)"
+
+      - name: Verify the pinned toolchain is consistent
+        # A floating or mismatched toolchain fails later and less clearly, so it
+        # is checked first and named explicitly.
+        run: python scripts/check_toolchain_pin.py
+
+      # Deliberately four separate steps rather than one bundled `ci_gates.py`
+      # invocation. The commands are identical to the script a developer runs
+      # locally, so there is no behavioural drift, but a step conclusion is
+      # visible in the run list and the check-run API without needing log access,
+      # while a single bundled step only says "something failed". A CI log that
+      # names the failing gate is the difference between a five-minute fix and
+      # an archaeology exercise.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The wrapper runs the identical command and additionally emits one
+      # workflow annotation per failing test. `cargo test` only writes failures
+      # to the job log, which needs write access to fetch; an annotation is
+      # visible to anyone who can read the repository, which is what makes a
+      # platform-specific failure actionable instead of mysterious. The gate
+      # still fails on the real exit code, so it cannot mask a failure.
+      - name: Test workspace
+        run: python scripts/run_workspace_tests.py
+
+      - name: Check the compatibility matrix is current
+        # The matrix is generated from a table and cross-checked against the
+        # differential corpus, so it cannot claim coverage that no test proves.
+        run: python scripts/compatibility_matrix.py --check
+
+      - name: Check the shipped shell scripts
+        run: python scripts/test_installer.py
+
+      - name: Check the benchmark harness PATH
+        # The harness keeps only PATH entries inside its safe roots, and those
+        # roots did not include the system binary directories. On Linux that
+        # removed `cc` from PATH and every native benchmark build failed with
+        # `linker 'cc' not found`, so the audit failed on Linux and passed on
+        # Windows, where rustc finds link.exe through the registry instead of
+        # through PATH.
+        run: python scripts/test_benchmark_path.py
+
+      # The acceptance question is "does Tarvos build with no Rust on PATH", and
+      # only a real Linux runner can answer it. It downloads and installs the
+      # managed toolchain, so it is kept out of `quality` and given its own job
+      # with a longer timeout: a cold managed install is minutes, not seconds.
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-diagnostics-${{ matrix.os }}
+          path: |
+            rust-toolchain.toml
+            .build-tmp
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Linux-only acceptance: installs the Tarvos-managed toolchain, then rebuilds
+  # with rustc, cargo and rustup removed from PATH. A green run here is the
+  # evidence for "a user installs Tarvos, not Rust"; without it that claim is
+  # only ever tested on a machine that already had Rust.
+  managed-toolchain:
+    name: Managed toolchain acceptance (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: stable-x86_64-unknown-linux-gnu
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Rust for building the CLI
+        # Pinned to the same tag as every other toolchain step in this workflow
+        # and to `rust-toolchain.toml`. This step used to say `@master` with the
+        # version in a `with:` block, which `scripts/check_toolchain_pin.py`
+        # reads as an unpinned install: the action could change what `@master`
+        # does at any time while the gates below it assumed 1.98.0.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup
+          key: managed-tc-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            managed-tc-${{ runner.os }}-
+
+      - name: Run the Linux acceptance script
+        run: bash scripts/verify_linux.sh
+
+      - name: Upload the acceptance report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: managed-toolchain-report
+          path: .build-tmp/linux-verify
+          if-no-files-found: ignore
+          retention-days: 7
+# The standalone contract, on a machine that has the build toolchain but not
+  # the artifact's dependencies. A native Tarvos binary embeds its own Rust and
+  # must run with nothing installed: no Python, no packages, no Tarvos. This job
+  # builds such a binary, copies *only* that file into an empty directory, runs it
+  # there, and fails if a Python source file appeared or the output is wrong.
+  #
+  # It cannot test a *second* machine from GitHub-hosted runners, so it makes no
+  # such claim. What it does prove is that nothing about the build machine leaks
+  # into the artifact: an unrelated directory, no inherited PYTHONPATH or
+  # VIRTUAL_ENV, and no interpreter on the lookup path.
+  standalone:
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.os == 'windows-latest' && 'stable-x86_64-pc-windows-gnu' || 'stable-x86_64-unknown-linux-gnu' }}
+    name: Standalone artifact
+    needs: quality
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ windows-latest, ubuntu-latest ]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Deliberately NOT installed: Python, any third-party package, and the
+      # Tarvos CLI itself. The build uses the managed toolchain under
+      # ~/.tarvos/toolchain, so the only compiler present is the one Tarvos
+      # manages. If the artifact needed any of the omitted pieces, this job fails
+      # rather than passing quietly on a runner that happens to have them.
+      - name: Build the release CLI
+        run: cargo build --release -p tarvos-cli
+
+      # This job's whole premise is that the artifact is built with the managed
+      # toolchain and nothing else, so that is what has to be installed first.
+      # Without it there is no compiler at all under ~/.tarvos, and the build
+      # falls back to whatever the runner happens to provide — which is exactly
+      # the situation this job exists to rule out.
+      - name: Install the managed toolchain
+        run: cargo run --release -p tarvos-cli -- toolchain --install
+
+      - name: Build a standalone program
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarvos="target/release/tarvos"
+          if [ -f "target/release/tarvos.exe" ]; then tarvos="target/release/tarvos.exe"; fi
+          mkdir -p .build-tmp/standalone/src
+          cat > .build-tmp/standalone/src/hello.py <<'PY'
+          total = 0
+          for value in range(5):
+              total = total + value
+          print("sum", total)
+          PY
+          "$tarvos" build .build-tmp/standalone/src/hello.py -o .build-tmp/standalone/hello
+
+      - name: Validate the artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarvos="target/release/tarvos"
+          if [ -f "target/release/tarvos.exe" ]; then tarvos="target/release/tarvos.exe"; fi
+          # Not a glob. `tarvos build` writes the executable and a sibling
+          # `<artifact>.tarvos-manifest.json`, so `hello*` expanded to two paths
+          # and `validate-artifact` accepts exactly one argument. It rejected the
+          # second with "unexpected argument" and exited 2 on both platforms, so
+          # this step never got as far as checking anything about the artifact.
+          artifact=""
+          for candidate in .build-tmp/standalone/hello.exe .build-tmp/standalone/hello; do
+            if [ -f "$candidate" ]; then artifact="$candidate"; break; fi
+          done
+          if [ -z "$artifact" ]; then
+            echo "::error title=Missing artifact::no standalone executable was produced"
+            exit 1
+          fi
+          echo "validating $artifact"
+          "$tarvos" validate-artifact "$artifact"
+
+      # Only the artifact crosses over. No source, no manifest, no virtualenv,
+      # no interpreter: exactly what a user would email to someone else.
+      - name: Run the artifact alone on this machine
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .build-tmp/isolated
+          mkdir -p .build-tmp/isolated
+          # Resolve the executable explicitly. The glob also matched the
+          # sibling `*.tarvos-manifest.json`, so `ls hello*` returned two lines
+          # and `exe` ended up holding a newline-joined pair; `./"$exe"` then
+          # failed on a path that did not exist. Only the executable is copied:
+          # what is being tested here is that the binary stands alone.
+          artifact=""
+          for candidate in .build-tmp/standalone/hello.exe .build-tmp/standalone/hello; do
+            if [ -f "$candidate" ]; then artifact="$candidate"; break; fi
+          done
+          if [ -z "$artifact" ]; then
+            echo "::error title=Missing artifact::no standalone executable was produced"
+            exit 1
+          fi
+          exe="$(basename "$artifact")"
+          cp "$artifact" .build-tmp/isolated/
+          ls -l .build-tmp/isolated
+          cd .build-tmp/isolated
+          # Remove every environment hint that the build machine is special.
+          unset PYTHONPATH VIRTUAL_ENV PYTHONHOME || true
+          output="$(./"$exe")"
+          echo "output: $output"
+          test "$output" = "sum 10"
+          test ! -f hello.py
+          # Nothing may be reconstructed on a second run either.
+          ./"$exe" > /dev/null
+          test -z "$(find . -name '*.tarvos-*.py' -o -name '*.py' | head -n 1)"
+
+      - name: Upload the artifact and its manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-${{ matrix.os }}
+          path: |
+            .build-tmp/standalone
+            .build-tmp/isolated
+          if-no-files-found: ignore
+          retention-days: 7
+
+
+
+  native:
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.os == 'windows-latest' && 'stable-x86_64-pc-windows-gnu' || 'stable-x86_64-unknown-linux-gnu' }}
+    # A static job name. GitHub renders a matrix expression in `name` literally,
+    # so the run list shows "native parity (${{ matrix.os }})" instead of a
+    # usable job name, and a failure notification becomes an unreadable string.
+    # The platform is still shown in the step output.
+    name: Native parity
+    needs: quality
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ windows-latest, ubuntu-latest ]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # CPython is the *oracle* for the differential suite, so its version is a
+      # correctness boundary, not a preference. It is pinned to 3.12 deliberately:
+      # a few statistics results differ between 3.12 and 3.13 (a single-element
+      # median_grouped/quantiles input raises on 3.12 and returns a value on
+      # 3.13), so a floating "latest" Python would make the suite non-deterministic.
+      # Any change here must be accompanied by re-verifying tests/corpus.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+
+      - name: Cache Cargo and build output
+        # First-party only. A third-party cache action would add a new
+        # external trust boundary while the current failure is still
+        # unexplained. The key carries the OS, the pinned toolchain, and
+        # Cargo.lock, so a toolchain bump or dependency change cannot
+        # silently reuse a stale build.
+        uses: actions/cache@v4
+        with:
+          # Only Cargo's download cache. `target/` is deliberately NOT cached:
+          # the key below has no source component, so a restored target tree
+          # would let a test run against a binary built from an older commit.
+          # For a compiler, that is a correctness hazard, not a speed-up.
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-rust-stable-x86_64-pc-windows-gnu-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-stable-x86_64-pc-windows-gnu-
+      - name: Build the CLI
+        run: cargo build -p tarvos-cli
+
+      # Both this job and the standalone job compile through the Tarvos CLI,
+      # which prefers its own managed toolchain. Without it installed on the
+      # runner, every native build falls back to CPython and the differential
+      # comparison is comparing Python against Python.
+      - name: Install the managed toolchain
+        run: cargo run -p tarvos-cli -- toolchain --install
+
+      - name: Report context
+        shell: bash
+        run: |
+          echo "os      : ${{ matrix.os }}"
+          echo "commit  : ${{ github.sha }}"
+          echo "cargo   : $(cargo --version)"
+          echo "python  : $(python --version 2>&1)"
+
+      # Each harness compiles real native executables and compares them with
+      # CPython, so a compiler regression that still produces valid Rust is
+      # caught here rather than by a user.
+      - name: Differential tests (CPython vs native)
+        run: python benchmarks/difftest.py
+
+      - name: CLI audit
+        run: python benchmarks/cli_audit.py
+
+      - name: Project acceptance
+        run: python benchmarks/project_acceptance.py
+
+      - name: Generated Rust compiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .build-tmp/verify
+          cat > .build-tmp/verify/main.py <<'PY'
+          def classify(n):
+              if n > 10:
+                  return "big"
+              elif n > 0:
+                  return "small"
+              return "none"
+
+
+          for n in range(3):
+              print(n, classify(n), n / 2, n % 2)
+          PY
+          tarvos="target/debug/tarvos"
+          if [ -f "target/debug/tarvos.exe" ]; then tarvos="target/debug/tarvos.exe"; fi
+          "$tarvos" compile .build-tmp/verify/main.py -o .build-tmp/verify/main.rs
+          grep -q "fn main" .build-tmp/verify/main.rs
+
+      # `always()` so a differential failure still leaves the generated Rust
+      # behind. A compiler regression is only diagnosable from the Rust it
+      # produced, and that file is the first thing lost when a step fails.
+      - name: Upload native validation log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-parity-${{ matrix.os }}
+          path: |
+            .build-tmp/verify/main.rs
+            .build-tmp/difftest
+          if-no-files-found: ignore
+          retention-days: 7
+
+  cross-target:
+    # A static job name: GitHub renders a matrix expression in `name` literally,
+    # which turns a failure notification into "${{ matrix.target }} failed".
+    name: Cross-target build
+    # Release-grade cross-platform artifacts are built by release.yml from the
+    # tag. This sweep exists so a target that stopped compiling is still caught
+    # between releases, which is why it must not run on every commit.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: tarvos.exe
+          - os: windows-latest
+            target: x86_64-pc-windows-gnu
+            binary_name: tarvos.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_name: tarvos
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Report context
+        run: |
+          echo "commit : ${{ github.sha }}"
+          echo "target : ${{ matrix.target }}"
+          echo "cargo  : $(cargo --version)"
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Windows GNU toolchain
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: |
+          choco install mingw -y --no-progress
+          echo "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin" >> $GITHUB_PATH
+
+      - name: Build release CLI for target
+        run: cargo build --release --target ${{ matrix.target }} -p tarvos-cli
+
+      - name: Report built binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
+          if [ ! -f "$binary" ]; then
+            echo "::error title=Missing binary::$binary was not produced for ${{ matrix.target }}"
+            exit 1
+          fi
+          ls -l "$binary"

@@ -1,0 +1,84 @@
+# Rust build and native artifacts
+/target/
+**/target/
+*.rlib
+*.rmeta
+*.pdb
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Temporary compiler output
+/.build-tmp/
+/tmp_build/
+*.rs.tmp
+*.out
+*.log
+*.tmp
+tarvos-export/
+tarvos-cache-v1.2/
+.tarvos_cache/
+
+# Python runtime and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+ENV/
+.bench-venv/
+
+# Benchmark and generated reports
+/benchmarks/results/
+/benchmark-results/
+*.bench.json
+*.benchmark.json
+*_benchmark.json
+
+# Locally staged release artifacts. These are built and uploaded by the release
+# workflow, or staged by hand when publishing a release; they are never part of
+# the source tree.
+/tarvos-windows-x86_64.exe
+/*.sha256
+
+# IDE and operating-system files
+.vscode/
+.idea/
+.cargo/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local-only tools and scratch files
+/tools/
+/true/
+.wininst-*.txt
+dummy*
+output.rs
+temp_output.rs
+tmp_app.rs
+tmp_fair.rs
+output_rust_out*
+fair_no_fold_rust*
+*_release.pdb
+/temp-tarvos-dist/
+
+# CI and cache
+/.tarvos_cache/
+**/.cache/
+
+# Test artifacts
+hello_speed.exe
+demo.exe
+output_rust_out.exe
+temp_output.rs
+docs/*.pdf
+
+# Scripts
+version_tools/
+

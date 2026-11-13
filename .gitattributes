@@ -1,0 +1,14 @@
+# Shell scripts must stay LF everywhere. With core.autocrlf=true on Windows,
+# bash scripts get CRLF on checkout and die with
+#   "syntax error: unexpected end of file"
+# which names neither the file nor the offending line. Pinning the eol here
+# means the working copy matches the index regardless of the local config.
+*.sh text eol=lf
+
+# Same hazard, lower stakes: a BOM stops bash from matching the shebang.
+*.sh text working-tree-encoding=UTF-8
+
+# Test and documentation fixtures are read byte-for-byte by the differential
+# harness, so they must not be rewritten either.
+tests/corpus/** text eol=lf
+*.py text eol=lf
