@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "compiler",
+    "crates/tarvos-cli",
+    "crates/tarvos-server",
+    "crates/tarvos-core",
+    "crates/tarvos-ast",
+    "crates/tarvos-parser",
+    "crates/tarvos-types",
+    "crates/tarvos-ir",
+    "crates/tarvos-analysis",
+    "crates/tarvos-optimizer",
+    "crates/tarvos-codegen-rust",
+    "crates/tarvos-codegen-wasm",
+    "crates/tarvos-codegen-cloud",
+    "crates/tarvos-codegen-cranelift",
+    "crates/tarvos-tests",
+]
+
+# Canonical product version.
+#
+# Every workspace member inherits this with `version.workspace = true`, so the
+# Cargo workspace is the only place a crate version is written down. Release
+# metadata outside Cargo (installer, launcher, README, gateway banner) is
+# verified against this value by `scripts/check_version_consistency.py`, which
+# CI runs on every push.
+[workspace.package]
+version = "1.3.1"
+edition = "2021"
+
+[profile.dev]
+incremental = true
+codegen-units = 8
+debug = 0
+opt-level = 0
+
+[profile.release]
+opt-level = 3           
+codegen-units = 1    
+lto = "fat"          
+panic = "abort"    
+strip = true       
+
+
+[profile.release-fast]
+inherits = "release"
+opt-level = 3
+codegen-units = 8
+lto = false
+panic = "abort"
+strip = "symbols"
