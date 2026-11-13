@@ -1,0 +1,9 @@
+[package]
+name = "tarvos-codegen-rust"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = "1"
+tarvos-ir = { path = "../tarvos-ir" }
+tarvos-types = { path = "../tarvos-types" }
