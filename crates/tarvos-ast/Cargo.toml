@@ -1,0 +1,8 @@
+[package]
+name = "tarvos-ast"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tarvos-types = { path = "../tarvos-types" }

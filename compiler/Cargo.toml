@@ -1,0 +1,16 @@
+[package]
+name = "tarvos"
+version.workspace = true
+edition.workspace = true
+
+# The Ruff-native reference compiler. Its binary must not be named `tarvos`,
+# because the user-facing CLI in `crates/tarvos-cli` already owns that name.
+# Sharing the name made cargo link both binaries to `target/<profile>/tarvos.exe`
+# ("output filename collision"), which could publish the wrong release artifact.
+[[bin]]
+name = "tarvos-ruff"
+path = "src/main.rs"
+
+[dependencies]
+ruff_python_parser = "=0.0.12"
+ruff_python_ast = "=0.0.12"

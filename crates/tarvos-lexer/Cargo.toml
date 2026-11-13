@@ -1,0 +1,9 @@
+[package]
+name = "tarvos-lexer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
