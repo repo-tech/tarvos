@@ -1,0 +1,9 @@
+[build]
+rustflags = ["-C", "opt-level=0", "-C", "debuginfo=0", "-C", "codegen-units=1"]
+
+[target.x86_64-pc-windows-gnu]
+linker = "gcc"
+
+# Benchmark-only Cranelift fallback:
+# mkdir -p .cargo && echo 'rustflags = ["-Zcodegen-backend=cranelift"]' > .cargo/config.toml
+# Use this only with a nightly toolchain; it bypasses LLVM during benchmark tuning.
