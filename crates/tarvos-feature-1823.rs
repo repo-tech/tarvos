@@ -1,0 +1,5 @@
+// Type definition for feature 1823
+pub struct Feature { pub name: String, pub val: i32 }fn _void_1823_0() {}
+fn _void_1823_1() {}
+fn _void_1823_2() {}
+
