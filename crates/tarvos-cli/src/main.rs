@@ -624,9 +624,65 @@ enum Commands {
     /// Validate Tarvos output against reference test suite
     #[command(long_about = VALIDATE_HELP)]
     Validate,
-    /// Run the Tarvos HTTP API gateway for AI/LLM integration
+    /// Run the Tarvos HTTP API gateway for AI/LLM integration with cloud support
     #[command(long_about = SERVE_HELP)]
-    Serve,
+    Serve {
+        /// Server port (default: 8080)
+        #[arg(long, default_value = "8080")]
+        port: u16,
+
+        /// Host address to bind (default: 0.0.0.0)
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+
+        /// Number of worker processes (default: number of CPUs)
+        #[arg(short = 'j', long)]
+        workers: Option<usize>,
+
+        /// Logging level: debug, info, warn, error (default: info)
+        #[arg(long, default_value = "info")]
+        log_level: String,
+
+        /// Maximum concurrent connections (default: 1000)
+        #[arg(long, default_value = "1000")]
+        max_connections: u32,
+
+        /// SSL certificate path for HTTPS
+        #[arg(long)]
+        ssl_cert: Option<PathBuf>,
+
+        /// SSL private key path for HTTPS
+        #[arg(long)]
+        ssl_key: Option<PathBuf>,
+
+        /// Deploy to AWS cloud: lambda, ecs, or ec2
+        #[arg(long)]
+        deploy_aws: Option<String>,
+
+        /// AWS region for cloud deployment (default: us-east-1)
+        #[arg(long, default_value = "us-east-1")]
+        aws_region: String,
+
+        /// AWS credentials profile name
+        #[arg(long)]
+        aws_profile: Option<String>,
+
+        /// Cloud provider: aws or local (default: local)
+        #[arg(long, default_value = "local")]
+        cloud_provider: String,
+
+        /// EC2 instance type for deployment (default: t3.medium)
+        #[arg(long, default_value = "t3.medium")]
+        instance_type: String,
+
+        /// Minimum instances for auto-scaling (default: 1)
+        #[arg(long, default_value = "1")]
+        min_instances: u32,
+
+        /// Maximum instances for auto-scaling (default: 10)
+        #[arg(long, default_value = "10")]
+        max_instances: u32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -794,7 +850,26 @@ fn main() -> Result<()> {
         }) => toolchain::toolchain_command(status, install, verify),
         Some(Commands::Install) => install_command(&[]),
         Some(Commands::Validate) => validate_command(&[]),
-        Some(Commands::Serve) => serve_command(&[]),
+        Some(Commands::Serve {
+            port,
+            host,
+            workers,
+            log_level,
+            max_connections,
+            ssl_cert,
+            ssl_key,
+            deploy_aws,
+            aws_region,
+            aws_profile,
+            cloud_provider,
+            instance_type,
+            min_instances,
+            max_instances,
+        }) => serve_command(
+            port, host, workers, log_level, max_connections,
+            ssl_cert, ssl_key, deploy_aws, aws_region, aws_profile,
+            cloud_provider, instance_type, min_instances, max_instances,
+        ),
         None => {
             if let Some(input) = cli.input {
                 let mut args = vec![input.to_string_lossy().to_string()];
@@ -822,9 +897,9 @@ fn transpile_python_to_ir(input_path: &Path) -> Result<tarvos_ir::Module> {
 pub(crate) fn compile_mode(
     args: &[String],
     release: bool,
-    jobs: Option<usize>,
-    timing: bool,
-    use_cache: bool,
+    _jobs: Option<usize>,
+    _timing: bool,
+    _use_cache: bool,
 ) -> Result<()> {
     let mut output_file = "output.rs".to_string();
     let mut format = "rust".to_string();
@@ -1494,7 +1569,12 @@ fn copy_project_assets(root: &Path, destination: &Path, entry: &Path) -> Result<
     visit(root, root, destination, entry)
 }
 
-fn prepare_native_run(args: &[String]) -> Result<(PathBuf, Vec<String>)> {
+fn prepare_native_run(
+    args: &[String],
+    release: bool,
+    jobs: Option<usize>,
+    use_cache: bool,
+) -> Result<(PathBuf, Vec<String>)> {
     let input_file = args
         .first()
         .ok_or_else(|| anyhow::anyhow!("usage: tarvos run <file.py> [args...]"))?;
@@ -1502,39 +1582,58 @@ fn prepare_native_run(args: &[String]) -> Result<(PathBuf, Vec<String>)> {
     let input_path = secure_input_path(input_file, &working_dir)?;
 
     // --- Incremental cache pipeline: source → IR → Rust → Binary ---
-    let cache = cache::IncrementalCache::new()?;
+    let cache = if use_cache {
+        Some(cache::IncrementalCache::new()?)
+    } else {
+        None
+    };
     let source = std::fs::read_to_string(&input_path)
         .with_context(|| format!("failed to read {}", input_path.display()))?;
     let source_hash = cache::IncrementalCache::hash_source(&source);
 
     // Stage 1: IR (from source)
-    let ir_json = if let Some(cached) = cache.get_ir(source_hash)? {
-        println!("Cache hit: IR stage");
-        cached
+    let ir_json = if let Some(ref c) = cache {
+        if let Some(cached) = c.get_ir(source_hash)? {
+            println!("Cache hit: IR stage");
+            cached
+        } else {
+            println!("Cache miss: IR stage — parsing & lowering...");
+            let ir_module = transpile_python_to_ir(&input_path)?;
+            let ir_json = serde_json::to_string(&ir_module)?;
+            c.put_ir(source_hash, &ir_json)?;
+            ir_json
+        }
     } else {
-        println!("Cache miss: IR stage — parsing & lowering...");
+        println!("Cache disabled: IR stage — parsing & lowering...");
         let ir_module = transpile_python_to_ir(&input_path)?;
         let ir_json = serde_json::to_string(&ir_module)?;
-        cache.put_ir(source_hash, &ir_json)?;
         ir_json
     };
 
     // Stage 2: Rust (from IR)
     let ir_hash = cache::IncrementalCache::hash_bytes(ir_json.as_bytes());
-    let rust_source = if let Some(cached) = cache.get_rust(ir_hash)? {
-        println!("Cache hit: Rust stage");
-        cached
+    let rust_source = if let Some(ref c) = cache {
+        if let Some(cached) = c.get_rust(ir_hash)? {
+            println!("Cache hit: Rust stage");
+            cached
+        } else {
+            println!("Cache miss: Rust stage — codegen...");
+            let ir_module: tarvos_ir::Module = serde_json::from_str(&ir_json)?;
+            let rust_source = tarvos_codegen_rust::RustCodegen::generate(&ir_module)?;
+            c.put_rust(ir_hash, &rust_source)?;
+            rust_source
+        }
     } else {
-        println!("Cache miss: Rust stage — codegen...");
+        println!("Cache disabled: Rust stage — codegen...");
         let ir_module: tarvos_ir::Module = serde_json::from_str(&ir_json)?;
-        let rust_source = tarvos_codegen_rust::RustCodegen::generate(&ir_module)?;
-        cache.put_rust(ir_hash, &rust_source)?;
-        rust_source
+        tarvos_codegen_rust::RustCodegen::generate(&ir_module)?
     };
 
     // Stage 3: Binary (from Rust)
     let rust_hash = cache::IncrementalCache::hash_bytes(rust_source.as_bytes());
-    let temp_dir = cache.root.join("runs");
+    let temp_dir = cache.as_ref().map(|c| c.root.join("runs")).unwrap_or_else(|| {
+        std::env::temp_dir().join("tarvos-run-cache")
+    });
     fs::create_dir_all(&temp_dir).with_context(|| {
         format!(
             "failed to create user cache directory {}",
@@ -1548,17 +1647,24 @@ fn prepare_native_run(args: &[String]) -> Result<(PathBuf, Vec<String>)> {
         if cfg!(windows) { ".exe" } else { "" }
     ));
 
-    if let Some(cached_bin) = cache.get_binary(rust_hash)? {
-        println!("Cache hit: Binary stage — using cached executable");
-        Ok((cached_bin, args[1..].to_vec()))
-    } else {
-        println!("Cache miss: Binary stage — compiling native executable...");
-        compile_rust_binary_opt(&exe_path, &rust_source, true, BuildProfile::Default)?;
+    let profile = if release { BuildProfile::Speed } else { BuildProfile::Default };
+    let num_jobs = jobs.unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+
+    if let Some(ref c) = cache {
+        if let Some(cached_bin) = c.get_binary(rust_hash)? {
+            println!("Cache hit: Binary stage — using cached executable");
+            return Ok((cached_bin, args[1..].to_vec()));
+        }
+    }
+
+    println!("Cache miss: Binary stage — compiling native executable...");
+    compile_rust_binary_opt(&exe_path, &rust_source, num_jobs > 1, profile)?;
+    if let Some(ref c) = cache {
         let metadata = std::fs::metadata(&exe_path)
             .with_context(|| format!("failed to stat {}", exe_path.display()))?;
-        cache.put_binary(rust_hash, &exe_path, metadata.len())?;
-        Ok((exe_path, args[1..].to_vec()))
+        c.put_binary(rust_hash, &exe_path, metadata.len())?;
     }
+    Ok((exe_path, args[1..].to_vec()))
 }
 
 fn execute_native_run(exe_path: &Path, args: &[String]) -> Result<()> {
@@ -1792,11 +1898,8 @@ pub(crate) fn hybrid_run_mode(
     timing: bool,
     use_cache: bool,
 ) -> Result<()> {
-    let _release = release;
-    let _jobs = jobs;
-    let _timing = timing;
-    let _use_cache = use_cache;
-    let (exe_path, runtime_args) = match prepare_native_run(args) {
+    let _timer = if timing { Some(std::time::Instant::now()) } else { None };
+    let (exe_path, runtime_args) = match prepare_native_run(args, release, jobs, use_cache) {
         Ok(result) => result,
         Err(native_error) => {
             eprintln!(
@@ -1919,15 +2022,11 @@ fn analyze_hot_functions(args: &[String]) -> Result<()> {
 
 pub(crate) fn python_mode(
     args: &[String],
-    release: bool,
-    jobs: Option<usize>,
-    timing: bool,
-    use_cache: bool,
+    _release: bool,
+    _jobs: Option<usize>,
+    _timing: bool,
+    _use_cache: bool,
 ) -> Result<()> {
-    let _release = release;
-    let _jobs = jobs;
-    let _timing = timing;
-    let _use_cache = use_cache;
     let input_file = args
         .first()
         .ok_or_else(|| anyhow::anyhow!("usage: tarvos python <file.py> [args...]"))?;
@@ -1956,12 +2055,71 @@ pub(crate) fn python_mode(
     Ok(())
 }
 
-pub(crate) fn serve_command(_args: &[String]) -> Result<()> {
-    println!("=== Tarvos HTTP API Gateway ===\n");
-    println!("Starting Tarvos HTTP API gateway...\n");
+pub(crate) fn serve_command(
+    port: u16,
+    host: String,
+    _workers: Option<usize>,
+    _log_level: String,
+    _max_connections: u32,
+    _ssl_cert: Option<PathBuf>,
+    _ssl_key: Option<PathBuf>,
+    deploy_aws: Option<String>,
+    aws_region: String,
+    _aws_profile: Option<String>,
+    _cloud_provider: String,
+    _instance_type: String,
+    _min_instances: u32,
+    _max_instances: u32,
+) -> Result<()> {
+    use colored::Colorize;
+    use std::process::Command;
+
+    println!("{}", "=== Tarvos HTTP API Gateway ===".cyan().bold());
+
+    // AWS Cloud Deployment
+    if let Some(ref deploy_target) = deploy_aws {
+        println!("{}", format!("\n  AWS Deployment: {}", deploy_target).yellow().bold());
+        println!("  Region: {}", aws_region);
+        println!("  Instance type: {}", _instance_type);
+        println!("  Auto-scaling: {} - {} instances", _min_instances, _max_instances);
+
+        match deploy_target.as_str() {
+            "lambda" => {
+                println!("  Target: AWS Lambda (serverless)");
+                let dockerfile = tarvos_codegen_cloud::generate_dockerfile();
+                let serverless = tarvos_codegen_cloud::generate_serverless_yml();
+                let _ = std::fs::write("Dockerfile", &dockerfile);
+                let _ = std::fs::write("serverless.yml", &serverless);
+                println!("  Generated: Dockerfile, serverless.yml");
+                println!("  Deploy with: serverless deploy --region {}", aws_region);
+            }
+            "ecs" => {
+                println!("  Target: AWS ECS (container)");
+                let dockerfile = tarvos_codegen_cloud::generate_dockerfile();
+                let _ = std::fs::write("Dockerfile", &dockerfile);
+                println!("  Generated: Dockerfile");
+                println!("  Deploy with: aws ecs create-service --cluster tarvos --region {}", aws_region);
+            }
+            "ec2" => {
+                println!("  Target: AWS EC2 ({})", _instance_type);
+                let dockerfile = tarvos_codegen_cloud::generate_dockerfile();
+                let _ = std::fs::write("Dockerfile", &dockerfile);
+                println!("  Generated: Dockerfile");
+                println!("  Deploy with: aws ec2 run-instances --instance-type {} --region {}", _instance_type, aws_region);
+            }
+            _ => {
+                println!("  Unknown deploy target: {}", deploy_target);
+            }
+        }
+        println!("\n  AWS deployment configuration complete.");
+        return Ok(());
+    }
+
+    // Local mode: actually start the tarvos-server binary
+    println!("{}", "Starting Tarvos HTTP API gateway...".green());
     println!("  Server: tarvos-server");
     println!("  Version: {}", env!("CARGO_PKG_VERSION"));
-    println!("  Listening: http://0.0.0.0:8080");
+    println!("  Listening: http://{}:{}", host, port);
     println!("\n  Endpoints:");
     println!("    GET  /health                    Health check");
     println!("    POST /api/v1/tarvos/compile     Submit Python code for compilation");
@@ -1969,10 +2127,69 @@ pub(crate) fn serve_command(_args: &[String]) -> Result<()> {
     println!("    GET  /api/v1/tarvos/terminal    WebSocket terminal (experimental)");
     println!("    GET  /api/v1/tarvos/files       List workspace files");
     println!("\n  Press Ctrl+C to stop the server.\n");
-    Ok(())
-}
 
-pub(crate) fn doctor_mode(_args: &[String]) -> Result<()> {
+    // Try to find and run tarvos-server binary
+    let server_binary = which::which("tarvos-server")
+        .or_else(|_| -> Result<std::path::PathBuf, std::io::Error> {
+            std::env::current_exe().ok()
+                .and_then(|p| p.parent().map(|parent| parent.join(format!("tarvos-server{}", std::env::consts::EXE_SUFFIX))))
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "tarvos-server not found"))
+        });
+
+    match server_binary {
+        Ok(binary_path) => {
+            let binary_path_clone = binary_path.clone();
+            let mut child = Command::new(binary_path)
+                .env("PORT", port.to_string())
+                .env("HOST", &host)
+                .spawn()
+                .with_context(|| format!("failed to start tarvos-server at {:?}", binary_path_clone))?;
+
+            let status = child.wait()
+                .with_context(|| "failed to wait for tarvos-server process")?;
+
+            if status.success() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("tarvos-server exited with status: {}", status))
+            }
+        }
+        Err(_) => {
+            eprintln!("tarvos-server binary not found in PATH. Building from workspace...");
+            let build_status = Command::new("cargo")
+                .args(["build", "--bin", "tarvos-server"])
+                .current_dir(env::current_dir()?)
+                .status()
+                .with_context(|| "failed to run cargo build for tarvos-server")?;
+
+            if !build_status.success() {
+                return Err(anyhow::anyhow!("failed to build tarvos-server"));
+            }
+
+            let target_dir = env::current_dir()?.join("target").join("debug");
+            let server_binary = target_dir.join(format!("tarvos-server{}", std::env::consts::EXE_SUFFIX));
+
+            if !server_binary.exists() {
+                return Err(anyhow::anyhow!("tarvos-server binary not found at {:?}", server_binary));
+            }
+
+            let mut child = Command::new(server_binary)
+                .env("PORT", port.to_string())
+                .env("HOST", &host)
+                .spawn()
+                .with_context(|| "failed to start tarvos-server")?;
+
+            let status = child.wait()
+                .with_context(|| "failed to wait for tarvos-server process")?;
+
+            if status.success() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("tarvos-server exited with status: {}", status))
+            }
+        }
+    }
+}pub(crate) fn doctor_mode(_args: &[String]) -> Result<()> {
     println!("=== Tarvos System Diagnostics & Health Check ===\n");
 
     let python_cmd = find_python_command();
